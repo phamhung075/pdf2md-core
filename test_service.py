@@ -46,13 +46,14 @@ ENGINE_LABELS = {
     "docling-pdf": "Docling PDF pipeline (Heron layout + TableFormer + RapidOCR PP-OCRv6 fr)",
     "docling-image": "Docling Image pipeline (Heron layout + TableFormer + RapidOCR PP-OCRv6 fr)",
     "docling-native": "Docling native readers (office formats; file's own structure, no OCR)",
-    "pypdf-fast-path": "pypdf fast path (digital text-layer PDF; opt-in DOCLING_PDF_FAST_PATH)",
+    "pdf-oxide-fast-path": "PDF Oxide fast path (Rust-compiled core; opt-in DOCLING_PDF_FAST_PATH)",
+    "pypdf-fast-path": "pypdf fast path (digital text-layer PDF; secondary fallback)",
     "vision:gemini-flash-latest": "Vision LLM rescue (Gemini Flash Latest via Vision API)",
     "vision:gemini-3.8-flash": "Vision LLM rescue (Gemini 3.8 Flash via Vision API)",
     "vision:gemini-1.5-flash": "Vision LLM rescue (Gemini 1.5 Flash via Vision API)",
 }
 EXT_ROUTING = {
-    ".pdf": "pdf → docling-pdf (or pypdf fast path, with Vision LLM fallback if gate fails)",
+    ".pdf": "pdf → docling-pdf (or pdf-oxide fast path, with Vision LLM fallback if gate fails)",
     ".jpg": "image → docling-image (with Vision LLM fallback if gate fails)",
     ".jpeg": "image → docling-image (with Vision LLM fallback if gate fails)",
     ".png": "image → docling-image (with Vision LLM fallback if gate fails)",

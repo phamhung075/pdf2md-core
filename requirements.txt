@@ -10,8 +10,10 @@ docling[rapidocr]==2.125.0
 # for opencv-python-headless (same version) right after install; on a headless host do the same:
 #   pip uninstall opencv-python && pip install opencv-python-headless==5.0.0.93
 #
-# Digital-PDF fast path (DOCLING_PDF_FAST_PATH=1). Permissive BSD-3-Clause / Apache-2.0.
-# pypdf provides fast model-free digital text extraction without copyleft risk.
+# Digital-PDF fast path (DOCLING_PDF_FAST_PATH=1). Permissive MIT / Apache-2.0 / BSD-3.
+# pdf-oxide: compiled Rust core with Python bindings for sub-millisecond native Markdown extraction.
+pdf-oxide>=0.3.70
+# pypdf: pure-Python secondary fallback for legacy PDF forms.
 pypdf>=5.0.0
 # Model Context Protocol (MCP) server SDK for agentic AI tools
 mcp>=1.2.0

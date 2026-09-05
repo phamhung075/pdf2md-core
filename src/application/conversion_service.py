@@ -177,8 +177,8 @@ class ConversionService(ConversionServicePort):
                 try:
                     logger.info("[%s] Checking digital-PDF fast path (DOCLING_PDF_FAST_PATH=1)...", filename)
                     if self._fast_path.is_digital(path):
-                        logger.info("[%s] Fast path converted digital PDF via pypdf fast-path.", filename)
                         fast_result = self._fast_path.convert(path, filename, embed_images=embed_images)
+                        logger.info("[%s] Fast path converted digital PDF via %s.", filename, fast_result.engine)
                         # Evaluate fast path output before accepting it
                         eval_md = fast_result.markdown
                         passed, reasons = evaluate_quality_gate(eval_md, fast_result.text, pdf_path=path)
