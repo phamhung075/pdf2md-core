@@ -1,0 +1,19 @@
+# markdown-extract-service — Docling file→Markdown microservice.
+#
+# Pinned to the exact docling version the service was measured with (2.125.0, RapidOCR PP-OCRv6 via
+# the rapidocr extra, onnxruntime backend). The rapidocr wheel bundles the PP-OCRv6 onnx models, so
+# the only downloads happen for the layout/table models at image BUILD time (Dockerfile runs the
+# pipeline warm-up) — runtime is offline.
+docling[rapidocr]==2.125.0
+# NOTE: rapidocr pulls the GUI `opencv-python` wheel, whose 4.14+/5.x builds need Qt/X11 system
+# libs (libxcb, libGL) and crash on import in slim/headless environments. The Dockerfile swaps it
+# for opencv-python-headless (same version) right after install; on a headless host do the same:
+#   pip uninstall opencv-python && pip install opencv-python-headless==5.0.0.93
+#
+# Optional digital-PDF fast path (pdf_fast_path.py; DOCLING_PDF_FAST_PATH=1). Model-free: pymupdf
+# probes the text layer, pymupdf4llm converts it. Both are small wheels; behavior is unchanged
+# while the flag is off.
+pymupdf>=1.24.9
+pymupdf4llm>=0.0.17
+# Model Context Protocol (MCP) server SDK for agentic AI tools
+mcp>=1.2.0

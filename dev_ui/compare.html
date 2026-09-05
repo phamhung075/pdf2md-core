@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Side-by-Side Comparison — markdown-extract-service</title>
+<link rel="stylesheet" href="/test/css/style.css">
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    background: #090e17;
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+
+  .compare-app {
+    display: flex;
+    flex-direction: column;
+    width: 100vw;
+    height: 100vh;
+  }
+
+  /* Top Navigation & Controls */
+  .compare-navbar {
+    height: 48px;
+    background: #0f172a;
+    border-bottom: 1px solid #334155;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 16px;
+    box-sizing: border-box;
+    flex-shrink: 0;
+    gap: 12px;
+  }
+
+  .compare-nav-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+  }
+
+  .compare-back-btn {
+    all: unset;
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--accent);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-weight: 500;
+    padding: 4px 8px;
+    border-radius: 6px;
+    background: var(--panel2);
+    border: 1px solid #334155;
+    text-decoration: none;
+    transition: background .15s;
+    white-space: nowrap;
+  }
+  .compare-back-btn:hover {
+    background: #334155;
+  }
+
+  .compare-doc-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: #f8fafc;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 320px;
+  }
+
+  .compare-meta-badges {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .compare-nav-center {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+
+  .compare-nav-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+
+  /* Workspace / Split Columns */
+  .compare-workspace {
+    flex: 1;
+    display: flex;
+    width: 100vw;
+    height: calc(100vh - 48px);
+    overflow: hidden;
+    position: relative;
+  }
+
+  .compare-pane {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-width: 250px;
+    overflow: hidden;
+    background: var(--panel);
+  }
+
+  .compare-pane-pdf {
+    width: 50%;
+    border-right: 1px solid #1e293b;
+  }
+
+  .compare-pane-md {
+    flex: 1;
+    min-width: 250px;
+  }
+
+  .pane-sub-header {
+    height: 38px;
+    background: #1e293b;
+    border-bottom: 1px solid #334155;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 12px;
+    flex-shrink: 0;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+  }
+
+  .pane-sub-header .pane-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #e2e8f0;
+  }
+
+  .pane-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  /* Split Resizer Divider */
+  .compare-resizer {
+    width: 6px;
+    cursor: col-resize;
+    background: #1e293b;
+    border-left: 1px solid #334155;
+    border-right: 1px solid #334155;
+    transition: background .2s;
+    user-select: none;
+    z-index: 10;
+    position: relative;
+  }
+  .compare-resizer:hover, .compare-resizer.dragging {
+    background: var(--accent);
+  }
+
+  /* Viewports */
+  .pdf-full-viewport {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: auto;
+    background: #020617;
+    padding: 20px 10px;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .md-full-viewport {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: auto;
+    background: #0f172a;
+    padding: 24px 32px;
+    box-sizing: border-box;
+    line-height: 1.65;
+  }
+
+  .md-full-viewport pre.raw-markdown {
+    font-family: var(--mono);
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: #020617;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    padding: 16px;
+    color: #cbd5e1;
+    line-height: 1.5;
+  }
+
+  /* Empty state box */
+  .compare-empty-banner {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    padding: 40px;
+    text-align: center;
+    color: var(--muted);
+    gap: 16px;
+  }
+  .compare-empty-banner h3 {
+    color: #f1f5f9;
+    margin: 0;
+    font-size: 18px;
+  }
+  .compare-drop-zone {
+    border: 2px dashed #475569;
+    border-radius: 12px;
+    padding: 36px 48px;
+    cursor: pointer;
+    background: #1e293b88;
+    transition: border-color .15s, background .15s;
+  }
+  .compare-drop-zone:hover {
+    border-color: var(--accent);
+    background: #1e293b;
+  }
+</style>
+</head>
+<body>
+<div class="compare-app">
+  <header class="compare-navbar">
+    <div class="compare-nav-left">
+      <a href="/test" class="compare-back-btn" title="Back to dev test page">↖ Back to Test</a>
+      <span class="badge" style="color:var(--accent);border-color:#0284c7;">SIDE-BY-SIDE COMPARE</span>
+      <span id="cmp-filename" class="compare-doc-title">No document loaded</span>
+      <div id="cmp-meta-badges" class="compare-meta-badges"></div>
+    </div>
+
+    <div class="compare-nav-center">
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--muted);user-select:none;">
+        <input type="checkbox" id="cmp-sync-scroll" checked style="width:auto;margin:0;cursor:pointer;">
+        <span>🔗 Synchronize Scroll</span>
+      </label>
+      <button id="cmp-split-reset" class="btn-sm" type="button" title="Reset split to 50/50">50 / 50</button>
+    </div>
+
+    <div class="compare-nav-right">
+      <input type="file" id="cmp-file-input" accept=".pdf,.jpg,.jpeg,.png,.webp,.bmp,.tiff,.tif" style="display:none;">
+      <button id="cmp-choose-btn" class="btn-sm" type="button">Load Document…</button>
+      <button id="cmp-fullscreen-btn" class="btn-sm" type="button" title="Toggle Fullscreen">⛶ Fullscreen</button>
+    </div>
+  </header>
+
+  <main class="compare-workspace" id="cmp-workspace">
+    <!-- Left: Original Document -->
+    <section class="compare-pane compare-pane-pdf" id="cmp-pane-pdf">
+      <div class="pane-sub-header">
+        <div class="pane-title">
+          <span>Original Document</span>
+          <span id="cmp-page-indicator" class="badge" style="font-size:10px;">0 / 0</span>
+        </div>
+        <div class="pane-actions">
+          <button id="cmp-zoom-out" class="btn-sm" type="button" title="Zoom Out">−</button>
+          <button id="cmp-zoom-reset" class="btn-sm" type="button" title="Fit to width">Fit</button>
+          <button id="cmp-zoom-in" class="btn-sm" type="button" title="Zoom In">+</button>
+          <a id="cmp-pdf-raw-link" class="btn-sm" target="_blank" rel="noopener" title="Open raw document in new browser tab">Open Raw ↗</a>
+        </div>
+      </div>
+      <div class="pdf-full-viewport" id="cmp-pdf-viewport">
+        <div id="cmp-pdf-pages-list" class="pdf-pages-list">
+          <div class="compare-empty-banner">
+            <h3>No document loaded for comparison</h3>
+            <p>Convert a document in the dev test page or load a PDF or image file directly.</p>
+            <div class="compare-drop-zone" id="cmp-drop-zone">
+              Click or drag a PDF or image here to view & compare
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Resizer Divider -->
+    <div class="compare-resizer" id="cmp-resizer" title="Drag to adjust split size (double click for 50/50)"></div>
+
+    <!-- Right: Rendered Markdown -->
+    <section class="compare-pane compare-pane-md" id="cmp-pane-md">
+      <div class="pane-sub-header">
+        <div class="pane-title">
+          <span>Extracted Markdown</span>
+          <span id="cmp-chars-count" class="badge" style="font-size:10px;">0 chars</span>
+        </div>
+        <div class="pane-actions">
+          <button id="cmp-view-toggle" class="btn-sm" type="button" title="Toggle Raw / Rendered">Show Raw MD</button>
+          <button id="cmp-font-dec" class="btn-sm" type="button" title="Decrease font size">A−</button>
+          <button id="cmp-font-inc" class="btn-sm" type="button" title="Increase font size">A+</button>
+          <button id="cmp-copy-md" class="btn-sm" type="button">Copy MD</button>
+        </div>
+      </div>
+      <div class="md-full-viewport" id="cmp-md-viewport">
+        <div id="cmp-md-content" class="split-md-content" style="padding:0;background:transparent;">
+          <div class="compare-empty-banner">
+            <h3>No Markdown content available</h3>
+            <p>Convert a document in the dev test page to compare extracted markdown against the original PDF.</p>
+          </div>
+        </div>
+        <pre id="cmp-raw-md" class="raw-markdown" style="display:none;"></pre>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="/test/marked.js"></script>
+<script src="/test/pdf.min.js"></script>
+<script type="module" src="/test/js/compare.js"></script>
+</body>
+</html>

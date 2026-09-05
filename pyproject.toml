@@ -1,0 +1,26 @@
+[project]
+name = "markdown-extract-service"
+version = "0.1.0"
+description = "Deterministic, layout-aware Markdown for PDFs and native office formats powered by Docling"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "docling[rapidocr]==2.125.0",
+    "pymupdf>=1.24.9",
+    "pymupdf4llm>=0.0.17",
+    "mcp>=1.2.0",
+]
+
+[tool.pyrefly]
+ignore-missing-imports = [
+    "docling",
+    "docling.*",
+    "docling_core",
+    "docling_core.*",
+    "pymupdf",
+    "pymupdf.*",
+    "pymupdf4llm",
+    "pymupdf4llm.*",
+    "mcp",
+    "mcp.*",
+]

@@ -1,0 +1,12 @@
+ignore-missing-imports = [
+    "docling",
+    "docling.*",
+    "docling_core",
+    "docling_core.*",
+    "pymupdf",
+    "pymupdf.*",
+    "pymupdf4llm",
+    "pymupdf4llm.*",
+    "mcp",
+    "mcp.*",
+]

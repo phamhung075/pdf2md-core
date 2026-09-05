@@ -1,0 +1,58 @@
+# pdf2md-core — High-Performance PDF to Markdown microservice
+# Standalone Docker Compose runner
+#
+#   docker compose up -d --build
+#   curl http://127.0.0.1:3984/health
+
+services:
+  pdf2md-core:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pdf2md-core:latest
+    container_name: pdf2md-core
+    restart: unless-stopped
+    ports:
+      - "${DOCLING_SERVICE_PORT:-3984}:${DOCLING_SERVICE_PORT:-3984}"
+    environment:
+      DOCLING_SERVICE_PORT: "${DOCLING_SERVICE_PORT:-3984}"
+      DOCLING_SERVICE_HOST: "${DOCLING_SERVICE_HOST:-0.0.0.0}"
+      DOCLING_PDF_FAST_PATH: "${DOCLING_PDF_FAST_PATH:-1}"
+      DOCLING_EMBED_IMAGES: "${DOCLING_EMBED_IMAGES:-1}"
+      DOCLING_OCR_LANGS: "${DOCLING_OCR_LANGS:-eng,fra,vie}"
+      DOCLING_DEV_UI: "${DOCLING_DEV_UI:-1}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      VISION_API_KEY: "${VISION_API_KEY:-}"
+      VISION_FALLBACK_ENABLED: "${VISION_FALLBACK_ENABLED:-1}"
+      VISION_MODEL: "${VISION_MODEL:-gemini-2.0-flash}"
+      VISION_MAX_PAGES: "${VISION_MAX_PAGES:-30}"
+      VISION_DPI: "${VISION_DPI:-150}"
+      VISION_BASE_URL: "${VISION_BASE_URL:-}"
+      VISION_TIMEOUT_SEC: "${VISION_TIMEOUT_SEC:-120}"
+      MAX_UPLOAD_SIZE_MB: "${MAX_UPLOAD_SIZE_MB:-100}"
+      ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-*}"
+    volumes:
+      - docling_models:/app/models
+      - docling_cache:/app/cache
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,os,sys; port=os.environ.get('DOCLING_SERVICE_PORT','3984'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  docling_models:
+    name: pdf2md_models_cache
+  docling_cache:
+    name: pdf2md_runtime_cache
