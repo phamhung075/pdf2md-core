@@ -37,10 +37,10 @@ const maxUploadBytes = 100 << 20 // 100 MB
 type convertResponse struct {
 	OK         bool   `json:"ok"`
 	Markdown   string `json:"markdown,omitempty"`
-	Pages      int    `json:"pages,omitempty"`
-	Words      int    `json:"words,omitempty"`
-	Tables     int    `json:"tables,omitempty"`
-	DurationUs uint64 `json:"duration_us,omitempty"`
+	Pages      int    `json:"pages"`
+	Words      int    `json:"words"`
+	Tables     int    `json:"tables"`
+	DurationUs uint64 `json:"duration_us"`
 	DurationMs int64  `json:"duration_ms,omitempty"`
 	Engine     string `json:"engine"`
 	Version    string `json:"version,omitempty"`
@@ -200,7 +200,7 @@ async function handle(f) {
     const data = await resp.json();
     if (data.ok) {
       out.textContent = data.markdown;
-      status.textContent = f.name + ' → ' + data.pages + ' pages, ' + data.words + ' words, ' + data.duration_us + ' µs (Rust)';
+      status.textContent = f.name + ' → ' + (data.pages ?? 0) + ' pages, ' + (data.words ?? 0) + ' words, ' + (data.duration_us ?? 0) + ' µs (Rust)';
     } else {
       out.textContent = '';
       status.textContent = 'Conversion failed: ' + (data.error || 'unknown error');
