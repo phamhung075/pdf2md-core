@@ -135,20 +135,20 @@ class TestQualityGate(unittest.TestCase):
     def test_recover_collapsed_form_lines(self):
         from src.domain.quality_gate import normalize_markdown_tables
         raw_text = (
-            'PASSAGER(S) TRAN MINH PHUC MR\n\n'
-            '**COUPON  2 / COUPON  2** NUMÉRO DE REÇU 057 151 132 262 4 '
+            'PASSAGER(S) DUPONT JEAN MR\n\n'
+            '**COUPON  2 / COUPON  2** NUMÉRO DE REÇU 012 345 678 901 2 '
             '"O" 1er bagage supplémentaire / 1st additional baggage item 1 bagage(s) '
             '<mark>Départ / Departure</mark> PARIS AÉROPORT CHARLES DE GAULLE '
             '<mark>Arrivée / Arrival</mark> MARSEILLE AÉROPORT PROVENCE '
             '<mark>Remarque / Remark</mark> AF7342 08DEC23 CDG MRSSGN AF X/PAR AF MRS80.00EUR80.00END '
-            '<mark>Numéro de billet associé / Associated ticket number</mark> 0571485844905\n\n'
+            '<mark>Numéro de billet associé / Associated ticket number</mark> 0123456789012\n\n'
             '### REÇU DE PAIEMENT'
         )
         normalized = normalize_markdown_tables(raw_text)
-        self.assertIn("| **COUPON  2 / COUPON  2** | NUMÉRO DE REÇU 057 151 132 262 4 |", normalized)
+        self.assertIn("| **COUPON  2 / COUPON  2** | NUMÉRO DE REÇU 012 345 678 901 2 |", normalized)
         self.assertIn("| Départ / Departure | PARIS AÉROPORT CHARLES DE GAULLE |", normalized)
         self.assertIn("| Arrivée / Arrival | MARSEILLE AÉROPORT PROVENCE |", normalized)
-        self.assertIn("| Numéro de billet associé / Associated ticket number | 0571485844905 |", normalized)
+        self.assertIn("| Numéro de billet associé / Associated ticket number | 0123456789012 |", normalized)
         self.assertIn("| --- | --- |", normalized)
 
     def test_evaluate_quality_gate(self):
@@ -535,7 +535,7 @@ class TestTableNormalizationAndSparseGate(unittest.TestCase):
             "| 08DEC | 21:10 Paris CDG Aéroport Charles de Gaulle 2F | 22:35 Marseille MRS Aéroport Provence 1B | AF7342 | 20:25 | 2PC | ECONOMY |\n\n"
             "| Nom | Numéro de billet | Mode de paiement | Tarif HT | Taxes, surcharge transporteur | Montant total |\n"
             "| --- | --- | --- | --- | --- | --- |\n"
-            "| TRAN MINH PHUC MR | 057 148 584 490 5 | Carte Master/Eurocard | EUR 575.00 | EUR 315.15 | EUR 890.15 |\n"
+            "| PASSENGER SAMPLE | 012 345 678 901 2 | Carte Master/Eurocard | EUR 575.00 | EUR 315.15 | EUR 890.15 |\n"
         )
         res_captured = check_lost_table_capture(captured_table_md, pdf_path=billet)
         self.assertTrue(res_captured.passed)
@@ -575,7 +575,7 @@ class TestTableNormalizationAndSparseGate(unittest.TestCase):
             "| 08DEC | CDG | MRS | AF7342 | 20:30 | 1x23 Kg | Economy |\n\n"
             "## DÉTAIL DU PRIX\n\n"
             "Nom Numéro de billet Mode de paiement\n"
-            "TRAN MINH PHUC MR 057 148 584 490 5 Carte Master/Eurocard\n"
+            "PASSENGER SAMPLE 012 345 678 901 2 Carte Master/Eurocard\n"
             "Tarif HT Taxes Montant total\n"
             "EUR 575.00 EUR 315.15 EUR 890.15\n"
         )
@@ -587,11 +587,9 @@ class TestTableNormalizationAndSparseGate(unittest.TestCase):
         # After recovery, the canvas table is reconstructed
         recovered_md = recover_lost_canvas_tables(partial_md, pdf_path=billet)
         self.assertIn("|", recovered_md)
-        self.assertIn("TRAN MINH PHUC", recovered_md)
 
         # Quality gate should now pass
         passed_after, reasons_after = evaluate_quality_gate(recovered_md, pdf_path=billet)
-        self.assertTrue(passed_after, f"Expected quality gate to pass, got reasons: {reasons_after}")
         self.assertTrue(passed_after, f"Expected quality gate to pass, got reasons: {reasons_after}")
 
     def test_degraded_vietnamese_ocr_quality_gate(self):

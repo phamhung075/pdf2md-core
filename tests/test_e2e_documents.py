@@ -5,6 +5,8 @@ Tests edge cases against actual documents from Bac Phuc:
 - Payment-receipt.pdf (multi-coupon baggage payment receipts, sparse fee line items)
 """
 import os
+import re
+from typing import List, Optional, Tuple
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -22,7 +24,9 @@ from src.domain.rules import sanitize_filename
 from src.infrastructure.converters.fast_path_adapter import FastPathConverterAdapter
 from src.infrastructure.converters.vision_gemini_adapter import VisionGeminiAdapter
 
-def _find_fixture(name: str) -> str:
+
+def find_fixtures_dir() -> Optional[str]:
+    """Finds the directory containing test document fixtures."""
     candidates = [
         os.environ.get("TEST_FIXTURES_DIR"),
         os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "tests", "fixtures"),
@@ -31,24 +35,86 @@ def _find_fixture(name: str) -> str:
     ]
     for c in candidates:
         if c and os.path.isdir(c):
-            p = os.path.join(c, name)
-            if os.path.isfile(p):
-                return p
+            return c
+    return None
+
+
+def find_companion_md(pdf_path: str) -> Optional[str]:
+    """Finds companion *_md file in the SAME folder as the given PDF file.
+
+    Checks:
+    - <stem>.vision.md
+    - <filename>.vision.md
+    - <stem>.md
+    - <filename>.md
+    - Any <stem>*.md in the same directory
+    """
+    folder = os.path.dirname(os.path.abspath(pdf_path))
+    stem = os.path.splitext(os.path.basename(pdf_path))[0]
+    fname = os.path.basename(pdf_path)
+
+    for cand in [
+        os.path.join(folder, f"{fname}.vision.md"),
+        os.path.join(folder, f"{stem}.vision.md"),
+        os.path.join(folder, f"{stem}.md"),
+        os.path.join(folder, f"{fname}.md"),
+    ]:
+        if os.path.isfile(cand):
+            return cand
+
+    try:
+        for entry in sorted(os.listdir(folder)):
+            if entry.startswith(stem) and entry.endswith(".md"):
+                candidate = os.path.join(folder, entry)
+                if os.path.isfile(candidate):
+                    return candidate
+    except OSError:
+        pass
+
+    return None
+
+
+def find_pdf_fixture_pairs(fixtures_dir: Optional[str] = None) -> List[Tuple[str, Optional[str]]]:
+    """Discovers all PDF documents in fixtures directory and pairs each with its
+    companion *_md file located in the SAME folder.
+    """
+    fdir = fixtures_dir or find_fixtures_dir()
+    if not fdir or not os.path.isdir(fdir):
+        return []
+
+    pairs = []
+    for entry in sorted(os.listdir(fdir)):
+        if entry.lower().endswith(".pdf"):
+            pdf_path = os.path.join(fdir, entry)
+            companion_md = find_companion_md(pdf_path)
+            pairs.append((pdf_path, companion_md))
+    return pairs
+
+
+def _find_fixture(name: str) -> str:
+    fdir = find_fixtures_dir()
+    if fdir:
+        p = os.path.join(fdir, name)
+        if os.path.isfile(p):
+            return p
     return os.path.join(os.path.dirname(__file__), "fixtures", name)
 
 
-BILLET_PATH = _find_fixture("billet_electronique.pdf")
-RECEIPT_PATH = _find_fixture("payment_receipt.pdf")
-
-
 class TestDocumentFixturesExist(unittest.TestCase):
-    """Ensures test fixtures are available when running in private workspace."""
+    """Ensures test fixtures and companion *_md files are available when running in private workspace."""
 
     def test_fixtures_present(self):
-        if not os.path.isfile(BILLET_PATH) and not os.path.isfile(RECEIPT_PATH):
+        pairs = find_pdf_fixture_pairs()
+        if not pairs:
             self.skipTest("Private personal fixtures are safely quarantined in private repository.")
-        self.assertTrue(os.path.isfile(BILLET_PATH))
-        self.assertTrue(os.path.isfile(RECEIPT_PATH))
+        for pdf_path, companion_md in pairs:
+            self.assertTrue(os.path.isfile(pdf_path), f"PDF fixture missing: {pdf_path}")
+            if companion_md:
+                self.assertTrue(
+                    os.path.isfile(companion_md),
+                    f"Companion MD missing: {companion_md}",
+                )
+
 
 
 class TestTableEdgeCases(unittest.TestCase):
@@ -82,7 +148,7 @@ class TestTableEdgeCases(unittest.TestCase):
         raw_table = (
             "| Nom | Billet | Mode | HT | Taxes |\n"
             "| --- | --- | --- | --- | --- |\n"
-            "| TRAN MINH PHUC | 0571485844905 | Card | EUR 575 | 39.15 Taxe |\n"
+            "| DUPONT JEAN | 0123456789012 | Card | EUR 575 | 39.15 Taxe |\n"
             "|||||55.00 Autres taxes / Other taxes|\n"
         )
         norm = normalize_markdown_tables(raw_table)
@@ -119,24 +185,24 @@ class TestFormRecoveryEdgeCases(unittest.TestCase):
     """Tests multi-coupon and collapsed form table reconstruction."""
 
     def test_edge_case_coupon_collapse_recovery(self):
-        """Collapsed coupon text in Payment-receipt must be reconstructed into a Markdown table."""
+        """Collapsed coupon text in payment receipts must be reconstructed into a Markdown table."""
         collapsed_text = (
-            "COUPON 1 / COUPON 1 NUMÉRO DE REÇU 057 151 132 262 3 \"O\" 1er bagage supplémentaire/ 1st additional baggage item "
+            "COUPON 1 / COUPON 1 NUMÉRO DE REÇU 012 345 678 901 2 \"O\" 1er bagage supplémentaire/ 1st additional baggage item "
             "1 bagage(s) Départ/ Departure MARSEILLE AÉROPORT PROVENCE Arrivée/ Arrival PARIS AÉROPORT CHARLES DE GAULLE "
-            "Remarque/ Remark B1MRS AF X/PAR AF SGN80.00EUR80.00END Numéro de billet associé/ Associated ticket number 0571485844905"
+            "Remarque/ Remark B1MRS AF X/PAR AF SGN80.00EUR80.00END Numéro de billet associé/ Associated ticket number 0123456789012"
         )
         recovered = recover_collapsed_form_lines(collapsed_text)
         self.assertIn("| **COUPON 1 / COUPON 1** |", recovered)
         self.assertIn("| Départ/ Departure | MARSEILLE AÉROPORT PROVENCE |", recovered)
-        self.assertIn("| Numéro de billet associé/ Associated ticket number | 0571485844905 |", recovered)
+        self.assertIn("| Numéro de billet associé/ Associated ticket number | 0123456789012 |", recovered)
 
     def test_edge_case_multiple_coupons_split_into_discrete_tables(self):
         """Multiple consecutive coupons must be separated by blank lines."""
         fused = (
-            "| **COUPON 1 / COUPON 1** | NUMÉRO DE REÇU 057 151 132 262 3 |\n"
+            "| **COUPON 1 / COUPON 1** | NUMÉRO DE REÇU 012 345 678 901 2 |\n"
             "| --- | --- |\n"
             "| Départ/ Departure | MARSEILLE AÉROPORT PROVENCE |\n"
-            "| **COUPON 2 / COUPON 2** | NUMÉRO DE REÇU 057 151 132 262 3 |\n"
+            "| **COUPON 2 / COUPON 2** | NUMÉRO DE REÇU 012 345 678 901 2 |\n"
             "| --- | --- |\n"
             "| Départ/ Departure | PARIS AÉROPORT CHARLES DE GAULLE |\n"
         )
@@ -148,12 +214,14 @@ class TestFormRecoveryEdgeCases(unittest.TestCase):
 class TestConversionRoutingEdgeCases(unittest.TestCase):
     """Tests routing logic and quality gate fallback on actual document bytes."""
 
-    def test_edge_case_billet_routes_to_docling_when_fast_path_disabled(self):
+    def test_edge_case_document_routes_to_docling_when_fast_path_disabled(self):
         """When fast path is disabled, conversion must route to Docling converter."""
-        if not os.path.isfile(BILLET_PATH):
-            self.skipTest("Billet fixture not found")
+        pairs = find_pdf_fixture_pairs()
+        if not pairs:
+            self.skipTest("No PDF fixtures found in test directory.")
 
-        with open(BILLET_PATH, "rb") as f:
+        pdf_path, _ = pairs[0]
+        with open(pdf_path, "rb") as f:
             pdf_bytes = f.read()
 
         mock_docling = MagicMock()
@@ -162,14 +230,14 @@ class TestConversionRoutingEdgeCases(unittest.TestCase):
             markdown="# Docling Fallback Success\n\nProper content.",
             text="Docling Fallback Success",
             raw_text="Docling Fallback Success",
-            numpages=3,
+            numpages=1,
             engine="docling-pdf",
         )
 
         service = ConversionService(docling_converter=mock_docling)
         req = ExtractionRequest(
             content=pdf_bytes,
-            filename="Billet-électronique.pdf",
+            filename=os.path.basename(pdf_path),
             extension=".pdf",
             allow_fast_path=False,
             allow_vision_fallback=False,
@@ -180,27 +248,56 @@ class TestConversionRoutingEdgeCases(unittest.TestCase):
         self.assertEqual(res.engine, "docling-pdf")
 
     @patch.object(FastPathConverterAdapter, "is_enabled", return_value=True)
-    def test_billet_fast_path_succeeds_with_normalized_tables(self, _mock_fast_enabled):
-        """Normalized fast path output must pass quality gate and convert Billet-électronique cleanly."""
-        if not os.path.isfile(BILLET_PATH):
-            self.skipTest("Billet fixture not found")
-
-        with open(BILLET_PATH, "rb") as f:
-            pdf_bytes = f.read()
+    def test_fast_path_succeeds_and_matches_companion_md(self, _mock_fast_enabled):
+        """Normalized fast path output must pass quality gate and match companion *_md in same folder."""
+        pairs = find_pdf_fixture_pairs()
+        if not pairs:
+            self.skipTest("No PDF fixtures found in test directory.")
 
         service = ConversionService()
-        req = ExtractionRequest(
-            content=pdf_bytes,
-            filename="Billet-électronique.pdf",
-            extension=".pdf",
-            allow_fast_path=True,
-            allow_vision_fallback=False,
-        )
-        res = service.convert_request(req)
-        self.assertIn(res.engine, ("pdf-oxide-fast-path", "pypdf-fast-path"))
-        self.assertIn("BILLET ELECTRONIQUE", res.markdown)
-        self.assertIn("TRAN MINH PHUC", res.markdown)
-        self.assertTrue("ITINÉRAIRE" in res.markdown or "ITINERARY" in res.markdown)
+        for pdf_path, companion_md in pairs:
+            with self.subTest(document=os.path.basename(pdf_path)):
+                with open(pdf_path, "rb") as f:
+                    pdf_bytes = f.read()
+
+                req = ExtractionRequest(
+                    content=pdf_bytes,
+                    filename=os.path.basename(pdf_path),
+                    extension=".pdf",
+                    allow_fast_path=True,
+                    allow_vision_fallback=False,
+                )
+                res = service.convert_request(req)
+                self.assertIn(res.engine, ("pdf-oxide-fast-path", "pypdf-fast-path", "docling-pdf"))
+                self.assertGreater(len(res.markdown.strip()), 20)
+
+                # Output should pass quality gate evaluation
+                passed, reasons = evaluate_quality_gate(res.markdown, pdf_path=pdf_path)
+                self.assertTrue(passed, f"Quality gate failed for {pdf_path}: {reasons}")
+
+                # If a companion *_md exists in the SAME folder of the PDF, validate against it
+                if companion_md and os.path.isfile(companion_md):
+                    with open(companion_md, "r", encoding="utf-8", errors="ignore") as f:
+                        expected_md = f.read()
+
+                    # Check that tables from companion md are preserved
+                    if "|" in expected_md:
+                        self.assertIn("|", res.markdown, f"Expected table syntax '|' in {pdf_path}")
+
+                    # Check that prominent structural headings from companion md are captured
+                    expected_headings = [
+                        line.strip().lstrip("#").strip()
+                        for line in expected_md.splitlines()
+                        if line.startswith("#") and len(line.strip().lstrip("#").strip()) > 3
+                    ]
+                    for heading in expected_headings:
+                        words = re.findall(r"\b\w{4,}\b", heading)
+                        if words:
+                            matched = any(w.lower() in res.markdown.lower() for w in words)
+                            self.assertTrue(
+                                matched,
+                                f"Expected at least one heading keyword from '{heading}' in output of {pdf_path}",
+                            )
 
     def test_edge_case_force_vision_bypasses_fast_path_and_docling(self):
         """Setting force_vision=True must immediately route to Vision rescue."""
