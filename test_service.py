@@ -322,6 +322,28 @@ def test_file(path: str, cfg: dict, verbose: bool):
         record["gateChecks"] = quality_checks(markdown, text)
         record["gateFailed"] = [c["id"] for c in record["gateChecks"] if not c["pass"]]
 
+    pipeline_trace = body.get("pipeline_trace") or body.get("info", {}).get("pipeline_trace", [])
+    if pipeline_trace:
+        steps.append(("ok", f"Step 7 — pipeline trace ({len(pipeline_trace)} stages executed):"))
+        for idx, stage in enumerate(pipeline_trace, 1):
+            s_name = stage.get("stage", "stage")
+            s_status = stage.get("status", "")
+            details = []
+            if "duration_ms" in stage:
+                details.append(f"{stage['duration_ms']} ms")
+            if "engine" in stage:
+                details.append(f"engine: {stage['engine']}")
+            if "markdown_chars" in stage:
+                details.append(f"{stage['markdown_chars']} chars")
+            if "reasons" in stage and stage["reasons"]:
+                details.append(f"reasons: {'; '.join(stage['reasons'])}")
+            elif "passed" in stage:
+                details.append("PASS" if stage["passed"] else "FAIL")
+            if "recovered" in stage:
+                details.append("table recovered" if stage["recovered"] else "no table recovery needed")
+            d_str = f" ({', '.join(details)})" if details else ""
+            steps.append(("ok", f"    {idx}. [{s_name}] {s_status}{d_str}"))
+
     if cfg["out_dir"]:
         stem = re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:120]
         saved = []
@@ -332,7 +354,7 @@ def test_file(path: str, cfg: dict, verbose: bool):
                 f.write(content)
             saved.append(p)
         record["savedFiles"] = saved
-        steps.append(("ok", f"Step 7 — artifacts saved to {', '.join(saved)}"))
+        steps.append(("ok", f"Step 8 — artifacts saved to {', '.join(saved)}"))
 
     if verbose:
         steps.append(("info", "structure: " + json.dumps(structure, ensure_ascii=False)))

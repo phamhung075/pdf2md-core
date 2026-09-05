@@ -163,12 +163,33 @@ class ConversionService(ConversionServicePort):
         is_pdf = ext in PDF_EXTENSIONS
         is_image = ext in IMAGE_EXTENSIONS
 
+        pipeline_trace: list = []
+
         # 1. Force vision if explicitly requested
         if (is_pdf or is_image) and force_vision:
             if self._vision_rescue.is_enabled():
                 logger.info("[%s] Force Vision LLM requested — running vision pipeline...", filename)
-                return self._vision_rescue.rescue(path, filename, embed_images=embed_images)
+                pipeline_trace.append({
+                    "stage": "routing",
+                    "action": "force_vision",
+                    "model": config.vision_model,
+                })
+                rescued = self._vision_rescue.rescue(path, filename, embed_images=embed_images)
+                pipeline_trace.append({
+                    "stage": "tier_c_vision_rescue",
+                    "status": "success",
+                    "model": config.vision_model,
+                    "duration_ms": rescued.duration_ms,
+                })
+                rescued.pipeline_trace = pipeline_trace
+                rescued.info["pipeline_trace"] = pipeline_trace
+                return rescued
             logger.warning("[%s] Force Vision LLM requested but vision engine is not enabled/configured.", filename)
+            pipeline_trace.append({
+                "stage": "routing",
+                "action": "force_vision_unavailable",
+                "fallback": "standard_pipeline",
+            })
 
         # 2. Standard conversion: Fast Path (if eligible) or Docling
         result: Optional[ConversionResult] = None
@@ -176,13 +197,35 @@ class ConversionService(ConversionServicePort):
             if allow_fast_path and self._fast_path.is_enabled():
                 try:
                     logger.info("[%s] Checking digital-PDF fast path (DOCLING_PDF_FAST_PATH=1)...", filename)
-                    if self._fast_path.is_digital(path):
+                    t_probe = time.monotonic()
+                    is_dig = self._fast_path.is_digital(path)
+                    probe_ms = round((time.monotonic() - t_probe) * 1000)
+                    pipeline_trace.append({
+                        "stage": "tier_a_fast_path_probe",
+                        "status": "eligible" if is_dig else "ineligible",
+                        "duration_ms": probe_ms,
+                    })
+                    if is_dig:
                         fast_result = self._fast_path.convert(path, filename, embed_images=embed_images)
-                        logger.info("[%s] Fast path converted digital PDF via %s.", filename, fast_result.engine)
+                        pipeline_trace.append({
+                            "stage": "tier_a_fast_path_convert",
+                            "engine": fast_result.engine,
+                            "status": "success",
+                            "duration_ms": fast_result.duration_ms,
+                            "markdown_chars": len(fast_result.markdown),
+                            "numpages": fast_result.numpages,
+                        })
                         # Evaluate fast path output before accepting it
                         eval_md = fast_result.markdown
                         passed, reasons = evaluate_quality_gate(eval_md, fast_result.text, pdf_path=path)
+                        pipeline_trace.append({
+                            "stage": "tier_a_quality_gate",
+                            "status": "passed" if passed else "failed",
+                            "passed": passed,
+                            "reasons": reasons,
+                        })
                         if passed:
+                            logger.info("[%s] Fast path converted digital PDF via %s.", filename, fast_result.engine)
                             result = fast_result
                         else:
                             logger.warning(
@@ -194,11 +237,21 @@ class ConversionService(ConversionServicePort):
                         logger.info("[%s] Fast path probe passed; falling through to Docling PDF pipeline.", filename)
                 except Exception as e:
                     self._warn_fast_fallback(filename, e)
+                    pipeline_trace.append({
+                        "stage": "tier_a_fast_path_error",
+                        "error": str(e),
+                        "fallback": "docling",
+                    })
             else:
                 logger.info(
                     "[%s] Routing to Docling PDF pipeline (Heron layout + TableFormer + RapidOCR PP-OCRv6).",
                     filename,
                 )
+                pipeline_trace.append({
+                    "stage": "routing",
+                    "action": "docling_pdf",
+                    "fast_path_enabled": False,
+                })
         elif is_image:
             if allow_fast_path and config.image_auto_vision and self._vision_rescue.is_enabled():
                 try:
@@ -207,19 +260,34 @@ class ConversionService(ConversionServicePort):
                         filename,
                         config.vision_model,
                     )
-                    return self._vision_rescue.rescue(path, filename, embed_images=embed_images)
+                    rescued = self._vision_rescue.rescue(path, filename, embed_images=embed_images)
+                    pipeline_trace.append({
+                        "stage": "tier_c_auto_vision",
+                        "status": "success",
+                        "model": config.vision_model,
+                        "duration_ms": rescued.duration_ms,
+                    })
+                    rescued.pipeline_trace = pipeline_trace
+                    rescued.info["pipeline_trace"] = pipeline_trace
+                    return rescued
                 except Exception as e:
                     logger.warning(
                         "[%s] Vision LLM for image failed (%s) — falling back to Docling image pipeline.",
                         filename,
                         e,
                     )
+                    pipeline_trace.append({
+                        "stage": "tier_c_auto_vision_failed",
+                        "error": str(e),
+                    })
             logger.info(
                 "[%s] Routing to Docling Image pipeline (Heron layout + TableFormer + RapidOCR PP-OCRv6).",
                 filename,
             )
+            pipeline_trace.append({"stage": "routing", "action": "docling_image"})
         else:
             logger.info("[%s] Routing to Docling native reader for %s (no OCR/layout models).", filename, ext)
+            pipeline_trace.append({"stage": "routing", "action": "docling_native", "ext": ext})
 
         if result is None:
             # Threading lock around Docling converter invocation
@@ -229,12 +297,32 @@ class ConversionService(ConversionServicePort):
             with self._convert_lock:
                 wait_ms = round((time.monotonic() - t_wait) * 1000)
                 logger.info("[%s] Acquired converter lock (waited %d ms).", tag, wait_ms)
+                t_doc = time.monotonic()
                 result = self._docling.convert(path, filename, embed_images=embed_images)
+                doc_ms = round((time.monotonic() - t_doc) * 1000)
+                pipeline_trace.append({
+                    "stage": "tier_b_docling_convert",
+                    "status": "success",
+                    "engine": result.engine,
+                    "wait_ms": wait_ms,
+                    "duration_ms": doc_ms,
+                    "markdown_chars": len(result.markdown),
+                    "numpages": result.numpages,
+                })
 
         # 3. Canvas Table Recovery & Quality Gate Evaluation
         if is_pdf and result and result.markdown:
+            t_rec = time.monotonic()
             recovered = recover_lost_canvas_tables(result.markdown, path)
-            if recovered != result.markdown:
+            rec_ms = round((time.monotonic() - t_rec) * 1000)
+            table_recovered = (recovered != result.markdown)
+            pipeline_trace.append({
+                "stage": "canvas_table_recovery",
+                "status": "recovered" if table_recovered else "no_tables_needed",
+                "recovered": table_recovered,
+                "duration_ms": rec_ms,
+            })
+            if table_recovered:
                 logger.info(
                     "[%s] Reconstructed uncaptured canvas table(s) locally via 2D geometry.",
                     filename,
@@ -243,7 +331,16 @@ class ConversionService(ConversionServicePort):
 
         if (is_pdf or is_image) and allow_vision_fallback and self._vision_rescue.is_enabled():
             gate_path = path if is_pdf else None
+            t_gate = time.monotonic()
             passed, reasons = evaluate_quality_gate(result.markdown, result.text, pdf_path=gate_path)
+            gate_ms = round((time.monotonic() - t_gate) * 1000)
+            pipeline_trace.append({
+                "stage": "final_quality_gate",
+                "status": "passed" if passed else "failed",
+                "passed": passed,
+                "reasons": reasons,
+                "duration_ms": gate_ms,
+            })
             if not passed:
                 logger.warning(
                     "[%s] Quality gate failed for %s (%s). Attempting Vision LLM rescue...",
@@ -252,9 +349,20 @@ class ConversionService(ConversionServicePort):
                     "; ".join(reasons),
                 )
                 try:
+                    t_vis = time.monotonic()
                     rescued = self._vision_rescue.rescue(path, filename, embed_images=embed_images)
+                    vis_ms = round((time.monotonic() - t_vis) * 1000)
+                    pipeline_trace.append({
+                        "stage": "tier_c_vision_rescue",
+                        "status": "success",
+                        "model": config.vision_model,
+                        "duration_ms": vis_ms,
+                        "original_engine": result.engine,
+                    })
                     rescued.info["original_engine"] = result.engine
                     rescued.info["quality_gate_reasons"] = reasons
+                    rescued.pipeline_trace = pipeline_trace
+                    rescued.info["pipeline_trace"] = pipeline_trace
                     return rescued
                 except Exception as exc:
                     logger.error(
@@ -263,7 +371,13 @@ class ConversionService(ConversionServicePort):
                         exc,
                         result.engine,
                     )
+                    pipeline_trace.append({
+                        "stage": "tier_c_vision_rescue_failed",
+                        "error": str(exc),
+                    })
 
+        result.pipeline_trace = pipeline_trace
+        result.info["pipeline_trace"] = pipeline_trace
         return result
 
 

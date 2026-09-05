@@ -1,7 +1,7 @@
 """Domain entities and value objects for document extraction."""
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 
 class DocumentFormat(str, Enum):
@@ -42,6 +42,7 @@ class ConversionResult:
     engine: str
     duration_ms: int = 0
     info: Dict[str, Any] = field(default_factory=dict)
+    pipeline_trace: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serializes to the JSON dictionary expected by client contracts."""
@@ -54,5 +55,6 @@ class ConversionResult:
             "engine": self.engine,
             "duration_ms": self.duration_ms,
             "info": self.info,
+            "pipeline_trace": self.pipeline_trace,
         }
         return payload
