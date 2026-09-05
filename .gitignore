@@ -1,29 +1,12 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-.venv/
+# Rust build artifacts
+/target/
+**/target/
 
-# Testing & Coverage
-.pytest_cache/
-.coverage
-htmlcov/
+# Go build artifacts (mini dev server)
+server/bin/
+server/server
 
-# Caches & Storage
-cache/
-models/
-.build_cache/
-.cache/
-
-# Environment variables & local secrets
-.env
-*.local
-
-# IDE
+# Editor / IDE
 .vscode/
 .idea/
 *.swp
@@ -31,11 +14,3 @@ models/
 # OS
 .DS_Store
 Thumbs.db
-
-# Sensitive / Personal Document Fixtures (Keep strictly on private repository)
-tests/fixtures/
-*.pdf
-*.vision.md
-*.jpg
-*.jpeg
-*.png

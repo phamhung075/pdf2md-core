@@ -1,201 +1,93 @@
 # pdf2md-core
 
-> **High-Performance, Multi-Tier Document-to-Markdown & RAG Ingestion Engine**
+> **Sub-millisecond, native Rust PDF→Markdown engine** — digital text-layer
+> extraction with 2D spatial canvas table reconstruction. Dual-licensed MIT /
+> Apache-2.0. Zero GPL/AGPL dependencies.
 
 [![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
-[![Docker](https://img.shields.io/badge/docker-ready-green.svg)](Dockerfile)
-[![MCP](https://img.shields.io/badge/MCP-2.1.1-purple.svg)](https://modelcontextprotocol.io)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 
-`pdf2md-core` is an open-source, production-ready document conversion engine designed for Retrieval-Augmented Generation (RAG) pipelines, knowledge bases, and LLM agent ingestion. It converts PDFs, Office documents, and scans into pristine GitHub Flavored Markdown (GFM) while preserving **2D table matrices, multi-column reading order, and LaTeX math formulas**.
+`pdf2md-core` is a compiled, native engine that converts digital (text-layer)
+PDFs into clean GitHub Flavored Markdown (GFM) — including pipe tables
+reconstructed from 2D span geometry — in microseconds. It is the fast,
+zero-cloud-cost foundation for RAG ingestion pipelines, CLI tooling, and
+in-browser document processing.
 
----
+## What's inside
 
-## Key Features
+| Component | Description |
+| :--- | :--- |
+| [`crates/pdf2md-core`](crates/pdf2md-core) | The native Rust engine: byte-level parsing, digital-PDF triage, 2D canvas table reconstruction. Ships as a Rust library, a Python wheel (PyO3/Maturin), and a C ABI (`libpdf2md_core`) for Go/cgo and other languages. |
+| [`crates/pdf2md-cli`](crates/pdf2md-cli) | `pdf2md` — a pipe-friendly, native command-line tool built on the core. |
+| [`crates/pdf2md-wasm`](crates/pdf2md-wasm) | WebAssembly target for 100% client-side, in-browser conversion. |
+| [`server`](server) | A minimal Go dev server (`/health`, `/convert`, sandbox UI) that calls the Rust core directly via cgo. |
 
-- **Tri-Tier Hybrid Conversion Pipeline:**
-  - **Tier A (Fast Path - Compiled Rust Core, ~0.001s - 0.05s):** Sub-millisecond digital PDF text extraction with 2D spatial canvas geometry for zero-cost, ultra-high-throughput conversions (213x faster than pure ML).
-  - **Tier B (Local CPU Layout, ~2.0s):** IBM Docling with TableFormer for complex tables, multi-column layouts, and hierarchical reading order. Operates entirely offline on CPU.
-  - **Tier C (Vision Rescue, ~1.5s):** Automatic fallback to Gemini Flash API for degraded scans, low-contrast photos, and rotated pages.
-- **Model Context Protocol (MCP) Server:** Native MCP integration supporting both `stdio` and `SSE` transports for Claude Desktop, Cursor, and AI coding agents.
-- **Zero-GPU Footprint:** Optimized for standard CPU hardware (x86_64 and ARM64 / Apple Silicon).
-- **Built-in Dev UI:** Includes an interactive web sandbox with PDF preview and split-screen comparison.
-- **Privacy First:** Stateless, in-memory processing with zero persistent document retention.
+## Quick start
 
----
-
-## Architecture Overview
-
-```
-                      ┌───────────────────────────┐
-                      │     Incoming Document     │
-                      └─────────────┬─────────────┘
-                                    │
-                                    ▼
-                      ┌───────────────────────────┐
-                      │    Fast Digital Triage    │
-                      │      (0.001s - 0.05s)     │
-                      └─────────────┬─────────────┘
-                                    │
-                         Is Digital Text Layer OK?
-                                   / \
-                            YES   /   \   NO / Empty
-                                 /     \
-                                ▼       ▼
- ┌────────────────────────────────┐   ┌────────────────────────────────┐
- │     Fast Digital Markdown      │   │    Quality & Language Gate     │
- │   Export (span-level layout)   │   │  (Alphanumeric / Noise ratio)  │
- └────────────────┬───────────────┘   └───────────────┬────────────────┘
-                  │                                   │
-                  ▼                                   ▼
-        Fails Quality Gate?                 Layout Complexity Check
-               / \                                   / \
-        NO    /   \   YES                     Tables/   \  Scanned /
-             /     \                          Columns    \ Degraded
-            ▼       ▼                            │        \   │
- ┌─────────────────────┐                         ▼         ▼  ▼
- │ Final Markdown OK   │          ┌───────────────────┐  ┌───────────────────┐
- │ Return to Client    │          │  Local Layout     │  │  Gemini Flash     │
- └─────────────────────┘          │  IBM Docling      │  │  Vision Rescue    │
-                                  │  (TableFormer)    │  │  (Remote API)     │
-                                  └─────────┬─────────┘  └─────────┬─────────┘
-                                            │                      │
-                                            ▼                      ▼
-                                  ┌──────────────────────────────────────────┐
-                                  │        Clean Output Verification         │
-                                  │  • Format GFM pipe tables                │
-                                  │  • Preserve inline/display LaTeX math    │
-                                  └──────────────────────────────────────────┘
-```
-
----
-
-## Quick Start with Docker
-
-### 1. Run via Docker Compose
+### CLI (native binary)
 
 ```bash
-git clone https://github.com/phamhung075/pdf2md-core.git
-cd pdf2md-core
-
-# Start the microservice (downloads models on first build)
-docker compose up -d --build
+cargo install --path crates/pdf2md-cli
+pdf2md document.pdf -o document.md
 ```
 
-### 2. Verify Health
+### Go mini dev server
 
 ```bash
-curl http://127.0.0.1:3984/health
+cd server
+make run
+# http://127.0.0.1:8989  — upload sandbox
+curl -X POST http://127.0.0.1:8989/convert --data-binary @document.pdf
 ```
 
-Expected output:
-```json
-{
-  "status": "ok",
-  "service": "markdown-extract",
-  "engine": "docling",
-  "pdfFastPath": true,
-  "visionFallback": {
-    "enabled": true,
-    "model": "gemini-flash-latest",
-    "hasApiKey": false
-  },
-  "devUi": true
-}
-```
+See [`server/README.md`](server/README.md).
 
-### 3. Open the Interactive Dev UI
-
-Navigate to [http://127.0.0.1:3984/](http://127.0.0.1:3984/) in your browser to test documents with live PDF side-by-side comparison.
-
----
-
-## API Usage
-
-### Convert Document to Markdown
+### Python wheel (PyO3)
 
 ```bash
-curl -X POST http://127.0.0.1:3984/extract \
-  -H "X-File-Name: sample.pdf" \
-  -H "Content-Type: application/pdf" \
-  --data-binary "@path/to/document.pdf"
+cd crates/pdf2md-core
+maturin develop --release
 ```
 
-Response format:
-```json
-{
-  "status": "ok",
-  "engine": "fast_path",
-  "duration_ms": 45,
-  "page_count": 4,
-  "markdown": "# Document Title\n\n| Column 1 | Column 2 |\n|---|---|\n| Data A | Data B |\n"
-}
+```python
+import pdf2md_core
+pdf2md_core.convert_pdf_bytes(open("doc.pdf", "rb").read())
 ```
 
-### Force Vision Rescue (Gemini Fallback)
-
-To force visual OCR rescue on degraded scans:
+### In-browser (WASM)
 
 ```bash
-curl -X POST "http://127.0.0.1:3984/extract?force_vision=1" \
-  -H "X-File-Name: scan.pdf" \
-  --data-binary "@path/to/scan.pdf"
+cd crates/pdf2md-wasm
+wasm-pack build --target web --out-dir pkg --release
 ```
 
----
+## C ABI (embedding)
 
-## Model Context Protocol (MCP) Integration
+`crates/pdf2md-core` exports a stable C ABI declared in
+[`include/pdf2md.h`](crates/pdf2md-core/include/pdf2md.h):
 
-`pdf2md-core` includes a built-in MCP server for AI coding assistants and agents:
-
-### Stdio Transport (e.g., Claude Desktop, Cursor)
-
-Add to your `claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "pdf2md": {
-      "command": "python",
-      "args": ["/path/to/pdf2md-core/run_mcp.py"]
-    }
-  }
-}
+```c
+char *pdf2md_convert(const uint8_t *bytes, size_t len);  /* -> JSON, free with pdf2md_free_string */
+int   pdf2md_is_digital(const uint8_t *bytes, size_t len);
+void  pdf2md_free_string(char *ptr);
+char *pdf2md_version(void);
 ```
 
----
-
-## Environment Variables
-
-| Variable | Default | Description |
-| :--- | :--- | :--- |
-| `DOCLING_SERVICE_PORT` | `3984` | HTTP server port |
-| `DOCLING_SERVICE_HOST` | `0.0.0.0` | Bind host address |
-| `DOCLING_PDF_FAST_PATH` | `1` | Enable fast-path digital text triage |
-| `DOCLING_EMBED_IMAGES` | `1` | Enable image extraction and referencing |
-| `DOCLING_OCR_LANGS` | `eng,fra,vie` | OCR languages for fallback engine |
-| `DOCLING_DEV_UI` | `1` | Enable/disable browser test UI |
-| `GEMINI_API_KEY` | `""` | Google Gemini API key for Tier C vision rescue |
-| `VISION_MODEL` | `gemini-flash-latest` | Gemini model identifier for vision rescue |
-| `MAX_UPLOAD_SIZE_MB` | `100` | Maximum file upload size in megabytes |
-
----
-
-## Running Tests
+Build the shared library without Python bindings:
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run unit and integration tests
-pytest tests/ -v
-
-# Run automated service check
-python test_service.py --health
+cd crates/pdf2md-core
+cargo build --release --no-default-features
+# -> target/release/libpdf2md_core.so
 ```
 
----
+## Scope
+
+`pdf2md-core` handles **digital PDFs** — documents that already contain a text
+layer. Scanned / image-only documents (OCR, vision LLM rescue) and heavy ML
+layout models are intentionally out of scope here and belong to the hosted
+service tier.
 
 ## License
 
-This project is licensed under the **MIT License** or **Apache License 2.0** — see the [LICENSE](LICENSE) file for details.
+Licensed under either of [MIT](LICENSE) or Apache License 2.0, at your option.

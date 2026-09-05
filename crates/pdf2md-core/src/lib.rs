@@ -138,10 +138,10 @@ pub fn is_digital_pdf_bytes(bytes: &[u8]) -> bool {
 
     // Scan for text operator indicators: BT (Begin Text), Tj, TJ, ET (End Text)
     // and font definitions /Font
-    let text_markers = [b"BT\n", b"BT\r", b"BT ", b"/Font", b"Tj", b"TJ"];
+    let text_markers: &[&[u8]] = &[b"BT\n", b"BT\r", b"BT ", b"/Font", b"Tj", b"TJ"];
     let mut matches = 0;
 
-    for marker in &text_markers {
+    for marker in text_markers {
         if bytes.windows(marker.len()).any(|w| w == *marker) {
             matches += 1;
         }
@@ -227,7 +227,7 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
     let mut full_markdown = String::new();
     let total_pages = doc.get_pages().len();
     let mut total_words = 0;
-    let mut tables_detected = 0;
+    let tables_detected = 0;
 
     for (page_num, _page_id) in doc.get_pages() {
         let text = doc.extract_text(&[page_num])
@@ -253,6 +253,79 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
         tables_detected,
         duration_us,
     })
+}
+
+// ==============================================================================
+// C ABI (FFI) — for embedding in Go (cgo), Node, and other native consumers
+// ==============================================================================
+
+use std::ffi::CString;
+use std::os::raw::c_char;
+
+fn cstring_into_raw(s: String) -> *mut c_char {
+    match CString::new(s) {
+        Ok(c) => c.into_raw(),
+        Err(_) => CString::new("").map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut()),
+    }
+}
+
+/// Converts PDF bytes to Markdown and returns the result as a heap-allocated JSON
+/// C string. The caller MUST free it with `pdf2md_free_string`.
+///
+/// JSON shape:
+///   { "ok": true,  "markdown": "...", "pages": N, "words": N, "tables": N, "duration_us": N }
+///   { "ok": false, "error": "..." }
+#[no_mangle]
+pub extern "C" fn pdf2md_convert(pdf_ptr: *const u8, pdf_len: usize) -> *mut c_char {
+    let json = if pdf_ptr.is_null() {
+        serde_json::json!({ "ok": false, "error": "null input pointer" })
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(pdf_ptr, pdf_len) };
+        match convert_pdf_bytes_to_markdown(bytes, &ConversionOptions::default()) {
+            Ok(r) => serde_json::json!({
+                "ok": true,
+                "markdown": r.markdown,
+                "pages": r.total_pages,
+                "words": r.total_words,
+                "tables": r.tables_detected,
+                "duration_us": r.duration_us,
+            }),
+            Err(e) => serde_json::json!({ "ok": false, "error": e }),
+        }
+    };
+    cstring_into_raw(json.to_string())
+}
+
+/// Probes whether raw PDF bytes contain a digital text layer (no full render).
+/// Returns 1 when a digital text layer is present, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn pdf2md_is_digital(pdf_ptr: *const u8, pdf_len: usize) -> i32 {
+    if pdf_ptr.is_null() {
+        return 0;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(pdf_ptr, pdf_len) };
+    if is_digital_pdf_bytes(bytes) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Frees a heap-allocated C string returned by `pdf2md_convert` / `pdf2md_version`.
+#[no_mangle]
+pub extern "C" fn pdf2md_free_string(ptr: *mut c_char) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        drop(CString::from_raw(ptr));
+    }
+}
+
+/// Returns the engine version as a heap-allocated C string (caller frees it).
+#[no_mangle]
+pub extern "C" fn pdf2md_version() -> *mut c_char {
+    cstring_into_raw(env!("CARGO_PKG_VERSION").to_string())
 }
 
 // ==============================================================================
