@@ -10,10 +10,8 @@ docling[rapidocr]==2.125.0
 # for opencv-python-headless (same version) right after install; on a headless host do the same:
 #   pip uninstall opencv-python && pip install opencv-python-headless==5.0.0.93
 #
-# Optional digital-PDF fast path (pdf_fast_path.py; DOCLING_PDF_FAST_PATH=1). Model-free: pymupdf
-# probes the text layer, pymupdf4llm converts it. Both are small wheels; behavior is unchanged
-# while the flag is off.
-pymupdf>=1.24.9
-pymupdf4llm>=0.0.17
+# Digital-PDF fast path (DOCLING_PDF_FAST_PATH=1). Permissive BSD-3-Clause / Apache-2.0.
+# pypdf provides fast model-free digital text extraction without copyleft risk.
+pypdf>=5.0.0
 # Model Context Protocol (MCP) server SDK for agentic AI tools
 mcp>=1.2.0

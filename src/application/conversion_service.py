@@ -53,7 +53,7 @@ class ConversionService(ConversionServicePort):
         if not self._warned_fast_fallback:
             self._warned_fast_fallback = True
             logger.warning(
-                "[fast-path] pymupdf4llm failed for %s — falling back to Docling (%s); "
+                "[fast-path] pypdf fast-path failed for %s — falling back to Docling (%s); "
                 "disable DOCLING_PDF_FAST_PATH if this repeats",
                 filename,
                 exc,
@@ -177,7 +177,7 @@ class ConversionService(ConversionServicePort):
                 try:
                     logger.info("[%s] Checking digital-PDF fast path (DOCLING_PDF_FAST_PATH=1)...", filename)
                     if self._fast_path.is_digital(path):
-                        logger.info("[%s] Fast path converted digital PDF via pymupdf4llm.", filename)
+                        logger.info("[%s] Fast path converted digital PDF via pypdf fast-path.", filename)
                         fast_result = self._fast_path.convert(path, filename, embed_images=embed_images)
                         # Evaluate fast path output before accepting it
                         eval_md = fast_result.markdown

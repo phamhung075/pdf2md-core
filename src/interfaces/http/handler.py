@@ -181,7 +181,7 @@ class ExtractServiceHandler(BaseHTTPRequestHandler):
             or self.headers.get("x-force-vision", "").lower() in ("1", "true", "yes", "on")
         )
 
-        # Fast path option (?fast_path=0 or ?engine=docling bypasses pymupdf4llm)
+        # Fast path option (?fast_path=0 or ?engine=docling bypasses pypdf fast-path)
         allow_fast_path = True
         fp_param = qs.get("fast_path", [""])[0].lower() or self.headers.get("x-fast-path", "").lower()
         engine_param = qs.get("engine", [""])[0].lower() or self.headers.get("x-engine", "").lower()

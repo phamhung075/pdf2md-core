@@ -514,20 +514,32 @@ def detect_canvas_table_grids(
     and multi-column line clustering (including wrapped continuation lines).
     """
     try:
-        import pymupdf
+        import pypdfium2
     except ImportError:
         return []
 
     grids: List[CanvasTableGrid] = []
     try:
-        doc = pymupdf.open(pdf_path)
+        doc = pypdfium2.PdfDocument(pdf_path)
     except Exception:
         return []
 
     try:
         for pno in range(len(doc)):
             page = doc[pno]
-            words = page.get_text("words")
+            tp = page.get_textpage()
+            n_rects = tp.count_rects()
+            if n_rects == 0:
+                continue
+
+            words = []
+            for i in range(n_rects):
+                rect = tp.get_rect(i)  # (left, bottom, right, top)
+                txt = tp.get_text_bounded(*rect).strip()
+                if txt:
+                    for w in txt.split():
+                        words.append((rect[0], rect[1], rect[2], rect[3], w))
+
             if not words:
                 continue
 
@@ -717,7 +729,7 @@ def recover_lost_canvas_tables(markdown: str, pdf_path: str) -> str:
         return markdown
 
     try:
-        import pymupdf
+        import pypdfium2
     except ImportError:
         return markdown
 
@@ -727,7 +739,7 @@ def recover_lost_canvas_tables(markdown: str, pdf_path: str) -> str:
 
     md_tokens = extract_markdown_table_tokens(markdown)
     try:
-        doc = pymupdf.open(pdf_path)
+        doc = pypdfium2.PdfDocument(pdf_path)
     except Exception:
         return markdown
 
@@ -740,7 +752,15 @@ def recover_lost_canvas_tables(markdown: str, pdf_path: str) -> str:
                 continue
 
             page = doc[g.page_number - 1]
-            words = page.get_text("words")
+            tp = page.get_textpage()
+            words = []
+            for i in range(tp.count_rects()):
+                rect = tp.get_rect(i)
+                txt = tp.get_text_bounded(*rect).strip()
+                if txt:
+                    for w in txt.split():
+                        words.append((rect[0], rect[1], rect[2], rect[3], w))
+
             grid_word_set = set(g.words)
             matched_words = [w for w in words if w[4].lower() in grid_word_set]
             if not matched_words:

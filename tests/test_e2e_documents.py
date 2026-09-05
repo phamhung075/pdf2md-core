@@ -88,8 +88,9 @@ class TestTableEdgeCases(unittest.TestCase):
         if not os.path.isfile(BILLET_PATH):
             self.skipTest("Billet fixture not found")
 
-        import pymupdf4llm
-        raw_md = pymupdf4llm.to_markdown(BILLET_PATH)
+        from src.infrastructure.converters.fast_path_adapter import FastPathConverterAdapter
+        adapter = FastPathConverterAdapter()
+        raw_md = adapter.convert(BILLET_PATH).markdown
         check = check_ragged_tables(raw_md)
         self.assertFalse(check.passed, "check_ragged_tables should have failed on fragmented table")
         self.assertIn("sparse rows", check.detail)
@@ -181,7 +182,7 @@ class TestConversionRoutingEdgeCases(unittest.TestCase):
             allow_vision_fallback=False,
         )
         res = service.convert_request(req)
-        self.assertEqual(res.engine, "pymupdf4llm")
+        self.assertEqual(res.engine, "pypdf-fast-path")
         self.assertIn("Reçu de paiement / Receipt", res.markdown)
         self.assertIn("Montant total", res.markdown)
 

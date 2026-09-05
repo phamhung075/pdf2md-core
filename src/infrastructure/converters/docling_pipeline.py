@@ -74,21 +74,21 @@ def warmup() -> None:
 
     # 2. Run a synthetic table conversion in-memory to load Heron + TableFormer weights into PyTorch memory
     try:
-        import pymupdf  # type: ignore
         from docling.datamodel.base_models import DocumentStream  # type: ignore
 
-        doc = pymupdf.open()
-        page = doc.new_page(width=400, height=300)
-        page.draw_rect(pymupdf.Rect(50, 50, 350, 150), color=(0, 0, 0), width=1)
-        page.draw_line(pymupdf.Point(50, 80), pymupdf.Point(350, 80), color=(0, 0, 0), width=1)
-        page.draw_line(pymupdf.Point(150, 50), pymupdf.Point(150, 150), color=(0, 0, 0), width=1)
-        page.insert_text((60, 70), "Col 1")
-        page.insert_text((160, 70), "Col 2")
-        page.insert_text((60, 110), "Val 1")
-        page.insert_text((160, 110), "Val 2")
-        pdf_bytes = doc.tobytes()
-        doc.close()
-
+        # Static, valid minimal PDF with simple text and table structure for warm-up
+        pdf_bytes = (
+            b"%PDF-1.4\n"
+            b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+            b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+            b"3 0 obj<</Type/Page/MediaBox[0 0 400 300]/Parent 2 0 R/Contents 4 0 R>>endobj\n"
+            b"4 0 obj<</Length 84>>stream\n"
+            b"BT /F1 12 Tf 60 230 Td (Col 1) Tj 100 0 Td (Col 2) Tj -100 -40 Td (Val 1) Tj 100 0 Td (Val 2) Tj ET\n"
+            b"endstream\nendobj\n"
+            b"xref\n0 5\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n"
+            b"0000000115 00000 n \n0000000214 00000 n \n"
+            b"trailer<</Size 5/Root 1 0 R>>\nstartxref\n348\n%%EOF\n"
+        )
         conv.convert(DocumentStream(name="warmup_init.pdf", stream=io.BytesIO(pdf_bytes)))
         elapsed = round(time.monotonic() - t0, 2)
         logger.info("Docling pipeline warm-up completed in %s sec.", elapsed)

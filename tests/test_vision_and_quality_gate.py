@@ -206,7 +206,7 @@ class TestConversionServiceRescue(unittest.TestCase):
             text="",
             raw_text="",
             numpages=1,
-            engine="pymupdf4llm",
+            engine="pypdf-fast-path",
         )
         # Docling succeeds and produces valid output
         self.mock_docling.convert.return_value = ConversionResult(
@@ -391,15 +391,15 @@ class TestVisionGeminiAdapter(unittest.TestCase):
 
     def test_partial_page_fallback(self):
         adapter = VisionGeminiAdapter()
-        mock_pymupdf = MagicMock()
+        mock_pdfium = MagicMock()
         mock_doc = MagicMock()
-        mock_doc.page_count = 2
+        mock_doc.__len__.return_value = 2
 
         page0 = MagicMock()
         page1 = MagicMock()
-        page1.get_text.return_value = "Extracted plain text for page 2"
-        mock_doc.load_page.side_effect = [page0, page1]
-        mock_pymupdf.open.return_value = mock_doc
+        page1.get_textpage.return_value.get_text_range.return_value = "Extracted plain text for page 2"
+        mock_doc.__getitem__.side_effect = [page0, page1]
+        mock_pdfium.PdfDocument.return_value = mock_doc
 
         def fake_render(item):
             p_num, _ = item
@@ -408,8 +408,8 @@ class TestVisionGeminiAdapter(unittest.TestCase):
             raise RuntimeError("API rate limit exhausted for page 2")
 
         import src.infrastructure.converters.vision_gemini_adapter as vga
-        with patch.object(vga, "_HAVE_PYMUPDF", True), \
-             patch.object(vga, "pymupdf", mock_pymupdf), \
+        with patch.object(vga, "_HAVE_PDFIUM", True), \
+             patch.object(vga, "pypdfium2", mock_pdfium), \
              patch.object(adapter, "_render_and_transcribe_page", side_effect=fake_render):
             result = adapter.rescue("dummy.pdf", "dummy.pdf")
             self.assertIn("# Page 1 Markdown", result.markdown)

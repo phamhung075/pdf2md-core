@@ -19,11 +19,11 @@ from src.infrastructure.config import config
 from src.infrastructure.logging.stream_logger import logger
 
 try:
-    import pymupdf  # type: ignore
-    _HAVE_PYMUPDF = True
+    import pypdfium2  # type: ignore
+    _HAVE_PDFIUM = True
 except Exception:  # pragma: no cover
-    pymupdf = None
-    _HAVE_PYMUPDF = False
+    pypdfium2 = None
+    _HAVE_PDFIUM = False
 
 VISION_PROMPT = """You are an expert document OCR engine. Transcribe this document page into clean, standard GitHub-Flavored Markdown.
 - Accurately preserve all text, numbers, dates, formulas, and accents (including French accents and Vietnamese tonal diacritics: ă, â, đ, ê, ô, ơ, ư).
@@ -37,8 +37,8 @@ class VisionGeminiAdapter(VisionRescuePort):
     """Rescues documents by rendering pages to images and processing with a Vision LLM."""
 
     def is_enabled(self) -> bool:
-        """Returns True if PyMuPDF and API keys are available."""
-        return _HAVE_PYMUPDF and config.vision_fallback_enabled and bool(config.gemini_api_key or config.vision_base_url)
+        """Returns True if PDF renderer and API keys are available."""
+        return _HAVE_PDFIUM and config.vision_fallback_enabled and bool(config.gemini_api_key or config.vision_base_url)
 
     def _execute_http_request_with_retry(
         self,
@@ -226,11 +226,14 @@ class VisionGeminiAdapter(VisionRescuePort):
         return clean
 
     def _render_and_transcribe_page(self, page_tuple: Tuple[int, Any]) -> Tuple[int, str]:
-        """Renders one PDF page and sends it to the Vision LLM."""
+        """Renders one PDF page using pypdfium2 and sends it to the Vision LLM."""
         page_num, page = page_tuple
-        pix = page.get_pixmap(dpi=config.vision_dpi)
-        img_bytes = pix.tobytes("jpeg")
-        b64_str = base64.b64encode(img_bytes).decode("utf-8")
+        scale = config.vision_dpi / 72.0
+        bitmap = page.render(scale=scale)
+        pil_image = bitmap.to_pil()
+        buffer = io.BytesIO()
+        pil_image.save(buffer, format="JPEG", quality=85)
+        b64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
         t0 = time.monotonic()
         page_md = self._transcribe_image(b64_str, "image/jpeg", page_num=page_num + 1)
         elapsed = round((time.monotonic() - t0) * 1000)
@@ -294,12 +297,12 @@ class VisionGeminiAdapter(VisionRescuePort):
                 },
             )
 
-        if not _HAVE_PYMUPDF or pymupdf is None:
-            raise RuntimeError("PyMuPDF is required for Vision rescue of PDF documents")
+        if not _HAVE_PDFIUM or pypdfium2 is None:
+            raise RuntimeError("pypdfium2 is required for Vision rescue of PDF documents")
 
-        doc = pymupdf.open(file_path)
+        doc = pypdfium2.PdfDocument(file_path)
         try:
-            total_pages = doc.page_count
+            total_pages = len(doc)
             if total_pages == 0:
                 raise ValueError(f"Empty PDF document: {file_path}")
 
@@ -311,7 +314,7 @@ class VisionGeminiAdapter(VisionRescuePort):
                 )
 
             # Load page objects
-            page_items = [(i, doc.load_page(i)) for i in range(pages_to_process)]
+            page_items = [(i, doc[i]) for i in range(pages_to_process)]
 
             # Concurrently process pages with controlled concurrency to prevent 503/429 overload
             max_workers = min(config.vision_concurrency, max(1, pages_to_process))
@@ -336,7 +339,7 @@ class VisionGeminiAdapter(VisionRescuePort):
                         )
                         # Extract local text if available as graceful per-page fallback
                         try:
-                            fallback_text = p_obj.get_text().strip()
+                            fallback_text = p_obj.get_textpage().get_text_range().strip()
                         except Exception:
                             fallback_text = ""
                         if fallback_text:
