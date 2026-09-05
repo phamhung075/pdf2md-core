@@ -343,6 +343,7 @@ def test_file(path: str, cfg: dict, verbose: bool):
                 details.append("table recovered" if stage["recovered"] else "no table recovery needed")
             d_str = f" ({', '.join(details)})" if details else ""
             steps.append(("ok", f"    {idx}. [{s_name}] {s_status}{d_str}"))
+        record["pipelineTrace"] = pipeline_trace
 
     if cfg["out_dir"]:
         stem = re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:120]
