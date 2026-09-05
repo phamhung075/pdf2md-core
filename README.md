@@ -97,7 +97,7 @@ Expected output:
   "pdfFastPath": true,
   "visionFallback": {
     "enabled": true,
-    "model": "gemini-2.0-flash",
+    "model": "gemini-flash-latest",
     "hasApiKey": false
   },
   "devUi": true
@@ -176,7 +176,7 @@ Add to your `claude_desktop_config.json`:
 | `DOCLING_OCR_LANGS` | `eng,fra,vie` | OCR languages for fallback engine |
 | `DOCLING_DEV_UI` | `1` | Enable/disable browser test UI |
 | `GEMINI_API_KEY` | `""` | Google Gemini API key for Tier C vision rescue |
-| `VISION_MODEL` | `gemini-2.0-flash` | Gemini model identifier for vision rescue |
+| `VISION_MODEL` | `gemini-flash-latest` | Gemini model identifier for vision rescue |
 | `MAX_UPLOAD_SIZE_MB` | `100` | Maximum file upload size in megabytes |
 
 ---

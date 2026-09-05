@@ -47,7 +47,8 @@ ENGINE_LABELS = {
     "docling-image": "Docling Image pipeline (Heron layout + TableFormer + RapidOCR PP-OCRv6 fr)",
     "docling-native": "Docling native readers (office formats; file's own structure, no OCR)",
     "pymupdf4llm": "pymupdf4llm fast path (digital text-layer PDF; opt-in DOCLING_PDF_FAST_PATH)",
-    "vision:gemini-2.0-flash": "Vision LLM rescue (Gemini 2.0 Flash via Vision API)",
+    "vision:gemini-flash-latest": "Vision LLM rescue (Gemini Flash Latest via Vision API)",
+    "vision:gemini-3.8-flash": "Vision LLM rescue (Gemini 3.8 Flash via Vision API)",
     "vision:gemini-1.5-flash": "Vision LLM rescue (Gemini 1.5 Flash via Vision API)",
 }
 EXT_ROUTING = {

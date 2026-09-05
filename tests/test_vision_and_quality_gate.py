@@ -248,7 +248,7 @@ class TestConversionServiceRescue(unittest.TestCase):
             text="Rescued Invoice",
             raw_text="Rescued Invoice",
             numpages=1,
-            engine="vision:gemini-2.0-flash",
+            engine="vision:gemini-flash-latest",
             info={"rescued_by_vision": True},
         )
 
@@ -260,7 +260,7 @@ class TestConversionServiceRescue(unittest.TestCase):
         result = self.service.convert_request(req)
 
         self.mock_vision.rescue.assert_called_once()
-        self.assertEqual(result.engine, "vision:gemini-2.0-flash")
+        self.assertEqual(result.engine, "vision:gemini-flash-latest")
         self.assertIn("original_engine", result.info)
         self.assertEqual(result.info["original_engine"], "docling-pdf")
         self.assertIn("quality_gate_reasons", result.info)
@@ -273,7 +273,7 @@ class TestConversionServiceRescue(unittest.TestCase):
             text="Force Vision",
             raw_text="Force Vision",
             numpages=1,
-            engine="vision:gemini-2.0-flash",
+            engine="vision:gemini-flash-latest",
         )
 
         req = ExtractionRequest(
@@ -284,7 +284,7 @@ class TestConversionServiceRescue(unittest.TestCase):
         )
         result = self.service.convert_request(req)
 
-        self.assertEqual(result.engine, "vision:gemini-2.0-flash")
+        self.assertEqual(result.engine, "vision:gemini-flash-latest")
         self.mock_docling.convert.assert_not_called()
         self.mock_vision.rescue.assert_called_once()
 
