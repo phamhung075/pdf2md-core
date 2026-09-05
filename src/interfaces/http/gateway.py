@@ -37,6 +37,7 @@ from src.infrastructure.config import config, uptime_sec
 from src.infrastructure.converters.fast_path_adapter import FastPathConverterAdapter
 from src.infrastructure.dev_assets import get_dev_asset
 from src.infrastructure.logging.stream_logger import logger
+from src.infrastructure.middleware.rate_limiter import RateLimitMiddleware
 
 # Initialize application
 app = FastAPI(
@@ -44,6 +45,9 @@ app = FastAPI(
     description="Deterministic layout-aware Markdown extraction microservice with native Rust fast path.",
     version="1.0.0",
 )
+
+# Rate Limiter Middleware (Token-Bucket: 5 req/10 min anon, 120 req/min auth)
+app.add_middleware(RateLimitMiddleware)
 
 # CORS middleware
 origins = [o.strip() for o in config.allowed_origins.split(",") if o.strip()]
@@ -371,15 +375,32 @@ async def create_conversion_job(
     file_b64 = base64.b64encode(content).decode("ascii")
 
     try:
-        from src.infrastructure.queue.tasks import convert_document_task
-        task = convert_document_task.delay(
-            file_b64,
-            clean_filename,
-            {"embed_images": config.embed_images, "allow_fast_path": True},
+        is_interactive = bool(
+            user_token
+            or (request.headers.get("X-Priority", "")).lower() in ("high", "interactive")
+            or (request.headers.get("X-Client", "")).lower() in ("obsidian", "mobile")
         )
+        if is_interactive:
+            from src.infrastructure.queue.tasks import convert_document_interactive
+            task = convert_document_interactive.delay(
+                file_b64,
+                clean_filename,
+                {"embed_images": config.embed_images, "allow_fast_path": True},
+            )
+            queue_name = "queue:interactive"
+        else:
+            from src.infrastructure.queue.tasks import convert_document_batch
+            task = convert_document_batch.delay(
+                file_b64,
+                clean_filename,
+                {"embed_images": config.embed_images, "allow_fast_path": True},
+            )
+            queue_name = "queue:batch"
+
         return {
             "job_id": task.id,
             "status": "PENDING",
+            "queue": queue_name,
             "filename": clean_filename,
             "check_status_url": f"/v1/jobs/{task.id}",
         }
