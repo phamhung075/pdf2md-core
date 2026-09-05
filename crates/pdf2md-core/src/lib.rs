@@ -3,6 +3,9 @@
 //!
 //! Licensed under MIT OR Apache-2.0. Zero AGPL/GPL dependencies.
 
+mod glyph_data;
+mod text_extract;
+
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
@@ -230,8 +233,13 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
     let tables_detected = 0;
 
     for (page_num, _page_id) in doc.get_pages() {
-        let text = doc.extract_text(&[page_num])
-            .unwrap_or_default();
+        // Prefer our own multilingual decoder (correct WinAnsi/Differences/
+        // ToUnicode handling — see text_extract.rs) and only fall back to
+        // lopdf's extractor when the page content cannot be parsed at all.
+        let text = match text_extract::extract_page_text(&doc, page_num) {
+            Ok(t) => t,
+            Err(_) => doc.extract_text(&[page_num]).unwrap_or_default(),
+        };
 
         let words: Vec<&str> = text.split_whitespace().collect();
         total_words += words.len();
