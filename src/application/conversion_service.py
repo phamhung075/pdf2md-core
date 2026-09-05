@@ -75,7 +75,9 @@ class ConversionService(ConversionServicePort):
             request.filename, len(request.content), checksum[:12], checksum[-6:], ext
         )
 
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        # Architectural rule: prefer /dev/shm RAM disk to prevent disk wear and guarantee zero persistent leakage
+        shm_dir = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
+        with tempfile.NamedTemporaryFile(dir=shm_dir, suffix=suffix, delete=False) as f:
             f.write(request.content)
             temp_path = f.name
 

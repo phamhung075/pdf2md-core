@@ -1,19 +1,14 @@
-# markdown-extract-service — Docling file→Markdown microservice.
+# markdown-extract-service — Complete dependencies
 #
-# Pinned to the exact docling version the service was measured with (2.125.0, RapidOCR PP-OCRv6 via
-# the rapidocr extra, onnxruntime backend). The rapidocr wheel bundles the PP-OCRv6 onnx models, so
-# the only downloads happen for the layout/table models at image BUILD time (Dockerfile runs the
-# pipeline warm-up) — runtime is offline.
-docling[rapidocr]==2.125.0
-# NOTE: rapidocr pulls the GUI `opencv-python` wheel, whose 4.14+/5.x builds need Qt/X11 system
-# libs (libxcb, libGL) and crash on import in slim/headless environments. The Dockerfile swaps it
-# for opencv-python-headless (same version) right after install; on a headless host do the same:
-#   pip uninstall opencv-python && pip install opencv-python-headless==5.0.0.93
-#
-# Digital-PDF fast path (DOCLING_PDF_FAST_PATH=1). Permissive MIT / Apache-2.0 / BSD-3.
-# pdf-oxide: compiled Rust core with Python bindings for sub-millisecond native Markdown extraction.
-pdf-oxide>=0.3.70
-# pypdf: pure-Python secondary fallback for legacy PDF forms.
-pypdf>=5.0.0
+# Heavy ML/OCR engine dependencies (cached in Docker base layer)
+# Includes: docling[rapidocr]==2.125.0, pdf-oxide>=0.3.70, pypdf>=5.0.0
+-r requirements-base.txt
+
 # Model Context Protocol (MCP) server SDK for agentic AI tools
 mcp>=1.2.0
+
+# Production SaaS Web Gateway & Decoupled Compute Pipeline (Step 1)
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+celery>=5.4.0
+redis>=5.0.0

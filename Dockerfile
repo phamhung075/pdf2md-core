@@ -30,7 +30,10 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY requirements.txt ./
+# 1. Install heavy ML/OCR base dependencies and warm up models.
+# By isolating requirements-base.txt, changes to application packages (FastAPI, Celery, etc.)
+# will NEVER invalidate the 2+ minute PyTorch/Docling/OCR download, install, or warmup layers.
+COPY requirements-base.txt ./
 # rapidocr (docling[rapidocr]) requires the GUI `opencv-python` dist, but its 4.14+/5.x wheels
 # link Qt/X11 (libxcb, libGL) and cannot even be imported on slim. Swap in
 # opencv-python-headless (same version). Order matters: uninstall the GUI wheel FIRST — both
@@ -39,7 +42,7 @@ COPY requirements.txt ./
 # Install CPU-only PyTorch first to prevent pulling ~6 GB of unused NVIDIA CUDA GPU binaries on slim CPU images.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision \
-    && pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt \
+    && pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-base.txt \
     && pip uninstall -y opencv-python \
     && pip install opencv-python-headless==5.0.0.93 \
     && python -c "import cv2, onnxruntime"   # fail the build fast if the OCR stack cannot import
@@ -64,6 +67,11 @@ warmup()
 
 shutil.copytree(target_dir, cache_dir, dirs_exist_ok=True)
 EOF
+
+# 2. Install lightweight application / gateway / protocol dependencies
+COPY requirements.txt ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
 
 # Application, domain, infrastructure, and interface code AFTER warm-up
 COPY --chown=appuser:appgroup src/ ./src/

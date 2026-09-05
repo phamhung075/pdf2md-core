@@ -1,0 +1,8 @@
+# markdown-extract-service — Base Heavy ML & OCR dependencies
+#
+# Pinned to docling 2.125.0 with RapidOCR PP-OCRv6 via onnxruntime backend.
+docling[rapidocr]==2.125.0
+# Digital-PDF fast path (DOCLING_PDF_FAST_PATH=1). Permissive MIT / Apache-2.0 / BSD-3.
+pdf-oxide>=0.3.70
+# Pure-Python secondary fallback for legacy PDF forms.
+pypdf>=5.0.0
