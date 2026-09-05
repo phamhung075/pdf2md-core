@@ -36,6 +36,8 @@ def get_dev_asset(request_path: str) -> Optional[Tuple[bytes, str]]:
         rel_path = "test.html"
     elif request_path in ("/test/compare", "/test/compare/"):
         rel_path = "compare.html"
+    elif request_path in ("/test/sandbox", "/test/sandbox/"):
+        rel_path = "sandbox.html"
     elif request_path.startswith("/test/"):
         rel_path = unquote(request_path[len("/test/"):].split("?")[0])
     else:
