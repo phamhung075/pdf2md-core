@@ -119,6 +119,8 @@ def get_root():
             "to_markdown": "/to-markdown (POST alias)",
             "sync_v1": "/v1/convert (POST synchronous conversion)",
             "async_v1": "/v1/jobs (POST async Celery job creation, GET /v1/jobs/{id})",
+            "webhook_telegram": "/v1/webhooks/telegram (POST Telegram Bot update)",
+            "webhook_whatsapp": "/v1/webhooks/whatsapp (GET verification, POST WhatsApp Cloud notification)",
             "dev_test_ui": "/test (GET; requires DOCLING_DEV_UI=1)"
             if config.dev_ui
             else "disabled (set DOCLING_DEV_UI=1 to enable /test page)",
@@ -238,6 +240,7 @@ async def extract_document(
     fast_path: Optional[bool] = Query(None),
     engine: Optional[str] = Query(None),
     vision_fallback: Optional[bool] = Query(None),
+    frontmatter: bool = Query(False, description="Prepend structured YAML frontmatter block"),
     x_force_vision: Optional[str] = Header(None),
     x_fast_path: Optional[str] = Header(None),
     x_engine: Optional[str] = Header(None),
@@ -303,7 +306,11 @@ async def extract_document(
     loop = asyncio.get_running_loop()
     try:
         result: ConversionResult = await loop.run_in_executor(None, _conversion_service.convert_request, req)
-        return result.to_dict()
+        payload = result.to_dict()
+        if frontmatter:
+            from src.domain.metadata_extractor import prepend_yaml_frontmatter
+            payload["markdown"] = prepend_yaml_frontmatter(payload["markdown"], filename=clean_filename)
+        return payload
     except Exception as e:
         logger.error("Conversion failed for %s: %s", clean_filename, e)
         raise HTTPException(status_code=500, detail=f"Conversion error: {e}")
@@ -318,6 +325,7 @@ async def convert_v1(
     request: Request,
     file: Optional[UploadFile] = File(None),
     x_file_name: Optional[str] = Header(None),
+    frontmatter: bool = Query(False, description="Prepend structured YAML frontmatter block"),
     user_token: Optional[Dict[str, Any]] = Depends(verify_keycloak_jwt),
 ):
     """SaaS Synchronous conversion endpoint for interactive PKM / API clients (<15s)."""
@@ -338,6 +346,9 @@ async def convert_v1(
     try:
         result = await loop.run_in_executor(None, _conversion_service.convert_request, req)
         resp = result.to_dict()
+        if frontmatter:
+            from src.domain.metadata_extractor import prepend_yaml_frontmatter
+            resp["markdown"] = prepend_yaml_frontmatter(resp["markdown"], filename=clean_filename)
         resp["success"] = True
         return resp
     except Exception as e:
@@ -409,3 +420,54 @@ def get_job_status(job_id: str, user_token: Optional[Dict[str, Any]] = Depends(v
             return {"job_id": job_id, "status": state}
     except Exception as e:
         return {"job_id": job_id, "status": "UNKNOWN", "error": str(e)}
+
+
+# ==============================================================================
+# Step 3: Mobile Bots Webhook Handlers (Telegram & WhatsApp Cloud API)
+# ==============================================================================
+
+@app.post("/v1/webhooks/telegram")
+async def telegram_webhook(request: Request):
+    """Stateless webhook receiver for Telegram Bot updates."""
+    try:
+        update = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON update payload")
+
+    from src.interfaces.webhooks.telegram_bot import handle_telegram_update
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    return handle_telegram_update(update, _conversion_service, bot_token=bot_token)
+
+
+@app.get("/v1/webhooks/whatsapp")
+def whatsapp_verify_challenge(
+    hub_mode: Optional[str] = Query(None, alias="hub.mode"),
+    hub_verify_token: Optional[str] = Query(None, alias="hub.verify_token"),
+    hub_challenge: Optional[str] = Query(None, alias="hub.challenge"),
+):
+    """Meta WhatsApp Cloud API webhook verification challenge handshake."""
+    from src.interfaces.webhooks.whatsapp_bot import verify_whatsapp_challenge
+    expected_token = os.environ.get("WHATSAPP_VERIFY_TOKEN", "pdf2md_secret")
+    challenge = verify_whatsapp_challenge(hub_mode, hub_verify_token, hub_challenge, expected_token)
+    if challenge is None:
+        raise HTTPException(status_code=403, detail="Verification token mismatch")
+    return RawResponse(content=challenge, media_type="text/plain")
+
+
+@app.post("/v1/webhooks/whatsapp")
+async def whatsapp_notification(request: Request):
+    """Meta WhatsApp Cloud API incoming message notification webhook."""
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    from src.interfaces.webhooks.whatsapp_bot import handle_whatsapp_notification
+    access_token = os.environ.get("WHATSAPP_ACCESS_TOKEN")
+    phone_id = os.environ.get("WHATSAPP_PHONE_NUMBER_ID")
+    return handle_whatsapp_notification(
+        payload,
+        _conversion_service,
+        phone_number_id=phone_id,
+        access_token=access_token,
+    )
