@@ -1,5 +1,6 @@
 """Unit tests for Quality Gate and Vision LLM Rescue fallback."""
 import json
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -458,8 +459,27 @@ class TestTableNormalizationAndSparseGate(unittest.TestCase):
     def test_canvas_table_grid_detection(self):
         from src.domain.quality_gate import detect_canvas_table_grids
 
+        # Helper to find private fixtures if present
+        def _find_fixture(name: str):
+            candidates = [
+                os.environ.get("TEST_FIXTURES_DIR"),
+                os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "tests", "fixtures"),
+                os.path.join(os.path.dirname(__file__), "fixtures"),
+                "/tmp/fixtures",
+            ]
+            for c in candidates:
+                if c and os.path.isdir(c):
+                    p = os.path.join(c, name)
+                    if os.path.isfile(p):
+                        return p
+            return None
+
         # Test on billet_electronique.pdf
-        billet_grids = detect_canvas_table_grids("tests/fixtures/billet_electronique.pdf")
+        billet = _find_fixture("billet_electronique.pdf")
+        if not billet:
+            self.skipTest("Private personal fixture not present (quarantined to private repository).")
+
+        billet_grids = detect_canvas_table_grids(billet)
         self.assertGreaterEqual(len(billet_grids), 2)
         # Verify receipt table detected on page 2
         p2_grids = [g for g in billet_grids if g.page_number == 2]
@@ -468,19 +488,37 @@ class TestTableNormalizationAndSparseGate(unittest.TestCase):
         self.assertIn("billet", p2_grids[0].words)
 
         # Test on payment_receipt.pdf
-        receipt_grids = detect_canvas_table_grids("tests/fixtures/payment_receipt.pdf")
-        self.assertGreaterEqual(len(receipt_grids), 1)
-        self.assertIn("nom", receipt_grids[0].words)
-        self.assertIn("reçu", receipt_grids[0].words)
+        receipt = _find_fixture("payment_receipt.pdf")
+        if receipt:
+            receipt_grids = detect_canvas_table_grids(receipt)
+            self.assertGreaterEqual(len(receipt_grids), 1)
+            self.assertIn("nom", receipt_grids[0].words)
+            self.assertIn("reçu", receipt_grids[0].words)
 
     def test_lost_table_capture_canvas_detection(self):
         from src.domain.quality_gate import check_lost_table_capture
 
+        def _find_fixture(name: str):
+            candidates = [
+                os.environ.get("TEST_FIXTURES_DIR"),
+                os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "tests", "fixtures"),
+                os.path.join(os.path.dirname(__file__), "fixtures"),
+                "/tmp/fixtures",
+            ]
+            for c in candidates:
+                if c and os.path.isdir(c):
+                    p = os.path.join(c, name)
+                    if os.path.isfile(p):
+                        return p
+            return None
+
+        billet = _find_fixture("billet_electronique.pdf")
+        if not billet:
+            self.skipTest("Private personal fixture not present (quarantined to private repository).")
+
         # Missing table in markdown should fail canvas quality check
         missing_table_md = "# Electronic Ticket\n\nSome plain text without pipe tables."
-        res_missing = check_lost_table_capture(
-            missing_table_md, pdf_path="tests/fixtures/billet_electronique.pdf"
-        )
+        res_missing = check_lost_table_capture(missing_table_md, pdf_path=billet)
         self.assertFalse(res_missing.passed)
         self.assertIn("Lost table capture: 2D canvas table", res_missing.detail)
 
@@ -499,13 +537,29 @@ class TestTableNormalizationAndSparseGate(unittest.TestCase):
             "| --- | --- | --- | --- | --- | --- |\n"
             "| TRAN MINH PHUC MR | 057 148 584 490 5 | Carte Master/Eurocard | EUR 575.00 | EUR 315.15 | EUR 890.15 |\n"
         )
-        res_captured = check_lost_table_capture(
-            captured_table_md, pdf_path="tests/fixtures/billet_electronique.pdf"
-        )
+        res_captured = check_lost_table_capture(captured_table_md, pdf_path=billet)
         self.assertTrue(res_captured.passed)
 
     def test_recover_lost_canvas_tables(self):
         from src.domain.quality_gate import recover_lost_canvas_tables, evaluate_quality_gate
+
+        def _find_fixture(name: str):
+            candidates = [
+                os.environ.get("TEST_FIXTURES_DIR"),
+                os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "tests", "fixtures"),
+                os.path.join(os.path.dirname(__file__), "fixtures"),
+                "/tmp/fixtures",
+            ]
+            for c in candidates:
+                if c and os.path.isdir(c):
+                    p = os.path.join(c, name)
+                    if os.path.isfile(p):
+                        return p
+            return None
+
+        billet = _find_fixture("billet_electronique.pdf")
+        if not billet:
+            self.skipTest("Private personal fixture not present (quarantined to private repository).")
 
         # Markdown where page 1 flight table is captured, but page 2 receipt table was dumped as scrambled text
         partial_md = (
@@ -526,23 +580,18 @@ class TestTableNormalizationAndSparseGate(unittest.TestCase):
             "EUR 575.00 EUR 315.15 EUR 890.15\n"
         )
         # Without recovery, lost-table-capture fails because page 2 table is not in pipe markdown
-        passed_before, reasons_before = evaluate_quality_gate(
-            partial_md, pdf_path="tests/fixtures/billet_electronique.pdf"
-        )
+        passed_before, reasons_before = evaluate_quality_gate(partial_md, pdf_path=billet)
         self.assertFalse(passed_before)
         self.assertTrue(any("lost-table-capture" in r for r in reasons_before))
 
         # After recovery, the canvas table is reconstructed
-        recovered_md = recover_lost_canvas_tables(
-            partial_md, pdf_path="tests/fixtures/billet_electronique.pdf"
-        )
+        recovered_md = recover_lost_canvas_tables(partial_md, pdf_path=billet)
         self.assertIn("|", recovered_md)
         self.assertIn("TRAN MINH PHUC", recovered_md)
 
         # Quality gate should now pass
-        passed_after, reasons_after = evaluate_quality_gate(
-            recovered_md, pdf_path="tests/fixtures/billet_electronique.pdf"
-        )
+        passed_after, reasons_after = evaluate_quality_gate(recovered_md, pdf_path=billet)
+        self.assertTrue(passed_after, f"Expected quality gate to pass, got reasons: {reasons_after}")
         self.assertTrue(passed_after, f"Expected quality gate to pass, got reasons: {reasons_after}")
 
     def test_degraded_vietnamese_ocr_quality_gate(self):

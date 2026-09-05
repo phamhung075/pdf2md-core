@@ -31,3 +31,11 @@ models/
 # OS
 .DS_Store
 Thumbs.db
+
+# Sensitive / Personal Document Fixtures (Keep strictly on private repository)
+tests/fixtures/
+*.pdf
+*.vision.md
+*.jpg
+*.jpeg
+*.png

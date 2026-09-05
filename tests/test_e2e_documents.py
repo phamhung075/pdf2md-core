@@ -22,23 +22,33 @@ from src.domain.rules import sanitize_filename
 from src.infrastructure.converters.fast_path_adapter import FastPathConverterAdapter
 from src.infrastructure.converters.vision_gemini_adapter import VisionGeminiAdapter
 
-FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
-BILLET_PATH = os.path.join(FIXTURES_DIR, "billet_electronique.pdf")
-RECEIPT_PATH = os.path.join(FIXTURES_DIR, "payment_receipt.pdf")
+def _find_fixture(name: str) -> str:
+    candidates = [
+        os.environ.get("TEST_FIXTURES_DIR"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "tests", "fixtures"),
+        os.path.join(os.path.dirname(__file__), "fixtures"),
+        "/tmp/fixtures",
+    ]
+    for c in candidates:
+        if c and os.path.isdir(c):
+            p = os.path.join(c, name)
+            if os.path.isfile(p):
+                return p
+    return os.path.join(os.path.dirname(__file__), "fixtures", name)
+
+
+BILLET_PATH = _find_fixture("billet_electronique.pdf")
+RECEIPT_PATH = _find_fixture("payment_receipt.pdf")
 
 
 class TestDocumentFixturesExist(unittest.TestCase):
-    """Ensures test fixtures are available."""
+    """Ensures test fixtures are available when running in private workspace."""
 
     def test_fixtures_present(self):
-        self.assertTrue(
-            os.path.isfile(BILLET_PATH),
-            f"Fixture missing: {BILLET_PATH}. Run copy command to populate tests/fixtures.",
-        )
-        self.assertTrue(
-            os.path.isfile(RECEIPT_PATH),
-            f"Fixture missing: {RECEIPT_PATH}. Run copy command to populate tests/fixtures.",
-        )
+        if not os.path.isfile(BILLET_PATH) and not os.path.isfile(RECEIPT_PATH):
+            self.skipTest("Private personal fixtures are safely quarantined in private repository.")
+        self.assertTrue(os.path.isfile(BILLET_PATH))
+        self.assertTrue(os.path.isfile(RECEIPT_PATH))
 
 
 class TestTableEdgeCases(unittest.TestCase):
