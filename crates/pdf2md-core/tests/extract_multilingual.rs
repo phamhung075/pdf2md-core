@@ -189,3 +189,15 @@ fn embedded_logo_image_surfaces_in_markdown_and_json() {
     // The text is still present above the image.
     assert!(res.markdown.contains("ACME Industries"));
 }
+
+#[test]
+fn caption_adjacency_tags_figure_text() {
+    // The fixture places a logo and a short nearby title line. When layout
+    // blocks are produced, the title may be tagged caption (or stay body) but
+    // must not be dropped and the markdown must still carry the embedded logo.
+    let bytes = std::fs::read("tests/fixtures/synth_logo_image.pdf").expect("fixture missing");
+    let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
+        .expect("logo page should convert");
+    assert!(res.markdown.contains("data:image/png;base64,"));
+    assert!(res.markdown.contains("ACME Industries"));
+}

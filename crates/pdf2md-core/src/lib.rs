@@ -298,9 +298,9 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
         any_fonts |= page_text.has_fonts;
         tables_detected += page_text.tables;
         let text = page_text.text.clone();
-        for mut b in page_text.blocks {
+        let mut page_blocks: Vec<layout::DocBlock> = page_text.blocks;
+        for b in &mut page_blocks {
             b.page = page_num as usize;
-            block_items.push(b);
         }
 
         let page_media: Vec<media::MediaItem> = if options.detect_media {
@@ -309,6 +309,28 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
         } else {
             Vec::new()
         };
+
+        // Figure + caption adjacency: when this page has structured layout
+        // blocks, mark the short text line attached to a content image as a
+        // caption so the block list reads like a document ("figure -> caption").
+        if options.detect_layout && !page_media.is_empty() && !page_blocks.is_empty() {
+            for m in page_media.iter().filter(|m| !m.decorative) {
+                let my = (m.y0 + m.y1) / 2.0;
+                let best = page_blocks.iter_mut().filter(|b| b.kind != "figure").min_by(|a, b2| {
+                    let da = ((a.y0 + a.y1) / 2.0 - my).abs();
+                    let db = ((b2.y0 + b2.y1) / 2.0 - my).abs();
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                if let Some(b) = best {
+                    let gap = (my - (b.y0 + b.y1) / 2.0).abs();
+                    let size_hint = (b.y1 - b.y0).abs().max(8.0);
+                    if gap <= 2.5 * size_hint && b.text.split_whitespace().count() <= 9 {
+                        b.kind = "caption".to_string();
+                    }
+                }
+            }
+        }
+        block_items.extend(page_blocks);
 
         // Words are counted from the text layer only, so corpus text-word
         // baselines are unaffected by image embedding.
