@@ -4,6 +4,7 @@
 //! Licensed under MIT OR Apache-2.0. Zero AGPL/GPL dependencies.
 
 mod glyph_data;
+mod layout;
 mod text_extract;
 
 use serde::{Deserialize, Serialize};

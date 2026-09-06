@@ -64,6 +64,27 @@ fn type3_glyph_encoded_reports_ocr_required() {
 }
 
 #[test]
+fn glyph_positioned_page_is_reassembled_in_reading_order() {
+    // LibreOffice-form style output: one glyph per `BT … Tm … TD … TJ … ET`
+    // block, absolute positions, NO space glyphs (word boundaries are encoded
+    // as inter-glyph gaps), and lines emitted out of reading order. The
+    // geometry engine must (1) sort lines top-to-bottom and (2) recover the
+    // gap-encoded spaces.
+    let md = convert("tests/fixtures/synth_fiche_glyphs.pdf");
+    // "Vie Privée" (top) must precede "Liens personnels" (bottom) even though
+    // the fixture emits "Liens personnels" first.
+    let vie = md.find("Vie Privée").expect("top line missing");
+    let liens = md.find("Liens personnels").expect("bottom line missing");
+    assert!(
+        vie < liens,
+        "reading order wrong: 'Vie Privée' should come before 'Liens personnels':\n{md}"
+    );
+    // Gap-encoded spaces must be recovered (no merged words).
+    assert!(md.contains("Vie Privée"), "word gap not recovered:\n{md}");
+    assert!(md.contains("Liens personnels"), "word gap not recovered:\n{md}");
+}
+
+#[test]
 fn compressed_text_layer_ticket_is_detected_and_extracted() {
     // Electronic tickets (e.g. "billet électronique") store their content
     // streams FlateDecode-compressed, so the raw bytes contain no "BT"/"Tj"

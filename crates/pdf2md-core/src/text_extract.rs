@@ -39,11 +39,11 @@ use crate::glyph_data::{AGL_NAMES, MAC_ROMAN, WIN_ANSI};
 /// Decoded byte-oriented (8-bit simple font) encoding table.
 /// `0` means "this char code has no Unicode mapping" (skip).
 #[derive(Clone, Copy)]
-struct ByteTable([u16; 256]);
+pub(crate) struct ByteTable([u16; 256]);
 
 /// A parsed `/ToUnicode` CMap: 1-4 byte source codes -> UTF-16 destinations.
 #[derive(Clone, Default)]
-struct CMapCodec {
+pub(crate) struct CMapCodec {
     /// Exact single mappings: (source code length in bytes, source code) -> UTF-16.
     exact: HashMap<(u8, u32), Vec<u16>>,
     /// bfrange with a single incrementing destination: (len, lo, hi, dst_lo);
@@ -51,8 +51,41 @@ struct CMapCodec {
     ranges: Vec<(u8, u32, u32, u32)>,
 }
 
+impl CMapCodec {
+    /// Look up a source code and return its destination as a single integer
+    /// (first UTF-16 unit). Used for `/Encoding` CID maps (code -> CID), whose
+    /// destinations are single 16-bit values.
+    pub(crate) fn lookup(&self, bytes: &[u8]) -> Option<u32> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let mut code: u32 = 0;
+        for &b in bytes {
+            code = (code << 8) | b as u32;
+        }
+        for len in 1u8..=4u8 {
+            let n = len as usize;
+            if n != bytes.len() {
+                continue;
+            }
+            if let Some(units) = self.exact.get(&(len, code)) {
+                return units.first().map(|&u| u as u32);
+            }
+            if let Some(dst) = self
+                .ranges
+                .iter()
+                .find(|(rl, lo, hi, _)| *rl == len && code >= *lo && code <= *hi)
+                .map(|(_, lo, _, dst_lo)| dst_lo + (code - lo))
+            {
+                return Some(dst);
+            }
+        }
+        None
+    }
+}
+
 #[derive(Clone)]
-enum Codec {
+pub(crate) enum Codec {
     Byte8(ByteTable),
     /// ToUnicode CMap, with an optional byte-table fallback for simple fonts
     /// whose CMap does not cover the actual char codes used on the page.
@@ -66,7 +99,7 @@ fn push_utf16(out: &mut String, units: &[u16]) {
 }
 
 impl Codec {
-    fn decode(&self, bytes: &[u8], out: &mut String) {
+    pub(crate) fn decode(&self, bytes: &[u8], out: &mut String) {
         match self {
             Codec::Byte8(t) => decode_byte_table(t, bytes, out),
             Codec::CMap(cm, fallback) => {
@@ -136,7 +169,7 @@ fn decode_cmap(cm: &CMapCodec, bytes: &[u8], out: &mut String) {
 // CMap parsing (bfchar / bfrange / codespacerange subset)
 // ---------------------------------------------------------------------------
 
-fn parse_cmap(data: &[u8]) -> Option<CMapCodec> {
+pub(crate) fn parse_cmap(data: &[u8]) -> Option<CMapCodec> {
     let toks = cmap_tokens(data);
     let mut cm = CMapCodec::default();
     let mut i = 0usize;
@@ -319,12 +352,12 @@ fn hex_to_units(hex: &[u8]) -> Option<Vec<u16>> {
 // Font encoding resolution
 // ---------------------------------------------------------------------------
 
-fn get_name<'a>(dict: &'a Dictionary, key: &[u8]) -> Option<&'a [u8]> {
+pub(crate) fn get_name<'a>(dict: &'a Dictionary, key: &[u8]) -> Option<&'a [u8]> {
     dict.get(key).ok().and_then(|o| o.as_name().ok())
 }
 
 /// Follow indirect references to the underlying object.
-fn deref<'d>(doc: &'d Document, obj: &'d Object) -> Option<&'d Object> {
+pub(crate) fn deref<'d>(doc: &'d Document, obj: &'d Object) -> Option<&'d Object> {
     let mut cur = obj;
     for _ in 0..16 {
         match cur {
@@ -426,7 +459,7 @@ fn font_to_unicode(doc: &Document, font: &Dictionary) -> Option<CMapCodec> {
     parse_cmap(&data)
 }
 
-fn resolve_codec(doc: &Document, font: &Dictionary) -> Option<Codec> {
+pub(crate) fn resolve_codec(doc: &Document, font: &Dictionary) -> Option<Codec> {
     let subtype = get_name(font, b"Subtype").unwrap_or(b"");
 
     if subtype == b"Type0" {
@@ -485,7 +518,6 @@ fn show_text(out: &mut String, codec: &Codec, operands: &[Object]) {
         match operand {
             Object::String(bytes, _) => push_decoded(out, codec, bytes),
             Object::Array(items) => {
-                let before = out.len();
                 for item in items {
                     match item {
                         Object::String(bytes, _) => push_decoded(out, codec, bytes),
@@ -497,11 +529,6 @@ fn show_text(out: &mut String, codec: &Codec, operands: &[Object]) {
                         }
                         _ => {}
                     }
-                }
-                // A TJ array is normally followed by further text on the same
-                // line; keep a single separator (e.g. between table cells).
-                if out.len() > before && !ends_with_ws(out) {
-                    out.push(' ');
                 }
             }
             _ => {}
@@ -530,9 +557,91 @@ fn extract_page(doc: &Document, page_id: ObjectId) -> Result<PageText, String> {
         .get_and_decode_page_content(page_id)
         .map_err(|e| format!("{e}"))?;
 
+    // Glyph-positioned pages (one glyph per text object with absolute
+    // coordinates, e.g. LibreOffice forms) need a geometry engine — word
+    // boundaries are encoded as inter-glyph gaps, not as space glyphs, and the
+    // content stream is not in reading order. Delegate those to `layout`.
+    //
+    // Signature: `TJ` arrays only (no plain `Tj` strings) **and** per-glyph
+    // `TD` positioning. Docs that use `Tm` with multi-string `TJ` arrays
+    // (e.g. some Enedis bills) still extract correctly through the string
+    // walker, so they must not be re-routed.
+    let has_tj = content.operations.iter().any(|op| op.operator == "TJ");
+    let has_tj_plain = content.operations.iter().any(|op| op.operator == "Tj");
+    let has_td = content.operations.iter().any(|op| op.operator == "TD");
+    if has_tj && !has_tj_plain && has_td {
+        return crate::layout::extract_page_glyphs(doc, page_id);
+    }
+
     let mut out = String::new();
     let mut cur: Option<usize> = None;
     let mut text_ops_seen = false;
+
+    // Position-aware reconstruction for "absolute" layout producers (form
+    // generators, table tools, print drivers) that place one glyph per block
+    // with explicit `Tm`/`TD` coordinates and a `TJ` array (no spaces in the
+    // strings). There word/line boundaries must be inferred from coordinates: a
+    // baseline `y` change is a line break, a large `x` gap on the same baseline
+    // is a separator, a small gap means "join". This mode is only engaged when
+    // the page actually mixes absolute positioning (`Tm`/`TD`) with `TJ`
+    // arrays. Ordinary documents that draw whole-line strings with `Tj` and
+    // relative `Td` moves (EDF/Enedis, tickets, books) keep the simple
+    // heuristic — spaces come from the strings, line breaks from `ET`/`T*` — so
+    // coordinate noise never breaks them.
+    let has_tj_array = content.operations.iter().any(|op| op.operator == "TJ");
+    let has_abs_pos = content
+        .operations
+        .iter()
+        .any(|op| matches!(op.operator.as_str(), "Tm" | "TD"));
+    let pos_mode = has_tj_array && has_abs_pos;
+    let line_eps = 0.5; // points: a y jump larger than this starts a new line
+    let space_eps = 1.0; // points: an x gap larger than this on the same line is a separator
+    let mut cur_pos: Option<(f64, f64)> = None;
+    let mut prev_pos: Option<(f64, f64)> = None;
+    let mut last_pos_show = false;
+
+    fn pos2(op: &Operation, i: usize) -> Option<(f64, f64)> {
+        let a = op.operands.get(i)?.as_float().ok()? as f64;
+        let b = op.operands.get(i + 1)?.as_float().ok()? as f64;
+        Some((a, b))
+    }
+
+    // Emit one text-show with optional coordinate-driven spacing/preceding
+    // newline. Sets `last_pos_show` so the following `ET` does not double the
+    // line break.
+    fn show_pos(
+        out: &mut String,
+        codec: &Codec,
+        operands: &[Object],
+        pos_mode: bool,
+        line_eps: f64,
+        space_eps: f64,
+        cur_pos: &mut Option<(f64, f64)>,
+        prev_pos: &mut Option<(f64, f64)>,
+        last_pos_show: &mut bool,
+    ) {
+        if pos_mode {
+            // In coordinate mode spacing is decided by the y/x gaps alone, so
+            // the following `ET`/`T*` must never add a second line break.
+            *last_pos_show = true;
+            if let (Some((px, py)), Some((cx, cy))) = (*prev_pos, *cur_pos) {
+                if (cy - py).abs() > line_eps {
+                    if !ends_with_ws(out) {
+                        out.push('\n');
+                    }
+                } else if (cx - px).abs() > space_eps {
+                    if !ends_with_ws(out) {
+                        out.push(' ');
+                    }
+                }
+            }
+            show_text(out, codec, operands);
+            *prev_pos = *cur_pos;
+        } else {
+            *last_pos_show = false;
+            show_text(out, codec, operands);
+        }
+    }
 
     for op in &content.operations {
         match op.operator.as_str() {
@@ -540,14 +649,29 @@ fn extract_page(doc: &Document, page_id: ObjectId) -> Result<PageText, String> {
                 let name = op.operands.first().and_then(|o| o.as_name().ok());
                 cur = name.and_then(|nm| codecs.iter().position(|(n, _)| n == nm));
             }
-            "Tj" | "TJ" => {
+            "Tm" => {
+                cur_pos = pos2(op, 4);
+            }
+            "TD" => {
+                cur_pos = pos2(op, 0);
+            }
+            "Tj" => {
                 text_ops_seen = true;
                 if let Some(ci) = cur {
-                    show_text(&mut out, &codecs[ci].1, &op.operands);
+                    show_pos(&mut out, &codecs[ci].1, &op.operands, pos_mode, line_eps, space_eps,
+                             &mut cur_pos, &mut prev_pos, &mut last_pos_show);
+                }
+            }
+            "TJ" => {
+                text_ops_seen = true;
+                if let Some(ci) = cur {
+                    show_pos(&mut out, &codecs[ci].1, &op.operands, pos_mode, line_eps, space_eps,
+                             &mut cur_pos, &mut prev_pos, &mut last_pos_show);
                 }
             }
             "'" => {
                 text_ops_seen = true;
+                last_pos_show = false;
                 if !ends_with_ws(&out) {
                     out.push('\n');
                 }
@@ -557,6 +681,7 @@ fn extract_page(doc: &Document, page_id: ObjectId) -> Result<PageText, String> {
             }
             "\"" => {
                 text_ops_seen = true;
+                last_pos_show = false;
                 if !ends_with_ws(&out) {
                     out.push('\n');
                 }
@@ -566,9 +691,15 @@ fn extract_page(doc: &Document, page_id: ObjectId) -> Result<PageText, String> {
                     }
                 }
             }
-            "ET" | "T*" => {
-                if !ends_with_ws(&out) {
+            // `ET`/`T*` mark line breaks for the string-based case. When the
+            // previous show was a positionally-placed glyph, the y-jump already
+            // produced the break; suppress the extra newline.
+            "T*" | "ET" => {
+                if !last_pos_show && !ends_with_ws(&out) {
                     out.push('\n');
+                }
+                if op.operator.as_str() == "T*" {
+                    prev_pos = None;
                 }
             }
             _ => {}
@@ -582,20 +713,9 @@ fn extract_page(doc: &Document, page_id: ObjectId) -> Result<PageText, String> {
     })
 }
 
-/// Extract readable text for one page (1-based page numbers, as used by
-/// `Document::get_pages`). Errors only when the page content cannot be parsed;
-/// the caller may then fall back to lopdf's own extractor.
-pub fn extract_page_text(doc: &Document, page_number: u32) -> Result<String, String> {
-    let pages: std::collections::BTreeMap<u32, ObjectId> = doc.get_pages();
-    let page_id = pages
-        .get(&page_number)
-        .copied()
-        .ok_or_else(|| format!("page {page_number} not found"))?;
-    extract_page(doc, page_id).map(|pt| pt.text)
-}
-
-/// Like [`extract_page_text`] but also reports whether the page contains
-/// text-show operators at all.
+/// Reports the text for one page (1-based page numbers, as used by
+/// `Document::get_pages`) plus whether the page contains text-show operators
+/// at all.
 pub fn extract_page_text_report(doc: &Document, page_number: u32) -> Result<PageText, String> {
     let pages: std::collections::BTreeMap<u32, ObjectId> = doc.get_pages();
     let page_id = pages
