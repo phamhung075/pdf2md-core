@@ -5,6 +5,7 @@
 
 mod glyph_data;
 mod layout;
+mod media;
 mod text_extract;
 
 use serde::{Deserialize, Serialize};
@@ -107,6 +108,8 @@ pub struct ConversionOptions {
     pub detect_tables: bool,
     pub detect_headings: bool,
     pub min_words_per_page: usize,
+    /// Extract placed images and return them as base64 media items.
+    pub detect_media: bool,
 }
 
 impl Default for ConversionOptions {
@@ -115,6 +118,7 @@ impl Default for ConversionOptions {
             detect_tables: true,
             detect_headings: true,
             min_words_per_page: 5,
+            detect_media: true,
         }
     }
 }
@@ -127,6 +131,9 @@ pub struct ConversionResult {
     pub total_words: usize,
     pub tables_detected: usize,
     pub duration_us: u64,
+    /// Extracted image placements (base64 payloads) when `detect_media`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<media::MediaItem>,
 }
 
 /// Probes whether raw PDF bytes contain a digital text stream without full rendering.
@@ -228,6 +235,20 @@ pub fn reconstruct_canvas_tables(spans: &[TextSpan]) -> Vec<CanvasTable> {
     }]
 }
 
+
+/// Best-effort device page box ([x0, y0, x1, y1]) from the page /MediaBox,
+/// used to classify full-page background images.
+fn page_media_box(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> Option<(f64, f64, f64, f64)> {
+    let dict = doc.get_dictionary(page_id).ok()?;
+    let mb = dict.get(b"MediaBox").ok()?.as_array().ok()?;
+    let g = |i: usize| -> Option<f64> {
+        mb.get(i)
+            .and_then(|o| o.as_float().ok().map(|f| f as f64))
+            .or_else(|| mb.get(i).and_then(|o| o.as_i64().ok().map(|v| v as f64)))
+    };
+    Some((g(0)?, g(1)?, g(2)?, g(3)?))
+}
+
 /// Converts PDF byte slice to clean Markdown with 2D spatial table reconstruction.
 pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) -> Result<ConversionResult, String> {
     let t0 = Instant::now();
@@ -242,6 +263,7 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
     let mut any_text_ops = false;
     let mut any_fonts = false;
     let mut tables_detected = 0usize;
+    let mut media_items: Vec<media::MediaItem> = Vec::new();
 
     for (page_num, page_id) in doc.get_pages() {
         // Prefer our own multilingual decoder (correct WinAnsi/Differences/
@@ -260,6 +282,12 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
         any_fonts |= page_text.has_fonts;
         tables_detected += page_text.tables;
         let text = page_text.text;
+
+        if options.detect_media {
+            let page_bbox = page_media_box(&doc, page_id);
+            let page_media = media::extract_page_media(&doc, page_id, page_num as usize, page_bbox);
+            media_items.extend(page_media);
+        }
 
         let words: Vec<&str> = text.split_whitespace().collect();
         total_words += words.len();
@@ -306,6 +334,7 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
         total_words,
         tables_detected,
         duration_us,
+        media: media_items,
     })
 }
 
@@ -327,7 +356,9 @@ fn cstring_into_raw(s: String) -> *mut c_char {
 /// C string. The caller MUST free it with `pdf2md_free_string`.
 ///
 /// JSON shape:
-///   { "ok": true,  "markdown": "...", "pages": N, "words": N, "tables": N, "duration_us": N }
+///   { "ok": true, "markdown": "...", "pages": N, "words": N, "tables": N,
+///     "media": [ { page, x0,y0,x1,y1, width,height, format, kind, decorative, repeat, data_b64 } ],
+///     "duration_us": N }
 ///   { "ok": false, "error": "..." }
 #[no_mangle]
 pub extern "C" fn pdf2md_convert(pdf_ptr: *const u8, pdf_len: usize) -> *mut c_char {
@@ -336,14 +367,18 @@ pub extern "C" fn pdf2md_convert(pdf_ptr: *const u8, pdf_len: usize) -> *mut c_c
     } else {
         let bytes = unsafe { std::slice::from_raw_parts(pdf_ptr, pdf_len) };
         match convert_pdf_bytes_to_markdown(bytes, &ConversionOptions::default()) {
-            Ok(r) => serde_json::json!({
-                "ok": true,
-                "markdown": r.markdown,
-                "pages": r.total_pages,
-                "words": r.total_words,
-                "tables": r.tables_detected,
-                "duration_us": r.duration_us,
-            }),
+            Ok(r) => {
+                let media_json = serde_json::to_value(&r.media).unwrap_or_else(|_| serde_json::json!([]));
+                serde_json::json!({
+                    "ok": true,
+                    "markdown": r.markdown,
+                    "pages": r.total_pages,
+                    "words": r.total_words,
+                    "tables": r.tables_detected,
+                    "media": media_json,
+                    "duration_us": r.duration_us,
+                })
+            }
             Err(e) => serde_json::json!({ "ok": false, "error": e }),
         }
     };

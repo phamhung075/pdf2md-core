@@ -35,7 +35,7 @@ use crate::{BoundingBox, CanvasTable};
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-struct Mtx {
+pub(crate) struct Mtx {
     a: f64,
     b: f64,
     c: f64,
@@ -45,7 +45,7 @@ struct Mtx {
 }
 
 impl Mtx {
-    const ID: Self = Mtx {
+    pub(crate) const ID: Self = Mtx {
         a: 1.0,
         b: 0.0,
         c: 0.0,
@@ -54,8 +54,13 @@ impl Mtx {
         f: 0.0,
     };
 
+    /// Construct from raw PDF matrix values [a b c d e f].
+    pub(crate) fn from_parts(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) -> Self {
+        Mtx { a, b, c, d, e, f }
+    }
+
     /// `self = self × rhs` (post-multiply).
-    fn post_mul(&mut self, rhs: &Mtx) {
+    pub(crate) fn post_mul(&mut self, rhs: &Mtx) {
         let a = self.a * rhs.a + self.b * rhs.c;
         let b = self.a * rhs.b + self.b * rhs.d;
         let c = self.c * rhs.a + self.d * rhs.c;
@@ -66,7 +71,7 @@ impl Mtx {
     }
 
     /// `self = lhs × self` (pre-multiply).
-    fn pre_mul(&mut self, lhs: &Mtx) {
+    pub(crate) fn pre_mul(&mut self, lhs: &Mtx) {
         let a = lhs.a * self.a + lhs.b * self.c;
         let b = lhs.a * self.b + lhs.b * self.d;
         let c = lhs.c * self.a + lhs.d * self.c;
@@ -76,11 +81,11 @@ impl Mtx {
         *self = Mtx { a, b, c, d, e, f };
     }
 
-    fn apply(&self, x: f64, y: f64) -> (f64, f64) {
+    pub(crate) fn apply(&self, x: f64, y: f64) -> (f64, f64) {
         (self.a * x + self.c * y + self.e, self.b * x + self.d * y + self.f)
     }
 
-    fn translate(tx: f64, ty: f64) -> Self {
+    pub(crate) fn translate(tx: f64, ty: f64) -> Self {
         Mtx {
             a: 1.0,
             b: 0.0,
@@ -96,14 +101,14 @@ impl Mtx {
     }
 }
 
-fn num(o: &Object) -> Option<f64> {
+pub(crate) fn num(o: &Object) -> Option<f64> {
     o.as_float()
         .ok()
         .map(|v| v as f64)
         .or_else(|| o.as_i64().ok().map(|v| v as f64))
 }
 
-fn mtx_from(op: &Operation) -> Option<Mtx> {
+pub(crate) fn mtx_from(op: &Operation) -> Option<Mtx> {
     Some(Mtx {
         a: num(op.operands.get(0)?)?,
         b: num(op.operands.get(1)?)?,
@@ -114,7 +119,7 @@ fn mtx_from(op: &Operation) -> Option<Mtx> {
     })
 }
 
-fn string_bytes(o: &Object) -> Option<&[u8]> {
+pub(crate) fn string_bytes(o: &Object) -> Option<&[u8]> {
     match o {
         Object::String(bytes, _) => Some(bytes),
         _ => None,

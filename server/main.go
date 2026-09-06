@@ -34,17 +34,33 @@ import (
 
 const maxUploadBytes = 100 << 20 // 100 MB
 
+type mediaItem struct {
+	Page       int     `json:"page"`
+	X0         float64 `json:"x0"`
+	Y0         float64 `json:"y0"`
+	X1         float64 `json:"x1"`
+	Y1         float64 `json:"y1"`
+	Width      int     `json:"width"`
+	Height     int     `json:"height"`
+	Format     string  `json:"format"`
+	Kind       string  `json:"kind"`
+	Decorative bool    `json:"decorative"`
+	Repeat     int     `json:"repeat"`
+	DataB64    string  `json:"data_b64,omitempty"`
+}
+
 type convertResponse struct {
-	OK         bool   `json:"ok"`
-	Markdown   string `json:"markdown,omitempty"`
-	Pages      int    `json:"pages"`
-	Words      int    `json:"words"`
-	Tables     int    `json:"tables"`
-	DurationUs uint64 `json:"duration_us"`
-	DurationMs int64  `json:"duration_ms,omitempty"`
-	Engine     string `json:"engine"`
-	Version    string `json:"version,omitempty"`
-	Error      string `json:"error,omitempty"`
+	OK         bool        `json:"ok"`
+	Markdown   string      `json:"markdown,omitempty"`
+	Pages      int         `json:"pages"`
+	Words      int         `json:"words"`
+	Tables     int         `json:"tables"`
+	Media      []mediaItem `json:"media,omitempty"`
+	DurationUs uint64      `json:"duration_us"`
+	DurationMs int64       `json:"duration_ms,omitempty"`
+	Engine     string      `json:"engine"`
+	Version    string      `json:"version,omitempty"`
+	Error      string      `json:"error,omitempty"`
 }
 
 func engineVersion() string {
