@@ -225,4 +225,17 @@ fn running_header_and_footer_are_tagged_in_block_list() {
             res.markdown
         );
     }
+    // Repeated header/footer lines are kept on their first page only.
+    assert_eq!(
+        res.markdown.matches("Rapport interne - CONFIDENTIEL").count(),
+        1,
+        "running header must appear once in markdown:\n{}",
+        res.markdown
+    );
+    assert_eq!(
+        res.markdown.matches("Document genere automatiquement").count(),
+        1,
+        "running footer must appear once in markdown:\n{}",
+        res.markdown
+    );
 }

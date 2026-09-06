@@ -348,6 +348,9 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
     let mut tables_detected = 0usize;
     let mut media_items: Vec<media::MediaItem> = Vec::new();
     let mut block_items: Vec<layout::DocBlock> = Vec::new();
+    // Per-page markdown chunks (page number, content) so running headers and
+    // footers can be suppressed after the doc-level furniture pass.
+    let mut page_md: Vec<(u32, String)> = Vec::new();
 
     for (page_num, page_id) in doc.get_pages() {
         // Prefer our own multilingual decoder (correct WinAnsi/Differences/
@@ -390,21 +393,54 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
 
         // Figure + caption adjacency: when this page has structured layout
         // blocks, mark the short text line attached to a content image as a
-        // caption so the block list reads like a document ("figure -> caption").
-        if options.detect_layout && !page_media.is_empty() && !page_blocks.is_empty() {
-            for m in page_media.iter().filter(|m| !m.decorative) {
-                let my = (m.y0 + m.y1) / 2.0;
-                let best = page_blocks.iter_mut().filter(|b| b.kind != "figure").min_by(|a, b2| {
-                    let da = ((a.y0 + a.y1) / 2.0 - my).abs();
-                    let db = ((b2.y0 + b2.y1) / 2.0 - my).abs();
-                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                if let Some(b) = best {
-                    let gap = (my - (b.y0 + b.y1) / 2.0).abs();
-                    let size_hint = (b.y1 - b.y0).abs().max(8.0);
-                    if gap <= 2.5 * size_hint && b.text.split_whitespace().count() <= 9 {
-                        b.kind = "caption".to_string();
+        // caption, and give the figure itself a role in the block list at its
+        // reading position (right before the text that follows it).
+        if options.detect_layout && !page_media.is_empty() {
+            let content: Vec<&media::MediaItem> =
+                page_media.iter().filter(|m| !m.decorative).collect();
+            if !content.is_empty() && !page_blocks.is_empty() {
+                for m in &content {
+                    let my = (m.y0 + m.y1) / 2.0;
+                    let best = page_blocks.iter_mut().filter(|b| b.kind != "figure").min_by(|a, b2| {
+                        let da = ((a.y0 + a.y1) / 2.0 - my).abs();
+                        let db = ((b2.y0 + b2.y1) / 2.0 - my).abs();
+                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    if let Some(b) = best {
+                        let gap = (my - (b.y0 + b.y1) / 2.0).abs();
+                        let size_hint = (b.y1 - b.y0).abs().max(8.0);
+                        if gap <= 2.5 * size_hint && b.text.split_whitespace().count() <= 9 {
+                            b.kind = "caption".to_string();
+                        }
                     }
+                }
+                // Insert figure blocks immediately before the caption line (or
+                // the first text block that sits below the figure).
+                let mut figures: Vec<layout::DocBlock> = content
+                    .iter()
+                    .map(|m| layout::DocBlock {
+                        page: page_num as usize,
+                        kind: "figure".to_string(),
+                        x0: m.x0.min(m.x1),
+                        y0: m.y0.min(m.y1),
+                        x1: m.x0.max(m.x1),
+                        y1: m.y0.max(m.y1),
+                        text: format!("[{}]", m.kind.as_str()),
+                    })
+                    .collect();
+                // Highest figure first.
+                figures.sort_by(|a, b| {
+                    let ay = (a.y0 + a.y1) / 2.0;
+                    let by = (b.y0 + b.y1) / 2.0;
+                    by.partial_cmp(&ay).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                for fig in figures {
+                    // Place after the last text block above it (reading order).
+                    let insert_at = page_blocks
+                        .iter()
+                        .position(|b| (b.y0 + b.y1) / 2.0 <= (fig.y0 + fig.y1) / 2.0)
+                        .unwrap_or(page_blocks.len());
+                    page_blocks.insert(insert_at, fig);
                 }
             }
         }
@@ -418,12 +454,13 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
             media_items.push(m.clone());
         }
 
+        let mut chunk = String::new();
         if options.detect_headings && (text.starts_with("# ") || text.lines().next().map_or(false, |l| l.len() < 60 && l.chars().all(|c| c.is_alphanumeric() || c.is_whitespace()))) {
-            full_markdown.push_str(&format!("\n## Page {}\n\n", page_num));
+            chunk.push_str(&format!("\n## Page {}\n\n", page_num));
         }
 
-        full_markdown.push_str(&text);
-        full_markdown.push_str("\n\n");
+        chunk.push_str(&text);
+        chunk.push_str("\n\n");
         if options.embed_media {
             // Non-decorative images of this page, reading order top-to-bottom
             // (larger device y first), as self-contained markdown images.
@@ -442,7 +479,7 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
             });
             if !imgs.is_empty() {
                 for m in imgs {
-                    full_markdown.push_str(&format!(
+                    chunk.push_str(&format!(
                         "![{}](data:{};base64,{})\n\n",
                         m.kind.as_str(),
                         m.format,
@@ -451,6 +488,7 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
                 }
             }
         }
+        page_md.push((page_num, chunk));
     }
 
     // When nothing was decoded, give an actionable reason instead of a silent
@@ -481,10 +519,45 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
 
     // Document-level furniture pass: a short line repeated at the top band of
     // many pages is a running header; one repeated at the bottom band is a
-    // running footer. Tagging them gives clients a structured way to suppress
-    // furniture (markdown text is intentionally left untouched here).
+    // running footer. Tag them in the block list, and suppress their repeated
+    // occurrences in the emitted markdown (keep the first / page-1 line).
     if options.detect_layout && !block_items.is_empty() {
         tag_running_furniture(&mut block_items);
+        // Keep a running header/footer only on its first page; strip the
+        // repeated occurrences from every later page of the markdown.
+        let mut furniture: Vec<(String, u32)> = Vec::new();
+        for b in block_items.iter().filter(|b| b.kind == "header" || b.kind == "footer") {
+            let t = b.text.trim();
+            if t.len() <= 1 {
+                continue;
+            }
+            match furniture.iter_mut().find(|(ft, _)| ft == t) {
+                Some((_, first)) => *first = (*first).min(b.page as u32),
+                None => furniture.push((t.to_string(), b.page as u32)),
+            }
+        }
+        for (page, chunk) in page_md.iter_mut() {
+            for (line_text, first_page) in furniture.iter() {
+                if *page <= *first_page {
+                    continue; // keep on the first page it occurs
+                }
+                let mut out = String::with_capacity(chunk.len());
+                for ln in chunk.lines() {
+                    if ln.trim() == line_text {
+                        continue;
+                    }
+                    out.push_str(ln);
+                    out.push('\n');
+                }
+                if out.ends_with('\n') {
+                    out.pop();
+                }
+                *chunk = out;
+            }
+        }
+    }
+    for (_p, chunk) in page_md {
+        full_markdown.push_str(&chunk);
     }
 
     let duration_us = t0.elapsed().as_micros() as u64;
