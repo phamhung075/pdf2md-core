@@ -38,6 +38,21 @@ pub enum MediaKind {
     Other,
 }
 
+impl MediaKind {
+    /// Stable lowercase name for the wire/markdown formats.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MediaKind::Logo => "logo",
+            MediaKind::Chart => "chart",
+            MediaKind::Photo => "photo",
+            MediaKind::Signature => "signature",
+            MediaKind::Barcode => "barcode",
+            MediaKind::Decorative => "decoration",
+            MediaKind::Other => "image",
+        }
+    }
+}
+
 /// One extracted object (deduped per page) with decoded bytes.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MediaItem {
@@ -789,6 +804,8 @@ fn classify_geometry(
 
     let aspect = w / h;
     let frac_w = page_bbox.map_or(1.0, |(px0, _, px1, _)| w / (px1 - px0).max(1.0));
+    // PDF device y grows upward: the visual bottom of the page is the LOW y
+    // edge. A signature is a small ink-dense scan near that bottom edge.
     let bottom_frac = page_bbox.map_or(0.0, |(_, py0, _, py1)| {
         let low = py0.min(py1);
         let high = py0.max(py1);
@@ -798,7 +815,7 @@ fn classify_geometry(
     if aspect > 5.0 || aspect < 0.2 {
         return (MediaKind::Barcode, false);
     }
-    if bottom_frac > 0.78 && area < 25_000.0 && aspect >= 0.3 && aspect <= 4.0 && frac_w < 0.35 {
+    if bottom_frac < 0.22 && area < 25_000.0 && aspect >= 0.3 && aspect <= 4.0 && frac_w < 0.35 {
         return (MediaKind::Signature, false);
     }
     if area < 20_000.0 && aspect >= 1.1 && h < 180.0 {

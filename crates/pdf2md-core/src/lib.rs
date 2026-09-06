@@ -114,6 +114,10 @@ pub struct ConversionOptions {
     /// geometry path (fallback is byte-identical for simple single-column
     /// pages).
     pub detect_layout: bool,
+    /// Embed extracted, non-decorative images into the markdown itself as
+    /// self-contained data-URI lines (placed top-to-bottom per page). When
+    /// false, images are only returned in the `media` JSON list.
+    pub embed_media: bool,
 }
 
 impl Default for ConversionOptions {
@@ -124,6 +128,7 @@ impl Default for ConversionOptions {
             min_words_per_page: 5,
             detect_media: true,
             detect_layout: true,
+            embed_media: true,
         }
     }
 }
@@ -298,14 +303,20 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
             block_items.push(b);
         }
 
-        if options.detect_media {
+        let page_media: Vec<media::MediaItem> = if options.detect_media {
             let page_bbox = page_media_box(&doc, page_id);
-            let page_media = media::extract_page_media(&doc, page_id, page_num as usize, page_bbox);
-            media_items.extend(page_media);
-        }
+            media::extract_page_media(&doc, page_id, page_num as usize, page_bbox)
+        } else {
+            Vec::new()
+        };
 
+        // Words are counted from the text layer only, so corpus text-word
+        // baselines are unaffected by image embedding.
         let words: Vec<&str> = text.split_whitespace().collect();
         total_words += words.len();
+        for m in &page_media {
+            media_items.push(m.clone());
+        }
 
         if options.detect_headings && (text.starts_with("# ") || text.lines().next().map_or(false, |l| l.len() < 60 && l.chars().all(|c| c.is_alphanumeric() || c.is_whitespace()))) {
             full_markdown.push_str(&format!("\n## Page {}\n\n", page_num));
@@ -313,6 +324,29 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
 
         full_markdown.push_str(&text);
         full_markdown.push_str("\n\n");
+        if options.embed_media {
+            // Non-decorative images of this page, reading order top-to-bottom
+            // (larger device y first), as self-contained markdown images.
+            let mut imgs: Vec<&media::MediaItem> = page_media
+                .iter()
+                .filter(|m| !m.decorative && !m.data_b64.is_empty())
+                .collect();
+            imgs.sort_by(|a, b| {
+                let ay = (a.y0 + a.y1) / 2.0;
+                let by = (b.y0 + b.y1) / 2.0;
+                by.partial_cmp(&ay).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if !imgs.is_empty() {
+                for m in imgs {
+                    full_markdown.push_str(&format!(
+                        "![{}](data:{};base64,{})\n\n",
+                        m.kind.as_str(),
+                        m.format,
+                        m.data_b64
+                    ));
+                }
+            }
+        }
     }
 
     // When nothing was decoded, give an actionable reason instead of a silent

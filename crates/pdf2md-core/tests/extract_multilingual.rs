@@ -171,3 +171,21 @@ fn two_column_glyph_page_reads_column_by_column() {
         "left column blocks before right column blocks: {texts:?}"
     );
 }
+
+#[test]
+fn embedded_logo_image_surfaces_in_markdown_and_json() {
+    // A synthetic page with one small RGB logo. It must be cut out, decoded to
+    // PNG, returned in the media JSON, and embedded as a self-contained
+    // markdown image line in reading order — while the text words stay intact.
+    let bytes = std::fs::read("tests/fixtures/synth_logo_image.pdf").expect("fixture missing");
+    let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
+        .expect("logo page should convert");
+    assert!(res.markdown.contains("![logo](data:image/png;base64,"), "logo not embedded:\n{}", res.markdown);
+    assert_eq!(res.media.len(), 1, "one media item expected");
+    let m = &res.media[0];
+    assert!(!m.decorative, "small logo must not be decorative");
+    assert_eq!(m.kind.as_str(), "logo");
+    assert!(m.data_b64.starts_with("iVBORw0KGgo"), "valid PNG base64 header expected");
+    // The text is still present above the image.
+    assert!(res.markdown.contains("ACME Industries"));
+}
