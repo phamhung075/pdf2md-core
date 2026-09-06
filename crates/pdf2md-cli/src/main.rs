@@ -38,6 +38,10 @@ struct Args {
     /// Suppress diagnostic and performance logs on stderr
     #[arg(short, long, default_value_t = false)]
     quiet: bool,
+
+    /// Detect pure-vector figure regions and cut them as clipped PDFs
+    #[arg(long, default_value_t = false)]
+    vectors: bool,
 }
 
 fn main() {
@@ -69,6 +73,7 @@ fn main() {
 
     let options = ConversionOptions {
         detect_tables: !args.no_tables,
+        detect_vectors: args.vectors,
         ..Default::default()
     };
 

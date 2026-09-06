@@ -118,6 +118,9 @@ pub struct ConversionOptions {
     /// self-contained data-URI lines (placed top-to-bottom per page). When
     /// false, images are only returned in the `media` JSON list.
     pub embed_media: bool,
+    /// Detect pure-vector figure regions (charts/diagrams/logos drawn with
+    /// paths, no raster) and cut them out as standalone clipped PDFs.
+    pub detect_vectors: bool,
 }
 
 impl Default for ConversionOptions {
@@ -129,6 +132,7 @@ impl Default for ConversionOptions {
             detect_media: true,
             detect_layout: true,
             embed_media: true,
+            detect_vectors: false,
         }
     }
 }
@@ -305,7 +309,16 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
 
         let page_media: Vec<media::MediaItem> = if options.detect_media {
             let page_bbox = page_media_box(&doc, page_id);
-            media::extract_page_media(&doc, page_id, page_num as usize, page_bbox)
+            let mut m = media::extract_page_media(&doc, page_id, page_num as usize, page_bbox);
+            if options.detect_vectors {
+                m.extend(media::extract_page_vector_figures(
+                    &doc,
+                    page_id,
+                    page_num as usize,
+                    page_bbox,
+                ));
+            }
+            m
         } else {
             Vec::new()
         };
@@ -351,7 +364,11 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
             // (larger device y first), as self-contained markdown images.
             let mut imgs: Vec<&media::MediaItem> = page_media
                 .iter()
-                .filter(|m| !m.decorative && !m.data_b64.is_empty())
+                .filter(|m| {
+                    !m.decorative
+                        && !m.data_b64.is_empty()
+                        && (m.format == "image/jpeg" || m.format == "image/png")
+                })
                 .collect();
             imgs.sort_by(|a, b| {
                 let ay = (a.y0 + a.y1) / 2.0;
@@ -438,7 +455,13 @@ pub extern "C" fn pdf2md_convert(pdf_ptr: *const u8, pdf_len: usize) -> *mut c_c
         serde_json::json!({ "ok": false, "error": "null input pointer" })
     } else {
         let bytes = unsafe { std::slice::from_raw_parts(pdf_ptr, pdf_len) };
-        match convert_pdf_bytes_to_markdown(bytes, &ConversionOptions::default()) {
+        let mut opts = ConversionOptions::default();
+        // Optional escape hatch so sandbox/FFI consumers can request vector
+        // figure cuts without an ABI change.
+        if std::env::var("P2M_DETECT_VECTORS").map_or(false, |v| v == "1" || v == "true") {
+            opts.detect_vectors = true;
+        }
+        match convert_pdf_bytes_to_markdown(bytes, &opts) {
             Ok(r) => {
                 let media_json = serde_json::to_value(&r.media).unwrap_or_else(|_| serde_json::json!([]));
                 let blocks_json = serde_json::to_value(&r.blocks).unwrap_or_else(|_| serde_json::json!([]));
