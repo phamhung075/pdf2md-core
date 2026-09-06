@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pdf2md-core sandbox</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, sans-serif; margin: 2rem auto; max-width: 1080px; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; }
+  h3 { margin: 1.1rem 0 0.3rem; font-size: 1rem; }
+  #drop { border: 2px dashed #888; border-radius: 10px; padding: 2rem; text-align: center; color: #666; cursor: pointer; }
+  #drop.dragover { border-color: #4f8; color: #2a2; }
+  pre { background: #111; color: #eee; padding: 1rem; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; min-height: 120px; }
+  #status { margin: 0.5rem 0; font-size: 0.9rem; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 0.75rem; margin: 0.5rem 0 1rem; }
+  .card { border: 1px solid #555; border-radius: 10px; overflow: hidden; background: #fff; color: #111; display: flex; flex-direction: column; }
+  .card .thumb { width: 100%; height: 150px; object-fit: contain; background: repeating-conic-gradient(#ececec 0% 25%, #fff 0% 50%) 50% / 14px 14px; display: block; border: 0; }
+  .card .thumb.pdf { height: 150px; }
+  .card .meta { padding: 0.45rem 0.6rem; font-size: 0.75rem; line-height: 1.5; border-top: 1px solid #ddd; word-break: break-all; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; background: #3a66c4; color: #fff; font-size: 0.7rem; font-weight: 600; }
+  .badge.decorative { background: #8a8a8a; }
+  .badge.signature { background: #b04a2e; }
+  .badge.logo { background: #2e7d4f; }
+  .badge.photo { background: #7a4ab0; }
+  .badge.chart, .badge.diagram { background: #b08a2e; }
+  .card a.dl { font-size: 0.75rem; }
+
+  /* Rendered Markdown preview */
+  .md-body { background: #fff; color: #111; padding: 1rem 1.2rem; border-radius: 8px; border: 1px solid #666; line-height: 1.55; overflow-wrap: anywhere; }
+  .md-body h1, .md-body h2, .md-body h3, .md-body h4, .md-body h5, .md-body h6 { margin: 0.9rem 0 0.4rem; line-height: 1.25; }
+  .md-body h1 { font-size: 1.5rem; border-bottom: 2px solid #ddd; padding-bottom: 0.2rem; }
+  .md-body h2 { font-size: 1.3rem; border-bottom: 1px solid #e2e2e2; padding-bottom: 0.15rem; }
+  .md-body h3 { font-size: 1.12rem; }
+  .md-body p { margin: 0.45rem 0; }
+  .md-body table { border-collapse: collapse; margin: 0.6rem 0; font-size: 0.9rem; }
+  .md-body th, .md-body td { border: 1px solid #8a8a8a; padding: 0.25rem 0.6rem; text-align: left; }
+  .md-body th { background: #e8eef8; }
+  .md-body img { max-width: 100%; height: auto; }
+  .md-body pre { background: #f4f4f4; color: #222; padding: 0.6rem 0.8rem; border-radius: 6px; overflow: auto; font-size: 0.85rem; white-space: pre; }
+  .md-body code { background: rgba(0,0,0,0.07); padding: 0.05rem 0.3rem; border-radius: 4px; font-size: 0.9em; }
+  .md-body pre code { background: none; padding: 0; }
+  .md-body a { color: #06c; }
+  .md-body hr { border: none; border-top: 2px solid #bbb; margin: 0.8rem 0; }
+  .md-body blockquote { border-left: 4px solid #bbb; margin: 0.5rem 0; padding: 0.1rem 0.8rem; color: #555; }
+  .md-body ul, .md-body ol { padding-left: 1.4rem; margin: 0.4rem 0; }
+  .md-body li { margin: 0.15rem 0; }
+
+  details { margin: 0.35rem 0; }
+  summary { cursor: pointer; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>pdf2md-core sandbox</h1>
+<p>Drop a digital (text-layer) PDF to convert it via the native Rust engine. Below you get the rendered Markdown, the raw Markdown source, the cut images (photos, logos, signatures, charts…), the layout blocks and the raw JSON response.</p>
+<div id="drop">Drop PDF here, or click to choose</div>
+<input id="file" type="file" accept="application/pdf,.pdf" hidden>
+<label style="display:block; margin:0.6rem 0;"><input type="checkbox" id="vectors"> Also cut pure-vector figures (charts / diagrams) as clipped PDFs</label>
+<div id="status"></div>
+
+<section id="renderedWrap" hidden>
+  <h3>Rendered Markdown</h3>
+  <div id="rendered" class="md-body"></div>
+</section>
+
+<section id="mediaSec" hidden>
+  <h3>Cut images / media (<span id="mediaCount"></span>)</h3>
+  <div id="mediaGrid" class="grid"></div>
+</section>
+
+<details id="mdWrap">
+  <summary>Raw Markdown</summary>
+  <pre id="out">(converted Markdown will appear here)</pre>
+</details>
+
+<details id="blocksWrap" hidden>
+  <summary>Layout blocks (<span id="blocksCount"></span>)</summary>
+  <pre id="blocksPre"></pre>
+</details>
+
+<details id="jsonWrap" hidden>
+  <summary>Raw JSON response</summary>
+  <pre id="jsonPre"></pre>
+</details>
+
+<script>
+const drop = document.getElementById('drop');
+const file = document.getElementById('file');
+const out = document.getElementById('out');
+const status = document.getElementById('status');
+const renderedWrap = document.getElementById('renderedWrap');
+const rendered = document.getElementById('rendered');
+const mediaSec = document.getElementById('mediaSec');
+const mediaCount = document.getElementById('mediaCount');
+const mediaGrid = document.getElementById('mediaGrid');
+const blocksWrap = document.getElementById('blocksWrap');
+const blocksCount = document.getElementById('blocksCount');
+const blocksPre = document.getElementById('blocksPre');
+const jsonWrap = document.getElementById('jsonWrap');
+const jsonPre = document.getElementById('jsonPre');
+const vectorsChk = document.getElementById('vectors');
+
+drop.addEventListener('click', () => file.click());
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('dragover'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('dragover'));
+drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('dragover'); if (e.dataTransfer.files.length) handle(e.dataTransfer.files[0]); });
+file.addEventListener('change', () => { if (file.files.length) handle(file.files[0]); });
+
+function dataUri(m) { return 'data:' + (m.format || 'application/octet-stream') + ';base64,' + m.data_b64; }
+function fileExt(m) { return (m.format || 'bin').split('/').pop(); }
+
+// ---------- tiny safe Markdown -> HTML renderer ----------
+function mdEscape(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function mdInline(s) {
+  let t = mdEscape(s);
+  t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+  t = t.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function (all, alt, url) {
+    if (/^data:image\/(png|jpe?g|gif|webp);base64,/i.test(url) || /^https?:\/\//i.test(url)) {
+      return '<img src="' + url + '" alt="' + alt + '">';
+    }
+    return all; // unsafe / unsupported src -> leave as plain text
+  });
+  t = t.replace(/\[([^\]]*)\]\(([^)]+)\)/g, function (all, text, url) {
+    if (/^https?:\/\//i.test(url)) {
+      return '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + text + '</a>';
+    }
+    return all;
+  });
+  t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  t = t.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  return t;
+}
+
+function splitCells(r) {
+  let s = r.trim();
+  if (s.startsWith('|')) s = s.slice(1);
+  if (s.endsWith('|')) s = s.slice(0, -1);
+  return s.split('|').map(c => c.trim());
+}
+
+function mdTable(rows) {
+  if (rows.length < 2) return '<p>' + mdInline(rows[0]) + '</p>';
+  const sep = splitCells(rows[1]).filter(c => c !== '');
+  const isSep = sep.length > 0 && sep.every(c => /^:?-+:?$/.test(c));
+  if (!isSep) {
+    return '<p>' + rows.map(r => mdInline(r)).join('<br>') + '</p>';
+  }
+  const header = splitCells(rows[0]);
+  const body = rows.slice(2).map(splitCells);
+  let h = '<table><thead><tr>' + header.map(c => '<th>' + mdInline(c) + '</th>').join('') + '</tr></thead>';
+  if (body.length) {
+    h += '<tbody>';
+    for (const r of body) {
+      h += '<tr>' + r.map(c => '<td>' + mdInline(c) + '</td>').join('') + '</tr>';
+    }
+    h += '</tbody>';
+  }
+  return h + '</table>';
+}
+
+function mdToHtml(md) {
+  const lines = (md || '').split('\n');
+  const out = [];
+  let i = 0;
+  let inCode = false;
+  const codeLines = [];
+  while (i < lines.length) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (/^```/.test(trimmed)) {
+      if (!inCode) { inCode = true; codeLines.length = 0; }
+      else { out.push('<pre><code>' + mdEscape(codeLines.join('\n')) + '</code></pre>'); inCode = false; }
+      i++; continue;
+    }
+    if (inCode) { codeLines.push(line); i++; continue; }
+    if (!trimmed) { i++; continue; }
+
+    const h = trimmed.match(/^(#{1,6})\s+(.*)/);
+    if (h) { const n = h[1].length; out.push('<h' + n + '>' + mdInline(h[2]) + '</h' + n + '>'); i++; continue; }
+    if (/^([-*_])\1{2,}\s*$/.test(trimmed)) { out.push('<hr>'); i++; continue; }
+    if (trimmed.startsWith('|')) {
+      const rows = [];
+      while (i < lines.length && lines[i].trim().startsWith('|')) { rows.push(lines[i].trim()); i++; }
+      out.push(mdTable(rows)); continue;
+    }
+    const listStart = trimmed.match(/^(?:[-*+]\s+|\d+\.\s+)(.*)/);
+    if (listStart) {
+      const ordered = /^\d+\.\s+/.test(trimmed);
+      const tag = ordered ? 'ol' : 'ul';
+      const items = [];
+      while (i < lines.length) {
+        const lt = lines[i].trim();
+        const m = lt.match(ordered ? /^\d+\.\s+(.*)/ : /^[-*+]\s+(.*)/);
+        if (!m) break;
+        items.push('<li>' + mdInline(m[1]) + '</li>');
+        i++;
+      }
+      out.push('<' + tag + '>' + items.join('') + '</' + tag + '>'); continue;
+    }
+    // paragraph: accumulate until blank or a new block starter
+    const buf = [];
+    while (i < lines.length) {
+      const lt = lines[i].trim();
+      if (!lt) break;
+      if (/^```/.test(lt) || /^#{1,6}\s/.test(lt) || lt.startsWith('|') ||
+          /^[-*+]\s+/.test(lt) || /^\d+\.\s+/.test(lt) || /^([-*_])\1{2,}\s*$/.test(lt)) break;
+      buf.push(lines[i]);
+      i++;
+    }
+    if (buf.length) out.push('<p>' + mdInline(buf.join('\n')) + '</p>');
+    else i++;
+  }
+  if (inCode) out.push('<pre><code>' + mdEscape(codeLines.join('\n')) + '</code></pre>');
+  return out.join('\n');
+}
+
+// ---------- media gallery ----------
+function cardFor(m, i) {
+  const card = document.createElement('div');
+  card.className = 'card';
+
+  const thumb = document.createElement(m.format === 'application/pdf' ? 'iframe' : 'img');
+  thumb.className = 'thumb' + (m.format === 'application/pdf' ? ' pdf' : '');
+  thumb.title = 'kind=' + (m.kind || '?') + ' page=' + m.page + ' ' + m.width + 'x' + m.height;
+  if (m.data_b64) {
+    thumb.src = dataUri(m);
+  } else {
+    thumb.style.display = 'none';
+  }
+
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+
+  const badge = document.createElement('span');
+  badge.className = 'badge' + (m.decorative ? ' decorative' : '') + (m.kind ? ' ' + m.kind : '');
+  badge.textContent = m.kind || m.format;
+
+  meta.appendChild(badge);
+  meta.appendChild(document.createElement('br'));
+  meta.appendChild(document.createTextNode('page ' + m.page + ' · ' + m.width + '×' + m.height + 'px · ' + (m.format || '?')));
+  if (m.decorative) meta.appendChild(document.createTextNode(' · decorative'));
+  if (m.repeat > 1) meta.appendChild(document.createTextNode(' · repeated ×' + m.repeat));
+  meta.appendChild(document.createElement('br'));
+
+  if (m.data_b64) {
+    const dl = document.createElement('a');
+    dl.className = 'dl';
+    dl.href = dataUri(m);
+    dl.download = 'media-p' + m.page + '-' + i + '.' + fileExt(m).replace('jpeg', 'jpg');
+    dl.textContent = '⬇ download';
+    meta.appendChild(dl);
+  } else {
+    meta.appendChild(document.createTextNode('no bytes (filtered / skipped)'));
+  }
+
+  card.appendChild(thumb);
+  card.appendChild(meta);
+  return card;
+}
+
+function renderMedia(list) {
+  mediaGrid.innerHTML = '';
+  if (!list || !list.length) { mediaSec.hidden = true; return; }
+  mediaCount.textContent = list.length;
+  list.forEach((m, i) => mediaGrid.appendChild(cardFor(m, i)));
+  mediaSec.hidden = false;
+}
+
+function renderBlocks(list) {
+  if (!list || !list.length) { blocksWrap.hidden = true; return; }
+  blocksCount.textContent = list.length;
+  blocksPre.textContent = JSON.stringify(list, null, 2);
+  blocksWrap.hidden = false;
+}
+
+async function handle(f) {
+  status.textContent = 'Converting ' + f.name + ' ...';
+  rendered.innerHTML = '';
+  renderedWrap.hidden = true;
+  mediaSec.hidden = true;
+  blocksWrap.hidden = true;
+  jsonWrap.hidden = true;
+  out.textContent = '';
+  try {
+    const resp = await fetch('/convert' + (vectorsChk.checked ? '?vectors=1' : ''), { method: 'POST', body: f });
+    const data = await resp.json();
+    if (data.ok) {
+      const md = data.markdown || '';
+      out.textContent = md;
+      rendered.innerHTML = mdToHtml(md);
+      renderedWrap.hidden = false;
+      renderMedia(data.media || []);
+      renderBlocks(data.blocks || []);
+      jsonPre.textContent = JSON.stringify(data, null, 2);
+      jsonWrap.hidden = false;
+      const n = (data.media || []).length;
+      status.textContent = f.name + ' → ' + (data.pages ?? 0) + ' pages, ' + (data.words ?? 0) + ' words, ' + (data.tables ?? 0) + ' tables, ' + n + ' image(s), ' + (data.duration_us ?? 0) + ' µs (Rust)';
+    } else {
+      out.textContent = '';
+      renderedWrap.hidden = true;
+      status.textContent = 'Conversion failed: ' + (data.error || 'unknown error');
+    }
+  } catch (err) {
+    status.textContent = 'Request error: ' + err;
+  }
+}
+</script>
+</body>
+</html>
