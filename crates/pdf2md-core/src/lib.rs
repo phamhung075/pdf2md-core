@@ -59,6 +59,25 @@ pub struct CanvasTable {
 }
 
 impl CanvasTable {
+    /// Escapes a cell for GFM pipe tables: `|` and `\` must be backslash
+    /// escaped, newlines flattened (a cell must stay on one physical row).
+    fn md_cell(raw: &str) -> String {
+        let v = raw.trim();
+        if v.is_empty() {
+            return " ".to_string();
+        }
+        let mut s = String::with_capacity(v.len() + 4);
+        for ch in v.chars() {
+            match ch {
+                '|' => s.push_str("\\|"),
+                '\\' => s.push_str("\\\\"),
+                '\n' | '\r' => s.push(' '),
+                _ => s.push(ch),
+            }
+        }
+        s
+    }
+
     /// Renders the reconstructed table into standard GitHub Flavored Markdown (GFM) pipe table.
     pub fn to_markdown(&self) -> String {
         if self.rows.is_empty() {
@@ -76,8 +95,8 @@ impl CanvasTable {
         let header = &self.rows[0];
         md.push('|');
         for c in 0..num_cols {
-            let val = header.get(c).map(|s| s.trim()).unwrap_or("");
-            md.push_str(&format!(" {} |", if val.is_empty() { " " } else { val }));
+            let val = header.get(c).map(|s| s.as_str()).unwrap_or("");
+            md.push_str(&format!(" {} |", Self::md_cell(val)));
         }
         md.push('\n');
 
@@ -92,8 +111,8 @@ impl CanvasTable {
         for row in self.rows.iter().skip(1) {
             md.push('|');
             for c in 0..num_cols {
-                let val = row.get(c).map(|s| s.trim()).unwrap_or("");
-                md.push_str(&format!(" {} |", if val.is_empty() { " " } else { val }));
+                let val = row.get(c).map(|s| s.as_str()).unwrap_or("");
+                md.push_str(&format!(" {} |", Self::md_cell(val)));
             }
             md.push('\n');
         }
@@ -171,9 +190,11 @@ pub fn is_digital_pdf_bytes(bytes: &[u8]) -> bool {
                 return true;
             }
             if let Ok(content) = doc.get_and_decode_page_content(page_id) {
-                if content.operations.iter().any(|op| {
-                    matches!(op.operator.as_str(), "Tj" | "TJ" | "'" | "\"")
-                }) {
+                if content
+                    .operations
+                    .iter()
+                    .any(|op| matches!(op.operator.as_str(), "Tj" | "TJ" | "'" | "\""))
+                {
                     return true;
                 }
             }
@@ -201,8 +222,16 @@ pub fn reconstruct_canvas_tables(spans: &[TextSpan]) -> Vec<CanvasTable> {
     // Sort spans top-to-bottom, left-to-right (Y inverted in standard PDF: larger Y is higher)
     let mut sorted_spans = spans.to_vec();
     sorted_spans.sort_by(|a, b| {
-        b.bbox.y0.partial_cmp(&a.bbox.y0).unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.bbox.x0.partial_cmp(&b.bbox.x0).unwrap_or(std::cmp::Ordering::Equal))
+        b.bbox
+            .y0
+            .partial_cmp(&a.bbox.y0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                a.bbox
+                    .x0
+                    .partial_cmp(&b.bbox.x0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
 
     // Group spans into candidate rows by vertical alignment threshold (3.0 points)
@@ -242,17 +271,28 @@ pub fn reconstruct_canvas_tables(spans: &[TextSpan]) -> Vec<CanvasTable> {
         table_rows.push(cols);
     }
 
-    let min_x = spans.iter().map(|s| s.bbox.x0).fold(f64::INFINITY, f64::min);
-    let max_x = spans.iter().map(|s| s.bbox.x1).fold(f64::NEG_INFINITY, f64::max);
-    let min_y = spans.iter().map(|s| s.bbox.y0).fold(f64::INFINITY, f64::min);
-    let max_y = spans.iter().map(|s| s.bbox.y1).fold(f64::NEG_INFINITY, f64::max);
+    let min_x = spans
+        .iter()
+        .map(|s| s.bbox.x0)
+        .fold(f64::INFINITY, f64::min);
+    let max_x = spans
+        .iter()
+        .map(|s| s.bbox.x1)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min_y = spans
+        .iter()
+        .map(|s| s.bbox.y0)
+        .fold(f64::INFINITY, f64::min);
+    let max_y = spans
+        .iter()
+        .map(|s| s.bbox.y1)
+        .fold(f64::NEG_INFINITY, f64::max);
 
     vec![CanvasTable {
         rows: table_rows,
         bbox: BoundingBox::new(min_x, min_y, max_x, max_y),
     }]
 }
-
 
 /// Best-effort device page box ([x0, y0, x1, y1]) from the page /MediaBox,
 /// used to classify full-page background images.
@@ -267,14 +307,15 @@ fn page_media_box(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> Option<(f6
     Some((g(0)?, g(1)?, g(2)?, g(3)?))
 }
 
-
 /// Tag blocks whose text repeats near the top/bottom of >= 3 pages as running
 /// headers/footers. Operates purely on the structured block list.
 fn tag_running_furniture(blocks: &mut [layout::DocBlock]) {
     use std::collections::HashMap;
     let mut page_span: HashMap<usize, (f64, f64)> = HashMap::new();
     for b in blocks.iter() {
-        let e = page_span.entry(b.page).or_insert((f64::INFINITY, f64::NEG_INFINITY));
+        let e = page_span
+            .entry(b.page)
+            .or_insert((f64::INFINITY, f64::NEG_INFINITY));
         e.0 = e.0.min(b.y0.min(b.y1));
         e.1 = e.1.max(b.y0.max(b.y1));
     }
@@ -333,12 +374,15 @@ fn tag_running_furniture(blocks: &mut [layout::DocBlock]) {
 }
 
 /// Converts PDF byte slice to clean Markdown with 2D spatial table reconstruction.
-pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) -> Result<ConversionResult, String> {
+pub fn convert_pdf_bytes_to_markdown(
+    bytes: &[u8],
+    options: &ConversionOptions,
+) -> Result<ConversionResult, String> {
     let t0 = Instant::now();
 
     // Try parsing with lopdf
-    let doc = lopdf::Document::load_mem(bytes)
-        .map_err(|e| format!("lopdf parsing error: {}", e))?;
+    let doc =
+        lopdf::Document::load_mem(bytes).map_err(|e| format!("lopdf parsing error: {}", e))?;
 
     let mut full_markdown = String::new();
     let total_pages = doc.get_pages().len();
@@ -356,7 +400,12 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
         // Prefer our own multilingual decoder (correct WinAnsi/Differences/
         // ToUnicode handling — see text_extract.rs) and only fall back to
         // lopdf's extractor when the page content cannot be parsed at all.
-        let page_text = match text_extract::extract_page_text_report(&doc, page_num, options.detect_tables, options.detect_layout) {
+        let page_text = match text_extract::extract_page_text_report(
+            &doc,
+            page_num,
+            options.detect_tables,
+            options.detect_layout,
+        ) {
             Ok(pt) => pt,
             Err(_) => text_extract::PageText {
                 text: doc.extract_text(&[page_num]).unwrap_or_default(),
@@ -401,11 +450,14 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
             if !content.is_empty() && !page_blocks.is_empty() {
                 for m in &content {
                     let my = (m.y0 + m.y1) / 2.0;
-                    let best = page_blocks.iter_mut().filter(|b| b.kind != "figure").min_by(|a, b2| {
-                        let da = ((a.y0 + a.y1) / 2.0 - my).abs();
-                        let db = ((b2.y0 + b2.y1) / 2.0 - my).abs();
-                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    let best = page_blocks
+                        .iter_mut()
+                        .filter(|b| b.kind != "figure")
+                        .min_by(|a, b2| {
+                            let da = ((a.y0 + a.y1) / 2.0 - my).abs();
+                            let db = ((b2.y0 + b2.y1) / 2.0 - my).abs();
+                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                        });
                     if let Some(b) = best {
                         let gap = (my - (b.y0 + b.y1) / 2.0).abs();
                         let size_hint = (b.y1 - b.y0).abs().max(8.0);
@@ -455,7 +507,12 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
         }
 
         let mut chunk = String::new();
-        if options.detect_headings && (text.starts_with("# ") || text.lines().next().map_or(false, |l| l.len() < 60 && l.chars().all(|c| c.is_alphanumeric() || c.is_whitespace()))) {
+        if options.detect_headings
+            && (text.starts_with("# ")
+                || text.lines().next().map_or(false, |l| {
+                    l.len() < 60 && l.chars().all(|c| c.is_alphanumeric() || c.is_whitespace())
+                }))
+        {
             chunk.push_str(&format!("\n## Page {}\n\n", page_num));
         }
 
@@ -526,7 +583,10 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
         // Keep a running header/footer only on its first page; strip the
         // repeated occurrences from every later page of the markdown.
         let mut furniture: Vec<(String, u32)> = Vec::new();
-        for b in block_items.iter().filter(|b| b.kind == "header" || b.kind == "footer") {
+        for b in block_items
+            .iter()
+            .filter(|b| b.kind == "header" || b.kind == "footer")
+        {
             let t = b.text.trim();
             if t.len() <= 1 {
                 continue;
@@ -583,7 +643,9 @@ use std::os::raw::c_char;
 fn cstring_into_raw(s: String) -> *mut c_char {
     match CString::new(s) {
         Ok(c) => c.into_raw(),
-        Err(_) => CString::new("").map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut()),
+        Err(_) => CString::new("")
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
     }
 }
 
@@ -604,11 +666,19 @@ pub extern "C" fn pdf2md_convert(pdf_ptr: *const u8, pdf_len: usize) -> *mut c_c
 /// (0 = off, nonzero = on) so sandbox/FFI consumers can request vector figure
 /// cuts per call instead of relying on the `P2M_DETECT_VECTORS` env hatch.
 #[no_mangle]
-pub extern "C" fn pdf2md_convert_ex(pdf_ptr: *const u8, pdf_len: usize, detect_vectors: i32) -> *mut c_char {
+pub extern "C" fn pdf2md_convert_ex(
+    pdf_ptr: *const u8,
+    pdf_len: usize,
+    detect_vectors: i32,
+) -> *mut c_char {
     pdf2md_convert_impl(pdf_ptr, pdf_len, Some(detect_vectors != 0))
 }
 
-fn pdf2md_convert_impl(pdf_ptr: *const u8, pdf_len: usize, vectors_override: Option<bool>) -> *mut c_char {
+fn pdf2md_convert_impl(
+    pdf_ptr: *const u8,
+    pdf_len: usize,
+    vectors_override: Option<bool>,
+) -> *mut c_char {
     let json = if pdf_ptr.is_null() {
         serde_json::json!({ "ok": false, "error": "null input pointer" })
     } else {
@@ -624,8 +694,10 @@ fn pdf2md_convert_impl(pdf_ptr: *const u8, pdf_len: usize, vectors_override: Opt
         }
         match convert_pdf_bytes_to_markdown(bytes, &opts) {
             Ok(r) => {
-                let media_json = serde_json::to_value(&r.media).unwrap_or_else(|_| serde_json::json!([]));
-                let blocks_json = serde_json::to_value(&r.blocks).unwrap_or_else(|_| serde_json::json!([]));
+                let media_json =
+                    serde_json::to_value(&r.media).unwrap_or_else(|_| serde_json::json!([]));
+                let blocks_json =
+                    serde_json::to_value(&r.blocks).unwrap_or_else(|_| serde_json::json!([]));
                 serde_json::json!({
                     "ok": true,
                     "markdown": r.markdown,
@@ -701,8 +773,9 @@ fn convert_pdf_bytes(bytes: &[u8], detect_tables: Option<bool>) -> PyResult<Stri
 #[cfg(feature = "python")]
 #[pyfunction]
 fn reconstruct_tables_from_json(spans_json: &str) -> PyResult<String> {
-    let spans: Vec<TextSpan> = serde_json::from_str(spans_json)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid spans JSON: {}", e)))?;
+    let spans: Vec<TextSpan> = serde_json::from_str(spans_json).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("Invalid spans JSON: {}", e))
+    })?;
     let tables = reconstruct_canvas_tables(&spans);
     let mut output = String::new();
     for t in tables {

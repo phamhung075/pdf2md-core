@@ -197,8 +197,12 @@ pub(crate) fn parse_cmap(data: &[u8]) -> Option<CMapCodec> {
             "beginbfchar" => {
                 i += 1;
                 while i < toks.len() && !is_end(&toks, i, "endbfchar") {
-                    let Some(src) = next_hex(&toks, &mut i) else { break };
-                    let Some(dst) = next_hex(&toks, &mut i) else { break };
+                    let Some(src) = next_hex(&toks, &mut i) else {
+                        break;
+                    };
+                    let Some(dst) = next_hex(&toks, &mut i) else {
+                        break;
+                    };
                     if let (Some(code), Some(units)) = (hex_to_u32(&src), hex_to_units(&dst)) {
                         let byte_len = src.len().div_ceil(2).clamp(1, 4) as u8;
                         cm.exact.insert((byte_len, code), units);
@@ -212,8 +216,12 @@ pub(crate) fn parse_cmap(data: &[u8]) -> Option<CMapCodec> {
             "beginbfrange" => {
                 i += 1;
                 while i < toks.len() && !is_end(&toks, i, "endbfrange") {
-                    let Some(lo_h) = next_hex(&toks, &mut i) else { break };
-                    let Some(hi_h) = next_hex(&toks, &mut i) else { break };
+                    let Some(lo_h) = next_hex(&toks, &mut i) else {
+                        break;
+                    };
+                    let Some(hi_h) = next_hex(&toks, &mut i) else {
+                        break;
+                    };
                     let (Some(lo), Some(hi)) = (hex_to_u32(&lo_h), hex_to_u32(&hi_h)) else {
                         break;
                     };
@@ -305,7 +313,9 @@ fn cmap_tokens(data: &[u8]) -> Vec<Tok> {
                 while i < data.len() && data[i].is_ascii_alphanumeric() {
                     i += 1;
                 }
-                toks.push(Tok::Word(String::from_utf8_lossy(&data[start..i]).into_owned()));
+                toks.push(Tok::Word(
+                    String::from_utf8_lossy(&data[start..i]).into_owned(),
+                ));
             }
             _ => i += 1,
         }
@@ -441,7 +451,12 @@ fn is_symbolic(doc: &Document, font: &Dictionary) -> bool {
     }
     if let Some(bf) = get_name(font, b"BaseFont") {
         let upper = bf.to_ascii_uppercase();
-        for marker in [b"SYMBOL".as_slice(), b"ZAPFDINGBATS", b"WINGDINGS", b"PICTS"] {
+        for marker in [
+            b"SYMBOL".as_slice(),
+            b"ZAPFDINGBATS",
+            b"WINGDINGS",
+            b"PICTS",
+        ] {
             if upper.windows(marker.len()).any(|w| w == marker) {
                 return true;
             }
@@ -576,10 +591,19 @@ fn extract_page(
     // `TD` positioning. Docs that use `Tm` with multi-string `TJ` arrays
     // (e.g. some Enedis bills) still extract correctly through the string
     // walker, so they must not be re-routed.
+    //
+    // Table recovery is the exception: Enedis-style notes place every cell
+    // (and every word) at an absolute `Tm` position, so the geometry engine
+    // can reconstruct their grids while the string walker flattens them. When
+    // `detect_tables` is on we therefore also route `TJ`-only pages that
+    // position with `Tm` (no `TD` needed) through the geometry engine, which
+    // recovers reading order *and* Stage-3 grids. Without `detect_tables` the
+    // string walker is kept so table-less callers stay byte-identical.
     let has_tj = content.operations.iter().any(|op| op.operator == "TJ");
     let has_tj_plain = content.operations.iter().any(|op| op.operator == "Tj");
     let has_td = content.operations.iter().any(|op| op.operator == "TD");
-    if has_tj && !has_tj_plain && has_td {
+    let has_tm = content.operations.iter().any(|op| op.operator == "Tm");
+    if has_tj && !has_tj_plain && (has_td || (detect_tables && has_tm)) {
         return crate::layout::extract_page_glyphs(doc, page_id, detect_tables, detect_layout);
     }
 
@@ -668,15 +692,33 @@ fn extract_page(
             "Tj" => {
                 text_ops_seen = true;
                 if let Some(ci) = cur {
-                    show_pos(&mut out, &codecs[ci].1, &op.operands, pos_mode, line_eps, space_eps,
-                             &mut cur_pos, &mut prev_pos, &mut last_pos_show);
+                    show_pos(
+                        &mut out,
+                        &codecs[ci].1,
+                        &op.operands,
+                        pos_mode,
+                        line_eps,
+                        space_eps,
+                        &mut cur_pos,
+                        &mut prev_pos,
+                        &mut last_pos_show,
+                    );
                 }
             }
             "TJ" => {
                 text_ops_seen = true;
                 if let Some(ci) = cur {
-                    show_pos(&mut out, &codecs[ci].1, &op.operands, pos_mode, line_eps, space_eps,
-                             &mut cur_pos, &mut prev_pos, &mut last_pos_show);
+                    show_pos(
+                        &mut out,
+                        &codecs[ci].1,
+                        &op.operands,
+                        pos_mode,
+                        line_eps,
+                        space_eps,
+                        &mut cur_pos,
+                        &mut prev_pos,
+                        &mut last_pos_show,
+                    );
                 }
             }
             "'" => {

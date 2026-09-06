@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Dai Hung PHAM. All rights reserved.
+// SPDX-License-Identifier: BSL-1.1
+// Licensed under the Business Source License 1.1 (BSL-1.1).
+
 //! End-to-end regression tests for multilingual (FR / VI) text extraction.
 //!
 //! synth_fr.pdf reproduces the EDF / Enedis failure mode: Type1 fonts with an
@@ -33,17 +37,17 @@ fn french_accents_survive_differences_with_notdef() {
     }
     // The corruption markers of lopdf's old STANDARD fallback must never appear.
     for bad in ['Ø', 'Ł', 'Þ'] {
-        assert!(!md.contains(bad), "corruption marker {bad:?} present in:\n{md}");
+        assert!(
+            !md.contains(bad),
+            "corruption marker {bad:?} present in:\n{md}"
+        );
     }
 }
 
 #[test]
 fn vietnamese_extracts_via_tounicode_cmap() {
     let md = convert("tests/fixtures/synth_vi.pdf");
-    for expected in [
-        "Hóa đơn tiền điện tháng 6/2025",
-        "tổng 1.234.567 ₫",
-    ] {
+    for expected in ["Hóa đơn tiền điện tháng 6/2025", "tổng 1.234.567 ₫"] {
         assert!(md.contains(expected), "missing {expected:?} in:\n{md}");
     }
 }
@@ -57,10 +61,7 @@ fn type3_glyph_encoded_reports_ocr_required() {
     let bytes = std::fs::read("tests/fixtures/type3_glyph.pdf").expect("fixture missing");
     let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default());
     let err = res.expect_err("glyph-encoded document should not produce markdown");
-    assert!(
-        err.contains("OCR"),
-        "error should mention OCR, got: {err}"
-    );
+    assert!(err.contains("OCR"), "error should mention OCR, got: {err}");
 }
 
 #[test]
@@ -81,7 +82,10 @@ fn glyph_positioned_page_is_reassembled_in_reading_order() {
     );
     // Gap-encoded spaces must be recovered (no merged words).
     assert!(md.contains("Vie Privée"), "word gap not recovered:\n{md}");
-    assert!(md.contains("Liens personnels"), "word gap not recovered:\n{md}");
+    assert!(
+        md.contains("Liens personnels"),
+        "word gap not recovered:\n{md}"
+    );
 }
 
 #[test]
@@ -93,8 +97,12 @@ fn compressed_text_layer_ticket_is_detected_and_extracted() {
     // the French/English text into Markdown.
     // A synthetic ticket whose content stream is FlateDecode-compressed (no
     // personal data). Raw bytes carry no "BT"/"Tj" markers.
-    let bytes = std::fs::read("tests/fixtures/synth_ticket_compressed.pdf").expect("fixture missing");
-    assert!(!bytes.windows(2).any(|w| w == b"BT"), "fixture should store text compressed");
+    let bytes =
+        std::fs::read("tests/fixtures/synth_ticket_compressed.pdf").expect("fixture missing");
+    assert!(
+        !bytes.windows(2).any(|w| w == b"BT"),
+        "fixture should store text compressed"
+    );
     assert!(
         pdf2md_core::is_digital_pdf_bytes(&bytes),
         "compressed text-stream PDF should be detected as digital"
@@ -112,6 +120,128 @@ fn compressed_text_layer_ticket_is_detected_and_extracted() {
     }
 }
 
+/// Builds a tiny synthetic "Enedis-style" page: every cell placed at an
+/// absolute `Tm` position inside a `TJ` array, with no per-glyph `TD` and no
+/// plain `Tj`. Returned as raw PDF bytes (no fixture file on disk, so the
+/// public repo stays free of document fixtures).
+fn tm_form_pdf_bytes() -> Vec<u8> {
+    let rows = [
+        ("Nom:", "DUPONT Marie"),
+        ("Prenom:", "Marie Helene"),
+        ("Date naissance:", "12/03/1985"),
+        ("Nationalite:", "Francaise"),
+    ];
+    let mut content = String::new();
+    for (i, (label, value)) in rows.iter().enumerate() {
+        let y = 700 - (i as i32) * 20;
+        for (x, text) in [(90, *label), (270, *value)] {
+            content.push_str(&format!(
+                "BT /F1 10 Tf 1 0 0 1 {} {} Tm [({})] TJ ET\n",
+                x, y, text
+            ));
+        }
+    }
+    let content = content.into_bytes();
+
+    // Minimal PDF writer (header, objects, xref) with a correct xref table.
+    fn assemble(objects: &[Vec<u8>]) -> Vec<u8> {
+        let mut out: Vec<u8> = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let mut offsets: Vec<usize> = Vec::with_capacity(objects.len() + 1);
+        offsets.push(0);
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend(format!("{} 0 obj\n", i + 1).into_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_pos = out.len();
+        out.extend(format!("xref\n0 {}\n", objects.len() + 1).into_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in offsets.iter().skip(1) {
+            out.extend(format!("{:010} 00000 n \n", off).into_bytes());
+        }
+        out.extend(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+                objects.len() + 1,
+                xref_pos
+            )
+            .into_bytes(),
+        );
+        out
+    }
+
+    let stream = format!(
+        "<< /Length {} >>\nstream\n",
+        content.len()
+    )
+    .into_bytes();
+    let mut stream = stream;
+    stream.extend_from_slice(&content);
+    stream.extend_from_slice(b"\nendstream");
+
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] \
+/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+            .to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+/Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding >> >>"
+            .to_vec(),
+        stream,
+    ];
+    assemble(&objects)
+}
+
+#[test]
+fn tm_positioned_form_page_recovers_grid_and_stays_walker_without_tables() {
+    // Enedis-style notes place every cell at an absolute `Tm` position inside a
+    // `TJ` array (no per-glyph `TD`, no plain `Tj`). The string walker flattens
+    // their grids; with `detect_tables` on, the geometry engine must route such
+    // pages and recover the aligned label/value grid as a GFM table.
+    let bytes = tm_form_pdf_bytes();
+    let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
+        .expect("Tm-positioned form should convert");
+    assert!(
+        res.tables_detected >= 1,
+        "expected >=1 table, got {}",
+        res.tables_detected
+    );
+    for expected in [
+        "| Nom: | DUPONT Marie |",
+        "| Prenom: | Marie Helene |",
+        "| Date naissance: | 12/03/1985 |",
+        "| Nationalite: | Francaise |",
+    ] {
+        assert!(
+            res.markdown.contains(expected),
+            "missing {expected:?} in:\n{}",
+            res.markdown
+        );
+    }
+    // Without table detection the page must keep the byte-identical string
+    // walker behaviour (flattened label/value lines, no pipes, no geometry).
+    let opts = ConversionOptions {
+        detect_tables: false,
+        ..Default::default()
+    };
+    let res2 = convert_pdf_bytes_to_markdown(&bytes, &opts).expect("walker form should convert");
+    assert_eq!(res2.tables_detected, 0, "no tables expected on walker path");
+    for expected in ["Nom: DUPONT Marie", "Prenom: Marie Helene"] {
+        assert!(
+            res2.markdown.contains(expected),
+            "missing {expected:?} in:\n{}",
+            res2.markdown
+        );
+    }
+    assert!(
+        !res2.markdown.contains("| --- |"),
+        "walker path must not emit GFM separators:\n{}",
+        res2.markdown
+    );
+}
+
 #[test]
 fn aligned_grid_glyph_page_becomes_gfm_table() {
     // A genuine aligned grid drawn the way table producers (LibreOffice,
@@ -122,14 +252,30 @@ fn aligned_grid_glyph_page_becomes_gfm_table() {
     let bytes = std::fs::read("tests/fixtures/synth_grid_table.pdf").expect("fixture missing");
     let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
         .expect("grid fixture should convert");
-    assert!(res.tables_detected >= 1, "expected >=1 table, got {}", res.tables_detected);
+    assert!(
+        res.tables_detected >= 1,
+        "expected >=1 table, got {}",
+        res.tables_detected
+    );
     let md = res.markdown;
     // GFM header + separator + body cells.
-    assert!(md.contains("| Désignation | Quantité | Prix unitaire | Montant |"), "missing header row:\n{md}");
+    assert!(
+        md.contains("| Désignation | Quantité | Prix unitaire | Montant |"),
+        "missing header row:\n{md}"
+    );
     assert!(md.contains("| --- |"), "missing GFM separator:\n{md}");
-    assert!(md.contains("| Abonnement | 1 | 12,50 | 12,50 |"), "missing data row:\n{md}");
-    assert!(md.contains("| Consommation | 240 | 0,1726 | 41,42 |"), "missing data row:\n{md}");
-    assert!(md.contains("| Réduction | -1 | -3,00 | -3,00 |"), "missing data row:\n{md}");
+    assert!(
+        md.contains("| Abonnement | 1 | 12,50 | 12,50 |"),
+        "missing data row:\n{md}"
+    );
+    assert!(
+        md.contains("| Consommation | 240 | 0,1726 | 41,42 |"),
+        "missing data row:\n{md}"
+    );
+    assert!(
+        md.contains("| Réduction | -1 | -3,00 | -3,00 |"),
+        "missing data row:\n{md}"
+    );
     // Each cell must keep its whole text (no merged or dropped words).
     assert!(md.contains("Prix unitaire"), "cell words merged:\n{md}");
     assert!(md.contains("Taxes diverses"), "cell words merged:\n{md}");
@@ -146,9 +292,15 @@ fn two_column_glyph_page_reads_column_by_column() {
         .expect("two-column page should convert");
     let md = res.markdown;
     // Reading order: title -> all 4 French lines -> all 4 English lines.
-    let f1 = md.find("Première ligne de la colonne gauche.").expect("left col 1");
-    let f2 = md.find("Quatrième ligne de la colonne gauche.").expect("left col 4");
-    let e1 = md.find("First line of the right column.").expect("right col 1");
+    let f1 = md
+        .find("Première ligne de la colonne gauche.")
+        .expect("left col 1");
+    let f2 = md
+        .find("Quatrième ligne de la colonne gauche.")
+        .expect("left col 4");
+    let e1 = md
+        .find("First line of the right column.")
+        .expect("right col 1");
     assert!(
         f1 < e1 && f2 < e1,
         "left column must finish before right column starts:\n{md}"
@@ -180,12 +332,19 @@ fn embedded_logo_image_surfaces_in_markdown_and_json() {
     let bytes = std::fs::read("tests/fixtures/synth_logo_image.pdf").expect("fixture missing");
     let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
         .expect("logo page should convert");
-    assert!(res.markdown.contains("![logo](data:image/png;base64,"), "logo not embedded:\n{}", res.markdown);
+    assert!(
+        res.markdown.contains("![logo](data:image/png;base64,"),
+        "logo not embedded:\n{}",
+        res.markdown
+    );
     assert_eq!(res.media.len(), 1, "one media item expected");
     let m = &res.media[0];
     assert!(!m.decorative, "small logo must not be decorative");
     assert_eq!(m.kind.as_str(), "logo");
-    assert!(m.data_b64.starts_with("iVBORw0KGgo"), "valid PNG base64 header expected");
+    assert!(
+        m.data_b64.starts_with("iVBORw0KGgo"),
+        "valid PNG base64 header expected"
+    );
     // The text is still present above the image.
     assert!(res.markdown.contains("ACME Industries"));
 }
@@ -227,13 +386,17 @@ fn running_header_and_footer_are_tagged_in_block_list() {
     }
     // Repeated header/footer lines are kept on their first page only.
     assert_eq!(
-        res.markdown.matches("Rapport interne - CONFIDENTIEL").count(),
+        res.markdown
+            .matches("Rapport interne - CONFIDENTIEL")
+            .count(),
         1,
         "running header must appear once in markdown:\n{}",
         res.markdown
     );
     assert_eq!(
-        res.markdown.matches("Document genere automatiquement").count(),
+        res.markdown
+            .matches("Document genere automatiquement")
+            .count(),
         1,
         "running footer must appear once in markdown:\n{}",
         res.markdown

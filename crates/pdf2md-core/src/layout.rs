@@ -82,7 +82,10 @@ impl Mtx {
     }
 
     pub(crate) fn apply(&self, x: f64, y: f64) -> (f64, f64) {
-        (self.a * x + self.c * y + self.e, self.b * x + self.d * y + self.f)
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
     }
 
     pub(crate) fn translate(tx: f64, ty: f64) -> Self {
@@ -408,10 +411,9 @@ pub fn extract_page_glyphs(
                 if op.operator == "'" {
                     tlm.pre_mul(&Mtx::translate(0.0, -leading));
                 }
-                if let (Some(ci), Some(bytes)) = (
-                    cur_font,
-                    op.operands.get(str_idx).and_then(string_bytes),
-                ) {
+                if let (Some(ci), Some(bytes)) =
+                    (cur_font, op.operands.get(str_idx).and_then(string_bytes))
+                {
                     let (codec, width) = (&codecs[ci].1, &widths[ci].1);
                     push_span(codec, width, bytes, 0.0, &tlm, &ctm, tfs, &mut spans);
                 }
@@ -446,7 +448,18 @@ pub fn extract_page_glyphs(
 
     let lines = build_lines(&spans);
     let page_height = page_height_of(doc, page_id).unwrap_or(842.0);
-    let hits = if detect_tables { find_tables(&lines) } else { Vec::new() };
+    let mut hits = if detect_tables {
+        find_tables(&lines)
+    } else {
+        Vec::new()
+    };
+    // Stage-3b: re-run the grid scan with a wider alignment tolerance over
+    // rows the strict pass missed (jittered / borderless tables).
+    if detect_tables {
+        let gap_hits = find_gap_tables(&lines, &hits);
+        hits.extend(gap_hits);
+        hits.sort_by(|a, b| a.start.cmp(&b.start));
+    }
     // A genuine two-column *reading* layout (two wide prose columns read
     // column-by-column) must win over the grid detector, which mistakes it for
     // a 2-column table. Real pipe tables have short cell tokens, so we only
@@ -575,7 +588,10 @@ fn render_cluster(lines: &[Vec<Span>]) -> String {
                     } else if gap - prev_advance > 0.35 * space_adv {
                         // Encoded word gap (actual gap exceeds the glyph's
                         // natural advance).
-                        if !line_text.is_empty() && !line_text.ends_with(' ') && !line_text.ends_with('\n') {
+                        if !line_text.is_empty()
+                            && !line_text.ends_with(' ')
+                            && !line_text.ends_with('\n')
+                        {
                             line_text.push(' ');
                         }
                     }
@@ -584,7 +600,8 @@ fn render_cluster(lines: &[Vec<Span>]) -> String {
             // Append the glyph, collapsing runs of spaces (producers often emit
             // stray extra space glyphs for alignment).
             if span.text == " " {
-                if !line_text.is_empty() && !line_text.ends_with(' ') && !line_text.ends_with('\n') {
+                if !line_text.is_empty() && !line_text.ends_with(' ') && !line_text.ends_with('\n')
+                {
                     line_text.push(' ');
                 }
             } else {
@@ -711,7 +728,7 @@ struct TableHit {
 ///   * consecutive rulers must be a real column gutter apart (> 0.6 em), so a
 ///     single line that merely repeats a few words ("- pages ...", "- pages
 ///     où ...") is not mistaken for a multi-column grid.
-fn find_tables(lines: &[Vec<Span>]) -> Vec<TableHit> {
+fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHit]) -> Vec<TableHit> {
     if lines.len() < 3 {
         return Vec::new();
     }
@@ -736,11 +753,14 @@ fn find_tables(lines: &[Vec<Span>]) -> Vec<TableHit> {
         })
         .collect();
 
-    // Alignment tolerance: same absolute column start on every row.
-    let tol = info
-        .iter()
-        .map(|r| (0.06 * r.size).clamp(0.5, 1.2))
-        .fold(0.0f64, f64::max);
+    // Alignment tolerance: same absolute column start on every row. Stage-3b
+    // (gap recovery) reruns the scan with a wider tolerance to catch tables
+    // whose column starts jitter by a few points between rows.
+    let tol = tol_mult
+        * info
+            .iter()
+            .map(|r| (0.06 * r.size).clamp(0.5, 1.2))
+            .fold(0.0f64, f64::max);
 
     // Rulers shared by rows lo..=hi (inclusive): word-start x present on every
     // row of the range, jitter-merged.
@@ -773,20 +793,21 @@ fn find_tables(lines: &[Vec<Span>]) -> Vec<TableHit> {
         for w in &info[ri].words {
             // Column k owns words between mid(r_{k-1}, r_k) and mid(r_k, r_{k+1});
             // words left of every ruler midpoint still belong to column 0.
-            let col = bounds
-                .iter()
-                .position(|&b| w.x0 < b)
-                .unwrap_or(ncol - 1);
+            let col = bounds.iter().position(|&b| w.x0 < b).unwrap_or(ncol - 1);
             cells[col].push(w.text.clone());
         }
         cells.into_iter().map(|c| c.join(" ")).collect()
     }
 
     // Vertical bands of consecutive rows that could sit in one grid (>= 2
-    // words, tight line pitch, no paragraph gap inside).
+    // words, tight line pitch, no paragraph gap inside). Rows already claimed
+    // by a previous (stricter) scan are excluded entirely.
     let mut bands: Vec<Vec<usize>> = Vec::new();
     for (i, r) in info.iter().enumerate() {
         if r.words.len() < 2 {
+            continue;
+        }
+        if covered.iter().any(|h| h.start <= i && i <= h.end) {
             continue;
         }
         match bands.last_mut() {
@@ -836,13 +857,17 @@ fn find_tables(lines: &[Vec<Span>]) -> Vec<TableHit> {
             let win_rows: Vec<usize> = band[lo..=hi].to_vec();
             if hi - lo + 1 >= 3 && rulers.len() >= 2 {
                 // Column gutter sanity: consecutive rulers are far apart.
-                let max_size = win_rows.iter().map(|&i| info[i].size).fold(0.0f64, f64::max);
+                let max_size = win_rows
+                    .iter()
+                    .map(|&i| info[i].size)
+                    .fold(0.0f64, f64::max);
                 let ok_gutter = rulers.windows(2).all(|p| p[1] - p[0] > 0.6 * max_size);
                 if ok_gutter {
                     // The first cell (left of the first ruler midpoint) must
                     // vary across rows: a constant marker means a list.
                     let mid1 = (rulers[0] + rulers[1]) / 2.0;
-                    let mut distinct: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    let mut distinct: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
                     for &i in &win_rows {
                         let first: String = info[i]
                             .words
@@ -857,8 +882,10 @@ fn find_tables(lines: &[Vec<Span>]) -> Vec<TableHit> {
                     }
                     if distinct.len() >= 2 {
                         // Cells per row from the ruler bands.
-                        let table_rows: Vec<Vec<String>> =
-                            win_rows.iter().map(|&i| bucket(&info, i, &rulers)).collect();
+                        let table_rows: Vec<Vec<String>> = win_rows
+                            .iter()
+                            .map(|&i| bucket(&info, i, &rulers))
+                            .collect();
                         // Drop fully-empty edge columns.
                         let ncol = rulers.len();
                         let mut c0 = 0usize;
@@ -870,10 +897,16 @@ fn find_tables(lines: &[Vec<Span>]) -> Vec<TableHit> {
                             c1 -= 1;
                         }
                         if c1 - c0 >= 2 {
-                            let rows2: Vec<Vec<String>> = table_rows
-                                .iter()
-                                .map(|r| r[c0..c1].to_vec())
-                                .collect();
+                            let rows2: Vec<Vec<String>> =
+                                table_rows.iter().map(|r| r[c0..c1].to_vec()).collect();
+                            // Guard rails against look-alikes that align but are
+                            // not data tables: TOC rows with dot leaders, body
+                            // prose split into two long-text columns, radio /
+                            // bullet lists with a constant marker column.
+                            if !is_tabular_rows(&rows2) {
+                                lo += 1;
+                                continue;
+                            }
                             let mut min_x = f64::INFINITY;
                             let mut max_x = f64::NEG_INFINITY;
                             let mut min_y = f64::INFINITY;
@@ -902,6 +935,152 @@ fn find_tables(lines: &[Vec<Span>]) -> Vec<TableHit> {
         }
     }
     hits
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3b — jitter-tolerant grid recovery (borderless / ragged tables)
+// ---------------------------------------------------------------------------
+//
+// Stage-3 requires column-start rulers that repeat on *every* row of a window
+// (exact alignment). Real-world tables from invoice tools, print drivers and
+// form generators frequently break that contract: column starts jitter by a
+// few points between rows, a cell wraps onto a second visual line, or one
+// column holds a long sentence next to short codes. Stage-3b therefore re-runs
+// the *identical* grid scan with a wider alignment tolerance over the rows the
+// strict pass did not claim, so tables whose starts are only approximately
+// aligned are still recovered, while justified prose (which never shares >= 2
+// column starts across 3+ rows) still cannot fire. Cell text keeps the strict
+// pass' word bucketing, and the shared `is_tabular_rows` guard below rejects
+// TOC dot leaders, aligned body prose and bullet / radio marker columns.
+
+/// Stage-3 table recovery: strict ruler alignment (the default pass).
+fn find_tables(lines: &[Vec<Span>]) -> Vec<TableHit> {
+    scan_aligned_grids(lines, 1.0, &[])
+}
+
+/// Stage-3b recovery pass: the same grid scan with a wider alignment
+/// tolerance, over rows the strict pass did not claim (jittered tables).
+fn find_gap_tables(lines: &[Vec<Span>], covered: &[TableHit]) -> Vec<TableHit> {
+    scan_aligned_grids(lines, 2.0, covered)
+}
+
+/// True when a candidate grid is a genuine data table rather than one of the
+/// alignment look-alikes. Cells are supplied per row (empty strings allowed).
+///
+/// Rejections:
+///   * any column that is a dot-leader column (>= half of its cells are
+///     leader runs like "......") — TOC / index rows;
+///   * a constant short first column across rows (bullet / radio markers);
+///   * grids where no column is short (<= ~1.6 words/cell on average) and
+///     where the overall cell verbosity looks like prose (>= 6 words/cell).
+fn is_tabular_rows(rows: &[Vec<String>]) -> bool {
+    let is_leader = |c: &str| -> bool {
+        let t = c.trim();
+        if t.is_empty() {
+            return false;
+        }
+        let n = t.chars().count();
+        let filler = t
+            .chars()
+            .filter(|ch| matches!(ch, '.' | '·' | '•' | '_' | ' '))
+            .count();
+        (t.starts_with('.') || t.starts_with('·') || t.starts_with('•')) && filler * 2 >= n
+    };
+
+    let data: Vec<&Vec<String>> = rows
+        .iter()
+        .filter(|r| r.iter().any(|c| !c.trim().is_empty()))
+        .collect();
+    if data.len() < 2 {
+        return false;
+    }
+    let cols = data.iter().map(|r| r.len()).max().unwrap_or(0);
+    if cols < 2 {
+        return false;
+    }
+    let non_empty: Vec<usize> = (0..cols)
+        .map(|k| {
+            data.iter()
+                .filter(|r| r.get(k).map_or(false, |c| !c.trim().is_empty()))
+                .count()
+        })
+        .collect();
+    let eff: Vec<usize> = (0..cols).filter(|&k| non_empty[k] > 0).collect();
+    if eff.len() < 2 {
+        return false;
+    }
+
+    // Dot-leader column (TOC dotted rows).
+    for &k in &eff {
+        let cells: Vec<&str> = data
+            .iter()
+            .filter_map(|r| {
+                let c = r.get(k).map_or("", |c| c.as_str()).trim();
+                if c.is_empty() {
+                    None
+                } else {
+                    Some(c)
+                }
+            })
+            .collect();
+        if cells.is_empty() {
+            continue;
+        }
+        let leaders = cells.iter().filter(|c| is_leader(c)).count();
+        if leaders * 2 >= cells.len() {
+            return false;
+        }
+    }
+
+    // Constant short first column (bullets / radio markers like "-" or "o").
+    if eff[0] == 0 {
+        let first: Vec<&str> = data
+            .iter()
+            .map(|r| r[0].trim())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if !first.is_empty()
+            && first.iter().all(|c| *c == first[0])
+            && first[0].chars().count() <= 2
+        {
+            return false;
+        }
+    }
+
+    // A data grid must contain at least one short column (codes, amounts,
+    // dates, labels); grids whose every cell is long prose are aligned body
+    // text, not tables.
+    let mut short_col = false;
+    let mut total_tokens = 0usize;
+    let mut total_cells = 0usize;
+    for &k in &eff {
+        let cells: Vec<&str> = data
+            .iter()
+            .filter_map(|r| {
+                let c = r.get(k).map_or("", |c| c.as_str()).trim();
+                if c.is_empty() {
+                    None
+                } else {
+                    Some(c)
+                }
+            })
+            .collect();
+        if cells.is_empty() {
+            continue;
+        }
+        let tokens: usize = cells.iter().map(|c| c.split_whitespace().count()).sum();
+        total_tokens += tokens;
+        total_cells += cells.len();
+        let mean = tokens as f64 / cells.len() as f64;
+        if mean <= 2.2 {
+            short_col = true;
+        }
+    }
+    if !short_col {
+        return false;
+    }
+    let overall = total_tokens as f64 / total_cells as f64;
+    overall < 6.0
 }
 
 /// Render a page's visual lines to text, replacing detected table blocks with
@@ -934,14 +1113,18 @@ fn render_with_tables(lines: &[Vec<Span>], tables: &[TableHit]) -> String {
                             line_text.push('\n');
                         }
                     } else if gap - prev_advance > 0.35 * space_adv {
-                        if !line_text.is_empty() && !line_text.ends_with(' ') && !line_text.ends_with('\n') {
+                        if !line_text.is_empty()
+                            && !line_text.ends_with(' ')
+                            && !line_text.ends_with('\n')
+                        {
                             line_text.push(' ');
                         }
                     }
                 }
             }
             if span.text == " " {
-                if !line_text.is_empty() && !line_text.ends_with(' ') && !line_text.ends_with('\n') {
+                if !line_text.is_empty() && !line_text.ends_with(' ') && !line_text.ends_with('\n')
+                {
                     line_text.push(' ');
                 }
             } else {
@@ -1082,7 +1265,10 @@ fn page_two_columns(lines: &[Vec<Span>]) -> Option<PageColumns> {
     let mut splits: Vec<Split> = Vec::new();
     for l in lines {
         if let Some((left, right)) = split_row_columns(l) {
-            let l_end = left.iter().map(|x| x.x + x.advance).fold(f64::NEG_INFINITY, f64::max);
+            let l_end = left
+                .iter()
+                .map(|x| x.x + x.advance)
+                .fold(f64::NEG_INFINITY, f64::max);
             let r_start = right.iter().map(|x| x.x).fold(f64::INFINITY, f64::min);
             splits.push(Split {
                 y: l[0].y,
@@ -1129,8 +1315,16 @@ fn page_two_columns(lines: &[Vec<Span>]) -> Option<PageColumns> {
             bottom_full.push(l.clone());
         }
     }
-    top_full.sort_by(|a, b| b[0].y.partial_cmp(&a[0].y).unwrap_or(std::cmp::Ordering::Equal));
-    bottom_full.sort_by(|a, b| b[0].y.partial_cmp(&a[0].y).unwrap_or(std::cmp::Ordering::Equal));
+    top_full.sort_by(|a, b| {
+        b[0].y
+            .partial_cmp(&a[0].y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    bottom_full.sort_by(|a, b| {
+        b[0].y
+            .partial_cmp(&a[0].y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     // Prose gate: a true text column is made of multi-word lines on both
     // sides where the words are spaced like a sentence. Pipe-table rows have
     // short tokens and wide cell gutters inside the "line", so they must keep
@@ -1302,7 +1496,10 @@ fn build_doc_blocks(lines: &[Vec<Span>], page_height: f64) -> Vec<DocBlock> {
     sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let body = sizes.get(sizes.len() / 2).copied().unwrap_or(10.0).max(1.0);
     let title_size = body * 1.6;
-    let max_y = lines.iter().map(|l| l[0].y).fold(f64::NEG_INFINITY, f64::max);
+    let max_y = lines
+        .iter()
+        .map(|l| l[0].y)
+        .fold(f64::NEG_INFINITY, f64::max);
 
     let mut blocks: Vec<DocBlock> = Vec::new();
     for stream in page_read_order(lines) {
@@ -1312,7 +1509,10 @@ fn build_doc_blocks(lines: &[Vec<Span>], page_height: f64) -> Vec<DocBlock> {
             }
             let size = line.iter().map(|s| s.size).fold(0.0f64, f64::max);
             let x0 = line.iter().map(|s| s.x).fold(f64::INFINITY, f64::min);
-            let x1 = line.iter().map(|s| s.x + s.advance).fold(f64::NEG_INFINITY, f64::max);
+            let x1 = line
+                .iter()
+                .map(|s| s.x + s.advance)
+                .fold(f64::NEG_INFINITY, f64::max);
             let y0 = line.iter().map(|s| s.y).fold(f64::INFINITY, f64::min);
             let y1 = line.iter().map(|s| s.y).fold(f64::NEG_INFINITY, f64::max);
             let text = render_line_text(&line);
@@ -1320,7 +1520,10 @@ fn build_doc_blocks(lines: &[Vec<Span>], page_height: f64) -> Vec<DocBlock> {
                 "title"
             } else if size >= body * 1.25 {
                 "heading"
-            } else if text.trim_start().starts_with(['-', '•', '●', '◦', '·', '*']) {
+            } else if text
+                .trim_start()
+                .starts_with(['-', '•', '●', '◦', '·', '*'])
+            {
                 "list"
             } else {
                 "body"
@@ -1337,4 +1540,133 @@ fn build_doc_blocks(lines: &[Vec<Span>], page_height: f64) -> Vec<DocBlock> {
         }
     }
     blocks
+}
+
+#[cfg(test)]
+mod table_detection_tests {
+    use super::*;
+
+    /// Build one visual line from (start_x, text) word spans on a shared
+    /// baseline `y` (page coordinates: larger y = higher on the page).
+    fn row(y: f64, words: &[(f64, &str)]) -> Vec<Span> {
+        words
+            .iter()
+            .map(|(x, t)| Span {
+                text: t.to_string(),
+                x: *x,
+                y,
+                size: 10.0,
+                advance: 0.0,
+            })
+            .collect()
+    }
+
+    fn page(rows: Vec<Vec<Span>>) -> Vec<Vec<Span>> {
+        rows
+    }
+
+    #[test]
+    fn aligned_two_column_grid_is_detected() {
+        let lines = page(vec![
+            row(700.0, &[(50.0, "Nom"), (300.0, "DUPONT")]),
+            row(690.0, &[(50.0, "Prenom"), (300.0, "Marie")]),
+            row(680.0, &[(50.0, "Date"), (300.0, "1985")]),
+            row(670.0, &[(50.0, "Pays"), (300.0, "France")]),
+        ]);
+        let hits = find_tables(&lines);
+        assert_eq!(hits.len(), 1, "aligned 2-col grid must be recovered");
+        let rows: Vec<Vec<String>> = hits[0].rows.clone();
+        assert_eq!(rows.len(), 4, "4 rows expected: {rows:?}");
+        assert_eq!(rows[0][0].as_str(), "Nom");
+        assert_eq!(rows[0][1].as_str(), "DUPONT");
+    }
+
+    #[test]
+    fn toc_dot_leader_rows_are_rejected() {
+        // Real TOC rows: section number, dot leaders, page number. The dots
+        // align perfectly but the grid is an index, not a data table.
+        let lines = page(vec![
+            row(700.0, &[(50.0, "1.1"), (300.0, "....."), (420.0, "5")]),
+            row(690.0, &[(50.0, "1.2"), (300.0, "....."), (420.0, "6")]),
+            row(680.0, &[(50.0, "2.1"), (300.0, "....."), (420.0, "9")]),
+            row(670.0, &[(50.0, "2.2"), (300.0, "....."), (420.0, "12")]),
+        ]);
+        assert!(
+            find_tables(&lines).is_empty(),
+            "TOC dot leaders must not be tabled"
+        );
+        assert!(
+            find_gap_tables(&lines, &[]).is_empty(),
+            "TOC dot leaders must not be tabled (3b)"
+        );
+    }
+
+    #[test]
+    fn aligned_long_prose_columns_are_rejected() {
+        // Body prose whose two ragged columns happen to start at the same x on
+        // every line must not become a table: no column holds short codes.
+        let lines = page(vec![
+            row(
+                700.0,
+                &[
+                    (50.0, "The quick brown fox jumps over the lazy dog"),
+                    (300.0, "second column of equally long words lives"),
+                ],
+            ),
+            row(
+                690.0,
+                &[
+                    (50.0, "Another quite long sentence to fill the first column"),
+                    (300.0, "and the right hand column keeps on flowing too"),
+                ],
+            ),
+            row(
+                680.0,
+                &[
+                    (50.0, "A third verbose paragraph placed under the two above"),
+                    (300.0, "with prose that keeps reading like a document"),
+                ],
+            ),
+        ]);
+        assert!(
+            find_tables(&lines).is_empty(),
+            "aligned prose must not be tabled"
+        );
+    }
+
+    #[test]
+    fn bullet_marker_column_is_rejected() {
+        // Radio/bullet option lists: a constant short first column ("o"/"-")
+        // is a marker, not data.
+        let lines = page(vec![
+            row(700.0, &[(50.0, "-"), (80.0, "option one")]),
+            row(690.0, &[(50.0, "-"), (80.0, "option two")]),
+            row(680.0, &[(50.0, "-"), (80.0, "option three")]),
+            row(670.0, &[(50.0, "-"), (80.0, "option four")]),
+        ]);
+        assert!(
+            find_tables(&lines).is_empty(),
+            "bullet marker column must not be tabled"
+        );
+    }
+
+    #[test]
+    fn jittered_grid_is_recovered_by_stage3b_only() {
+        // A genuine grid whose second column start jitters by < 1 pt between
+        // rows: the strict pass misses it, the wider Stage-3b tolerance wins.
+        let lines = page(vec![
+            row(700.0, &[(50.0, "A1"), (300.0, "B1")]),
+            row(690.0, &[(50.0, "A2"), (300.8, "B2")]),
+            row(680.0, &[(50.0, "A3"), (299.6, "B3")]),
+            row(670.0, &[(50.0, "A4"), (300.4, "B4")]),
+        ]);
+        assert!(
+            find_tables(&lines).is_empty(),
+            "strict pass must miss the jittered grid"
+        );
+        let gap = find_gap_tables(&lines, &[]);
+        assert_eq!(gap.len(), 1, "Stage-3b must recover the jittered grid");
+        let rows: Vec<Vec<String>> = gap[0].rows.clone();
+        assert!(rows[0].iter().any(|c| c == "B1"), "cells wrong: {rows:?}");
+    }
 }
