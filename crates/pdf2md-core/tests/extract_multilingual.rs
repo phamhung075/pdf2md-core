@@ -134,3 +134,40 @@ fn aligned_grid_glyph_page_becomes_gfm_table() {
     assert!(md.contains("Prix unitaire"), "cell words merged:\n{md}");
     assert!(md.contains("Taxes diverses"), "cell words merged:\n{md}");
 }
+
+#[test]
+fn two_column_glyph_page_reads_column_by_column() {
+    // A page with two side-by-side prose columns sharing baselines. Row-major
+    // output would interleave FR/EN lines; human reading order must emit the
+    // whole left column first, then the right column, with the full-width
+    // title before both.
+    let bytes = std::fs::read("tests/fixtures/synth_two_column.pdf").expect("fixture missing");
+    let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
+        .expect("two-column page should convert");
+    let md = res.markdown;
+    // Reading order: title -> all 4 French lines -> all 4 English lines.
+    let f1 = md.find("Première ligne de la colonne gauche.").expect("left col 1");
+    let f2 = md.find("Quatrième ligne de la colonne gauche.").expect("left col 4");
+    let e1 = md.find("First line of the right column.").expect("right col 1");
+    assert!(
+        f1 < e1 && f2 < e1,
+        "left column must finish before right column starts:\n{md}"
+    );
+    // Structural block list is present and ordered: title first, then the
+    // left column's lines, then the right column's lines.
+    assert!(!res.blocks.is_empty(), "expected blocks");
+    let texts: Vec<&str> = res.blocks.iter().map(|b| b.text.as_str()).collect();
+    assert!(texts[0].contains("Rapport"), "title block first: {texts:?}");
+    let left_idx = texts
+        .iter()
+        .position(|t| t.contains("Première"))
+        .expect("left col present");
+    let right_idx = texts
+        .iter()
+        .position(|t| t.contains("First line"))
+        .expect("right col present");
+    assert!(
+        left_idx < right_idx,
+        "left column blocks before right column blocks: {texts:?}"
+    );
+}

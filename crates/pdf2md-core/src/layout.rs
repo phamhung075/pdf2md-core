@@ -332,6 +332,7 @@ pub fn extract_page_glyphs(
     doc: &Document,
     page_id: ObjectId,
     detect_tables: bool,
+    detect_layout: bool,
 ) -> Result<PageText, String> {
     let fonts = doc.get_page_fonts(page_id).map_err(|e| e.to_string())?;
     let has_fonts = !fonts.is_empty();
@@ -444,20 +445,26 @@ pub fn extract_page_glyphs(
     }
 
     let lines = build_lines(&spans);
-    if !detect_tables {
-        return Ok(PageText {
-            text: render_cluster(&lines),
-            text_ops_seen,
-            has_fonts,
-            tables: 0,
-        });
-    }
-    let hits = find_tables(&lines);
-    let text = if hits.is_empty() {
+    let page_height = page_height_of(doc, page_id).unwrap_or(842.0);
+    let hits = if detect_tables { find_tables(&lines) } else { Vec::new() };
+    // A genuine two-column *reading* layout (two wide prose columns read
+    // column-by-column) must win over the grid detector, which mistakes it for
+    // a 2-column table. Real pipe tables have short cell tokens, so we only
+    // prefer the layout when every detected "row" is long prose on both sides.
+    let prose_columns = detect_layout && page_two_columns(&lines).is_some();
+    let text = if !hits.is_empty() && !prose_columns {
         // Byte-identical to the plain text renderer when no table is found.
-        render_cluster(&lines)
-    } else {
         render_with_tables(&lines, &hits)
+    } else if detect_layout {
+        render_human_order(&lines, page_height, true)
+    } else {
+        render_cluster(&lines)
+    };
+
+    let blocks = if detect_layout {
+        build_doc_blocks(&lines, page_height)
+    } else {
+        Vec::new()
     };
 
     Ok(PageText {
@@ -465,7 +472,22 @@ pub fn extract_page_glyphs(
         text_ops_seen,
         has_fonts,
         tables: hits.len(),
+        blocks,
     })
+}
+
+/// Height of the page media box in device points (best effort).
+fn page_height_of(doc: &Document, page_id: ObjectId) -> Option<f64> {
+    let dict = doc.get_dictionary(page_id).ok()?;
+    let mb = dict.get(b"MediaBox").ok()?.as_array().ok()?;
+    let g = |i: usize| -> Option<f64> {
+        mb.get(i)
+            .and_then(|o| o.as_float().ok().map(|f| f as f64))
+            .or_else(|| mb.get(i).and_then(|o| o.as_i64().ok().map(|v| v as f64)))
+    };
+    let y0 = g(1)?;
+    let y1 = g(3)?;
+    Some((y1 - y0).abs())
 }
 
 /// Group consecutive spans into runs by device baseline y, preserving
@@ -967,4 +989,351 @@ fn render_with_tables(lines: &[Vec<Span>], tables: &[TableHit]) -> String {
     }
 
     out.trim_end().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4 — human reading order (zones / columns / furniture / block list)
+// ---------------------------------------------------------------------------
+//
+// Deterministic, no ML. On the glyph-layout path we know every visual line's
+// device position, so we can decide *in which order a human reads the page*:
+//
+//   1. column detection — if lines split into >= 2 tall x-bands separated by a
+//      real gutter, the page is multi-column and each column is read
+//      top-to-bottom before the next column (not row-interleaved);
+//   2. furniture removal — short numeric-only lines at the very bottom band
+//      (page numbers) and repeated corner/band furniture lines are dropped;
+//   3. role labels — title (largest font near the top), heading (larger than
+//      body), list item (leading bullet/dash), body — emitted as a structured
+//      block list so a frontend can render the page like a document.
+//
+// Pages with no column structure and no removable furniture produce output
+// byte-identical to the plain renderer, so existing single-column documents
+// (Fiche etc.) never change.
+
+/// One structured block (reading unit) with a semantic role.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DocBlock {
+    /// 1-based page number (filled by the caller).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub page: usize,
+    pub kind: String,
+    pub x0: f64,
+    pub y0: f64,
+    pub x1: f64,
+    pub y1: f64,
+    pub text: String,
+}
+
+fn is_zero(v: &usize) -> bool {
+    *v == 0
+}
+
+/// Split one visual row at a clearly oversized intra-row gap (a column
+/// gutter). Rows without such a gap are single-column rows -> None.
+fn split_row_columns(spans: &[Span]) -> Option<(Vec<Span>, Vec<Span>)> {
+    if spans.len() < 5 {
+        return None;
+    }
+    let size = spans.iter().map(|s| s.size).fold(0.0f64, f64::max).max(0.1);
+    let mut best: Option<(f64, usize)> = None; // (gap, split index)
+    for i in 0..spans.len() - 1 {
+        let a_end = spans[i].x + spans[i].advance;
+        let b_start = spans[i + 1].x;
+        let gap = (b_start - a_end).max(0.0);
+        // A word space is ~0.25em; a true gutter is much wider. Requiring
+        // > 1.2em keeps justified prose rows unsplit.
+        if gap > 1.2 * size && best.map_or(true, |(g, _)| gap > g) {
+            best = Some((gap, i));
+        }
+    }
+    let (_, at) = best?;
+    if at < 2 || at >= spans.len() - 3 {
+        return None;
+    }
+    Some((spans[..=at].to_vec(), spans[at + 1..].to_vec()))
+}
+
+/// Detect a genuine two-column page: >= 3 rows split at a *consistent* gutter
+/// x. Returns the reading-order column streams (left column top-to-bottom,
+/// right column top-to-bottom) when stable, else None (single column).
+struct PageColumns {
+    top_full: Vec<Vec<Span>>,
+    left: Vec<Vec<Span>>,
+    right: Vec<Vec<Span>>,
+    bottom_full: Vec<Vec<Span>>,
+}
+
+/// Detect a genuine two-column page and produce reading-order streams:
+/// full-width rows above the column block, left column top-to-bottom, right
+/// column top-to-bottom, full-width rows below. Returns None when the page is
+/// not convincingly two-column.
+fn page_two_columns(lines: &[Vec<Span>]) -> Option<PageColumns> {
+    if lines.len() < 3 {
+        return None;
+    }
+    struct Split {
+        y: f64,
+        left: Vec<Span>,
+        right: Vec<Span>,
+        gutter_x: f64,
+    }
+    let mut splits: Vec<Split> = Vec::new();
+    for l in lines {
+        if let Some((left, right)) = split_row_columns(l) {
+            let l_end = left.iter().map(|x| x.x + x.advance).fold(f64::NEG_INFINITY, f64::max);
+            let r_start = right.iter().map(|x| x.x).fold(f64::INFINITY, f64::min);
+            splits.push(Split {
+                y: l[0].y,
+                left,
+                right,
+                gutter_x: (l_end + r_start) / 2.0,
+            });
+        }
+    }
+    if splits.len() < 3 {
+        return None;
+    }
+    let mut gxs: Vec<f64> = splits.iter().map(|s| s.gutter_x).collect();
+    gxs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med = gxs[gxs.len() / 2];
+    let tol = (0.15 * med.abs()).max(6.0);
+    let keep: Vec<Split> = splits
+        .into_iter()
+        .filter(|s| (s.gutter_x - med).abs() <= tol)
+        .collect();
+    if keep.len() < 3 {
+        return None;
+    }
+    let rows_with_text = lines.iter().filter(|l| l.len() >= 3).count().max(1);
+    if keep.len() * 2 < rows_with_text {
+        return None;
+    }
+    let col_top = keep.iter().map(|s| s.y).fold(f64::NEG_INFINITY, f64::max);
+    let mut left: Vec<(f64, Vec<Span>)> = Vec::new();
+    let mut right: Vec<(f64, Vec<Span>)> = Vec::new();
+    let mut top_full: Vec<Vec<Span>> = Vec::new();
+    let mut bottom_full: Vec<Vec<Span>> = Vec::new();
+    for l in lines {
+        let y = l[0].y;
+        let y_tol = 0.5 * l[0].size.max(0.1);
+        if let Some(sp) = keep.iter().find(|s| (s.y - y).abs() < y_tol) {
+            left.push((sp.y, sp.left.clone()));
+            right.push((sp.y, sp.right.clone()));
+            continue;
+        }
+        if y > col_top + y_tol {
+            top_full.push(l.clone());
+        } else {
+            bottom_full.push(l.clone());
+        }
+    }
+    top_full.sort_by(|a, b| b[0].y.partial_cmp(&a[0].y).unwrap_or(std::cmp::Ordering::Equal));
+    bottom_full.sort_by(|a, b| b[0].y.partial_cmp(&a[0].y).unwrap_or(std::cmp::Ordering::Equal));
+    // Prose gate: a true text column is made of multi-word lines on both
+    // sides where the words are spaced like a sentence. Pipe-table rows have
+    // short tokens and wide cell gutters inside the "line", so they must keep
+    // flowing through the table detector.
+    let wc = |rows: &[(f64, Vec<Span>)]| -> f64 {
+        if rows.is_empty() {
+            return 0.0;
+        }
+        rows.iter()
+            .map(|(_, v)| v.iter().filter(|sp| !sp.text.trim().is_empty()).count() as f64)
+            .sum::<f64>()
+            / rows.len() as f64
+    };
+    if wc(&left) < 2.5 || wc(&right) < 2.5 {
+        return None;
+    }
+    // No half may contain a column-wide gutter inside it (that would mean the
+    // "column" still holds multiple table cells).
+    let clean = |rows: &[(f64, Vec<Span>)]| -> bool {
+        rows.iter().all(|(_, v)| {
+            let size = v.iter().map(|x| x.size).fold(0.0f64, f64::max).max(0.1);
+            v.windows(2).all(|p| {
+                let a_end = p[0].x + p[0].advance;
+                let gap = (p[1].x - a_end).max(0.0);
+                gap <= 1.2 * size
+            })
+        })
+    };
+    if !clean(&left) || !clean(&right) {
+        return None;
+    }
+    left.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    right.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    Some(PageColumns {
+        top_full,
+        left: left.into_iter().map(|(_, v)| v).collect(),
+        right: right.into_iter().map(|(_, v)| v).collect(),
+        bottom_full,
+    })
+}
+
+/// Human reading order for the page as streams of visual lines: single-column
+/// pages produce one stream (top-down); two-column pages produce full-width
+/// header rows, left column, right column, footer rows.
+fn page_read_order(lines: &[Vec<Span>]) -> Vec<Vec<Vec<Span>>> {
+    if let Some(pc) = page_two_columns(lines) {
+        let mut streams = Vec::new();
+        if !pc.top_full.is_empty() {
+            streams.push(pc.top_full);
+        }
+        streams.push(pc.left);
+        streams.push(pc.right);
+        if !pc.bottom_full.is_empty() {
+            streams.push(pc.bottom_full);
+        }
+        return streams;
+    }
+    vec![lines.to_vec()]
+}
+
+/// Decide whether a visual line is a page-number footer (numeric-only, in the
+/// bottom band of the page).
+fn is_page_number_line(spans: &[Span], page_height: f64) -> bool {
+    let y0 = spans.iter().map(|s| s.y).fold(f64::INFINITY, f64::min);
+    let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if y0 < page_height * 0.055 {
+        let all_num = t
+            .chars()
+            .all(|c| c.is_ascii_digit() || c.is_whitespace() || c == '/' || c == '-' || c == '.');
+        return all_num && t.len() <= 12;
+    }
+    false
+}
+
+/// Human reading order for the page, expressed as streams of visual lines.
+/// Single-column pages produce one stream in top-to-bottom order; two-column
+/// pages produce two streams (left column then right column, each top-down).
+
+/// Render a single visual line to text (no surrounding blank-line logic).
+fn render_line_text(spans: &[Span]) -> String {
+    let size = spans.iter().map(|s| s.size).fold(0.0f64, f64::max).max(0.1);
+    let mut out = String::new();
+    let mut prev_x: Option<f64> = None;
+    let mut prev_advance = 0.0f64;
+    for span in spans {
+        if span.text.is_empty() {
+            continue;
+        }
+        if let Some(px) = prev_x {
+            let gap = span.x - px;
+            let space_adv = 0.25 * size;
+            if span.text != " " {
+                if gap > 2.5 * size {
+                    if !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                } else if gap - prev_advance > 0.35 * space_adv {
+                    if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
+                        out.push(' ');
+                    }
+                }
+            }
+        }
+        if span.text == " " {
+            if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
+                out.push(' ');
+            }
+        } else {
+            out.push_str(&span.text);
+        }
+        prev_x = Some(span.x);
+        prev_advance = span.advance;
+    }
+    out.trim_end().to_string()
+}
+
+/// Render page text in human reading order. When the page is a single column
+/// and nothing was removed, output equals `render_cluster` byte-for-byte.
+fn render_human_order(lines: &[Vec<Span>], page_height: f64, drop_furniture: bool) -> String {
+    let streams = page_read_order(lines);
+    if streams.len() == 1 {
+        // Single column: identical to the plain renderer unless we strip
+        // furniture lines (page numbers).
+        if !drop_furniture {
+            return render_cluster(lines);
+        }
+        let keep: Vec<Vec<Span>> = lines
+            .iter()
+            .filter(|l| !is_page_number_line(l, page_height))
+            .cloned()
+            .collect();
+        return render_cluster(&keep);
+    }
+    let mut out = String::new();
+    for (ci, stream) in streams.iter().enumerate() {
+        if ci > 0 && !out.is_empty() {
+            out.push('\n');
+        }
+        let mut prev_y: Option<f64> = None;
+        for line in stream {
+            if drop_furniture && is_page_number_line(line, page_height) {
+                continue;
+            }
+            let size = line[0].size.max(0.1);
+            if let Some(py) = prev_y {
+                if py - line[0].y > 2.0 * size {
+                    out.push('\n');
+                }
+            }
+            out.push_str(&render_line_text(line));
+            out.push('\n');
+            prev_y = Some(line[0].y);
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// Build the structured block list for a glyph page in reading order.
+fn build_doc_blocks(lines: &[Vec<Span>], page_height: f64) -> Vec<DocBlock> {
+    let mut sizes: Vec<f64> = lines
+        .iter()
+        .map(|l| l.iter().map(|s| s.size).fold(0.0f64, f64::max))
+        .filter(|s| *s > 0.0)
+        .collect();
+    sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let body = sizes.get(sizes.len() / 2).copied().unwrap_or(10.0).max(1.0);
+    let title_size = body * 1.6;
+    let max_y = lines.iter().map(|l| l[0].y).fold(f64::NEG_INFINITY, f64::max);
+
+    let mut blocks: Vec<DocBlock> = Vec::new();
+    for stream in page_read_order(lines) {
+        for line in stream {
+            if is_page_number_line(&line, page_height) {
+                continue;
+            }
+            let size = line.iter().map(|s| s.size).fold(0.0f64, f64::max);
+            let x0 = line.iter().map(|s| s.x).fold(f64::INFINITY, f64::min);
+            let x1 = line.iter().map(|s| s.x + s.advance).fold(f64::NEG_INFINITY, f64::max);
+            let y0 = line.iter().map(|s| s.y).fold(f64::INFINITY, f64::min);
+            let y1 = line.iter().map(|s| s.y).fold(f64::NEG_INFINITY, f64::max);
+            let text = render_line_text(&line);
+            let kind = if size >= title_size && y0 >= max_y - 2.0 {
+                "title"
+            } else if size >= body * 1.25 {
+                "heading"
+            } else if text.trim_start().starts_with(['-', '•', '●', '◦', '·', '*']) {
+                "list"
+            } else {
+                "body"
+            };
+            blocks.push(DocBlock {
+                page: 0,
+                kind: kind.to_string(),
+                x0,
+                y0,
+                x1,
+                y1,
+                text,
+            });
+        }
+    }
+    blocks
 }

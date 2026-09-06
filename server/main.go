@@ -49,6 +49,16 @@ type mediaItem struct {
 	DataB64    string  `json:"data_b64,omitempty"`
 }
 
+type docBlock struct {
+	Page int     `json:"page,omitempty"`
+	Kind string  `json:"kind"`
+	X0   float64 `json:"x0"`
+	Y0   float64 `json:"y0"`
+	X1   float64 `json:"x1"`
+	Y1   float64 `json:"y1"`
+	Text string  `json:"text"`
+}
+
 type convertResponse struct {
 	OK         bool        `json:"ok"`
 	Markdown   string      `json:"markdown,omitempty"`
@@ -56,6 +66,7 @@ type convertResponse struct {
 	Words      int         `json:"words"`
 	Tables     int         `json:"tables"`
 	Media      []mediaItem `json:"media,omitempty"`
+	Blocks     []docBlock  `json:"blocks,omitempty"`
 	DurationUs uint64      `json:"duration_us"`
 	DurationMs int64       `json:"duration_ms,omitempty"`
 	Engine     string      `json:"engine"`

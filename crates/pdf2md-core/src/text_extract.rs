@@ -545,12 +545,16 @@ pub struct PageText {
     pub text_ops_seen: bool,
     pub has_fonts: bool,
     pub tables: usize,
+    /// Structured human-reading-order blocks (geometry path only; empty on
+    /// string-walker pages).
+    pub blocks: Vec<crate::layout::DocBlock>,
 }
 
 fn extract_page(
     doc: &Document,
     page_id: ObjectId,
     detect_tables: bool,
+    detect_layout: bool,
 ) -> Result<PageText, String> {
     let fonts = doc.get_page_fonts(page_id).map_err(|e| format!("{e}"))?;
     let has_fonts = !fonts.is_empty();
@@ -576,7 +580,7 @@ fn extract_page(
     let has_tj_plain = content.operations.iter().any(|op| op.operator == "Tj");
     let has_td = content.operations.iter().any(|op| op.operator == "TD");
     if has_tj && !has_tj_plain && has_td {
-        return crate::layout::extract_page_glyphs(doc, page_id, detect_tables);
+        return crate::layout::extract_page_glyphs(doc, page_id, detect_tables, detect_layout);
     }
 
     let mut out = String::new();
@@ -717,6 +721,7 @@ fn extract_page(
         text_ops_seen,
         has_fonts,
         tables: 0,
+        blocks: Vec::new(),
     })
 }
 
@@ -727,13 +732,14 @@ pub fn extract_page_text_report(
     doc: &Document,
     page_number: u32,
     detect_tables: bool,
+    detect_layout: bool,
 ) -> Result<PageText, String> {
     let pages: std::collections::BTreeMap<u32, ObjectId> = doc.get_pages();
     let page_id = pages
         .get(&page_number)
         .copied()
         .ok_or_else(|| format!("page {page_number} not found"))?;
-    extract_page(doc, page_id, detect_tables)
+    extract_page(doc, page_id, detect_tables, detect_layout)
 }
 
 #[cfg(test)]

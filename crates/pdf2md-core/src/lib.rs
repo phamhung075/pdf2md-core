@@ -110,6 +110,10 @@ pub struct ConversionOptions {
     pub min_words_per_page: usize,
     /// Extract placed images and return them as base64 media items.
     pub detect_media: bool,
+    /// Rebuild reading order with zones/columns/furniture handling on the
+    /// geometry path (fallback is byte-identical for simple single-column
+    /// pages).
+    pub detect_layout: bool,
 }
 
 impl Default for ConversionOptions {
@@ -119,6 +123,7 @@ impl Default for ConversionOptions {
             detect_headings: true,
             min_words_per_page: 5,
             detect_media: true,
+            detect_layout: true,
         }
     }
 }
@@ -134,6 +139,10 @@ pub struct ConversionResult {
     /// Extracted image placements (base64 payloads) when `detect_media`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<media::MediaItem>,
+    /// Structured reading-order blocks for pages handled by the geometry
+    /// layout engine.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<layout::DocBlock>,
 }
 
 /// Probes whether raw PDF bytes contain a digital text stream without full rendering.
@@ -264,24 +273,30 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
     let mut any_fonts = false;
     let mut tables_detected = 0usize;
     let mut media_items: Vec<media::MediaItem> = Vec::new();
+    let mut block_items: Vec<layout::DocBlock> = Vec::new();
 
     for (page_num, page_id) in doc.get_pages() {
         // Prefer our own multilingual decoder (correct WinAnsi/Differences/
         // ToUnicode handling — see text_extract.rs) and only fall back to
         // lopdf's extractor when the page content cannot be parsed at all.
-        let page_text = match text_extract::extract_page_text_report(&doc, page_num, options.detect_tables) {
+        let page_text = match text_extract::extract_page_text_report(&doc, page_num, options.detect_tables, options.detect_layout) {
             Ok(pt) => pt,
             Err(_) => text_extract::PageText {
                 text: doc.extract_text(&[page_num]).unwrap_or_default(),
                 text_ops_seen: true,
                 has_fonts: doc.get_page_fonts(page_id).map_or(false, |f| !f.is_empty()),
                 tables: 0,
+                blocks: Vec::new(),
             },
         };
         any_text_ops |= page_text.text_ops_seen;
         any_fonts |= page_text.has_fonts;
         tables_detected += page_text.tables;
-        let text = page_text.text;
+        let text = page_text.text.clone();
+        for mut b in page_text.blocks {
+            b.page = page_num as usize;
+            block_items.push(b);
+        }
 
         if options.detect_media {
             let page_bbox = page_media_box(&doc, page_id);
@@ -335,6 +350,7 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
         tables_detected,
         duration_us,
         media: media_items,
+        blocks: block_items,
     })
 }
 
@@ -369,6 +385,7 @@ pub extern "C" fn pdf2md_convert(pdf_ptr: *const u8, pdf_len: usize) -> *mut c_c
         match convert_pdf_bytes_to_markdown(bytes, &ConversionOptions::default()) {
             Ok(r) => {
                 let media_json = serde_json::to_value(&r.media).unwrap_or_else(|_| serde_json::json!([]));
+                let blocks_json = serde_json::to_value(&r.blocks).unwrap_or_else(|_| serde_json::json!([]));
                 serde_json::json!({
                     "ok": true,
                     "markdown": r.markdown,
@@ -376,6 +393,7 @@ pub extern "C" fn pdf2md_convert(pdf_ptr: *const u8, pdf_len: usize) -> *mut c_c
                     "words": r.total_words,
                     "tables": r.tables_detected,
                     "media": media_json,
+                    "blocks": blocks_json,
                     "duration_us": r.duration_us,
                 })
             }
