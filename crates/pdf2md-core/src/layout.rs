@@ -452,7 +452,8 @@ pub fn extract_page_glyphs(
     // a 2-column table. Real pipe tables have short cell tokens, so we only
     // prefer the layout when every detected "row" is long prose on both sides.
     let prose_columns = detect_layout && page_two_columns(&lines).is_some();
-    let text = if !hits.is_empty() && !prose_columns {
+    let table_rendered = !hits.is_empty() && !prose_columns;
+    let text = if table_rendered {
         // Byte-identical to the plain text renderer when no table is found.
         render_with_tables(&lines, &hits)
     } else if detect_layout {
@@ -471,7 +472,7 @@ pub fn extract_page_glyphs(
         text,
         text_ops_seen,
         has_fonts,
-        tables: hits.len(),
+        tables: if table_rendered { hits.len() } else { 0 },
         blocks,
     })
 }
