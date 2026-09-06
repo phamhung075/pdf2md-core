@@ -267,6 +267,71 @@ fn page_media_box(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> Option<(f6
     Some((g(0)?, g(1)?, g(2)?, g(3)?))
 }
 
+
+/// Tag blocks whose text repeats near the top/bottom of >= 3 pages as running
+/// headers/footers. Operates purely on the structured block list.
+fn tag_running_furniture(blocks: &mut [layout::DocBlock]) {
+    use std::collections::HashMap;
+    let mut page_span: HashMap<usize, (f64, f64)> = HashMap::new();
+    for b in blocks.iter() {
+        let e = page_span.entry(b.page).or_insert((f64::INFINITY, f64::NEG_INFINITY));
+        e.0 = e.0.min(b.y0.min(b.y1));
+        e.1 = e.1.max(b.y0.max(b.y1));
+    }
+    let norm = |t: &str| -> String {
+        t.chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let mut header_counts: HashMap<String, usize> = HashMap::new();
+    let mut footer_counts: HashMap<String, usize> = HashMap::new();
+    for b in blocks.iter() {
+        if b.kind != "body" && b.kind != "list" && b.kind != "heading" {
+            continue;
+        }
+        if b.text.split_whitespace().count() > 14 {
+            continue; // paragraphs aren't furniture
+        }
+        let n = norm(&b.text);
+        if n.is_empty() {
+            continue;
+        }
+        if let Some((lo, hi)) = page_span.get(&b.page) {
+            let span = (hi - lo).abs().max(1.0);
+            let top_frac = ((b.y0.max(b.y1)) - lo) / span;
+            let bottom_frac = ((b.y0.min(b.y1)) - lo) / span;
+            if top_frac > 0.9 {
+                *header_counts.entry(n).or_insert(0) += 1;
+            } else if bottom_frac < 0.1 {
+                *footer_counts.entry(n).or_insert(0) += 1;
+            }
+        }
+    }
+    for b in blocks.iter_mut() {
+        if b.kind != "body" && b.kind != "list" && b.kind != "heading" {
+            continue;
+        }
+        if b.text.split_whitespace().count() > 14 {
+            continue;
+        }
+        let n = norm(&b.text);
+        if let Some((lo, hi)) = page_span.get(&b.page) {
+            let span = (hi - lo).abs().max(1.0);
+            let top_frac = ((b.y0.max(b.y1)) - lo) / span;
+            let bottom_frac = ((b.y0.min(b.y1)) - lo) / span;
+            if top_frac > 0.9 && header_counts.get(&n).copied().unwrap_or(0) >= 3 {
+                b.kind = "header".to_string();
+            } else if bottom_frac < 0.1 && footer_counts.get(&n).copied().unwrap_or(0) >= 3 {
+                b.kind = "footer".to_string();
+            }
+        }
+    }
+}
+
 /// Converts PDF byte slice to clean Markdown with 2D spatial table reconstruction.
 pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) -> Result<ConversionResult, String> {
     let t0 = Instant::now();
@@ -412,6 +477,14 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
              route through the OCR/Vision pipeline (Docling/Gemini)."
                 .to_string(),
         );
+    }
+
+    // Document-level furniture pass: a short line repeated at the top band of
+    // many pages is a running header; one repeated at the bottom band is a
+    // running footer. Tagging them gives clients a structured way to suppress
+    // furniture (markdown text is intentionally left untouched here).
+    if options.detect_layout && !block_items.is_empty() {
+        tag_running_furniture(&mut block_items);
     }
 
     let duration_us = t0.elapsed().as_micros() as u64;

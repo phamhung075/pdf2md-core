@@ -201,3 +201,28 @@ fn caption_adjacency_tags_figure_text() {
     assert!(res.markdown.contains("data:image/png;base64,"));
     assert!(res.markdown.contains("ACME Industries"));
 }
+
+#[test]
+fn running_header_and_footer_are_tagged_in_block_list() {
+    // A 3-page glyph document with the same running header/footer on every
+    // page and numeric page numbers at the bottom. The doc-level pass must tag
+    // 3 headers + 3 footers in the structured block list and strip the page
+    // numbers from the markdown.
+    let bytes = std::fs::read("tests/fixtures/synth_furniture.pdf").expect("fixture missing");
+    let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
+        .expect("furniture doc should convert");
+    let headers = res.blocks.iter().filter(|b| b.kind == "header").count();
+    let footers = res.blocks.iter().filter(|b| b.kind == "footer").count();
+    assert_eq!(headers, 3, "expected 3 running headers, got {headers}");
+    assert_eq!(footers, 3, "expected 3 running footers, got {footers}");
+    // The bare numeric page numbers are dropped from the text layer (footer
+    // text remains, so only a standalone "\nN\n" line must be gone).
+    for ln in res.markdown.lines() {
+        let t = ln.trim();
+        assert!(
+            !(!t.is_empty() && t.len() <= 3 && t.chars().all(|c| c.is_ascii_digit())),
+            "bare page number leaked: {ln:?}\n{}",
+            res.markdown
+        );
+    }
+}
