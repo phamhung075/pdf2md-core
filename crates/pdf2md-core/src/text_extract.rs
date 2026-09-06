@@ -538,14 +538,20 @@ fn show_text(out: &mut String, codec: &Codec, operands: &[Object]) {
 
 /// Page text result plus whether the page's content stream contains any
 /// text-show operators (used to detect glyph-encoded / outlined documents
-/// whose text cannot be recovered, so the caller can ask for OCR).
+/// whose text cannot be recovered, so the caller can ask for OCR), plus how
+/// many grid tables the geometry engine recovered on the page.
 pub struct PageText {
     pub text: String,
     pub text_ops_seen: bool,
     pub has_fonts: bool,
+    pub tables: usize,
 }
 
-fn extract_page(doc: &Document, page_id: ObjectId) -> Result<PageText, String> {
+fn extract_page(
+    doc: &Document,
+    page_id: ObjectId,
+    detect_tables: bool,
+) -> Result<PageText, String> {
     let fonts = doc.get_page_fonts(page_id).map_err(|e| format!("{e}"))?;
     let has_fonts = !fonts.is_empty();
     let codecs: Vec<(Vec<u8>, Codec)> = fonts
@@ -570,7 +576,7 @@ fn extract_page(doc: &Document, page_id: ObjectId) -> Result<PageText, String> {
     let has_tj_plain = content.operations.iter().any(|op| op.operator == "Tj");
     let has_td = content.operations.iter().any(|op| op.operator == "TD");
     if has_tj && !has_tj_plain && has_td {
-        return crate::layout::extract_page_glyphs(doc, page_id);
+        return crate::layout::extract_page_glyphs(doc, page_id, detect_tables);
     }
 
     let mut out = String::new();
@@ -710,19 +716,24 @@ fn extract_page(doc: &Document, page_id: ObjectId) -> Result<PageText, String> {
         text: out.trim_end().to_string(),
         text_ops_seen,
         has_fonts,
+        tables: 0,
     })
 }
 
 /// Reports the text for one page (1-based page numbers, as used by
 /// `Document::get_pages`) plus whether the page contains text-show operators
 /// at all.
-pub fn extract_page_text_report(doc: &Document, page_number: u32) -> Result<PageText, String> {
+pub fn extract_page_text_report(
+    doc: &Document,
+    page_number: u32,
+    detect_tables: bool,
+) -> Result<PageText, String> {
     let pages: std::collections::BTreeMap<u32, ObjectId> = doc.get_pages();
     let page_id = pages
         .get(&page_number)
         .copied()
         .ok_or_else(|| format!("page {page_number} not found"))?;
-    extract_page(doc, page_id)
+    extract_page(doc, page_id, detect_tables)
 }
 
 #[cfg(test)]

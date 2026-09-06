@@ -241,22 +241,24 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
     let mut total_words = 0;
     let mut any_text_ops = false;
     let mut any_fonts = false;
-    let tables_detected = 0;
+    let mut tables_detected = 0usize;
 
     for (page_num, page_id) in doc.get_pages() {
         // Prefer our own multilingual decoder (correct WinAnsi/Differences/
         // ToUnicode handling — see text_extract.rs) and only fall back to
         // lopdf's extractor when the page content cannot be parsed at all.
-        let page_text = match text_extract::extract_page_text_report(&doc, page_num) {
+        let page_text = match text_extract::extract_page_text_report(&doc, page_num, options.detect_tables) {
             Ok(pt) => pt,
             Err(_) => text_extract::PageText {
                 text: doc.extract_text(&[page_num]).unwrap_or_default(),
                 text_ops_seen: true,
                 has_fonts: doc.get_page_fonts(page_id).map_or(false, |f| !f.is_empty()),
+                tables: 0,
             },
         };
         any_text_ops |= page_text.text_ops_seen;
         any_fonts |= page_text.has_fonts;
+        tables_detected += page_text.tables;
         let text = page_text.text;
 
         let words: Vec<&str> = text.split_whitespace().collect();

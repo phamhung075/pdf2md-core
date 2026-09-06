@@ -111,3 +111,26 @@ fn compressed_text_layer_ticket_is_detected_and_extracted() {
         assert!(md.contains(expected), "missing {expected:?} in:\n{md}");
     }
 }
+
+#[test]
+fn aligned_grid_glyph_page_becomes_gfm_table() {
+    // A genuine aligned grid drawn the way table producers (LibreOffice,
+    // print drivers) draw one: every row starts its cell words at the same
+    // absolute column x (per-glyph BT/Tm/TD/TJ blocks). The geometry engine's
+    // Stage-3 table recovery must turn it into a GFM pipe table and report a
+    // real table count.
+    let bytes = std::fs::read("tests/fixtures/synth_grid_table.pdf").expect("fixture missing");
+    let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
+        .expect("grid fixture should convert");
+    assert!(res.tables_detected >= 1, "expected >=1 table, got {}", res.tables_detected);
+    let md = res.markdown;
+    // GFM header + separator + body cells.
+    assert!(md.contains("| Désignation | Quantité | Prix unitaire | Montant |"), "missing header row:\n{md}");
+    assert!(md.contains("| --- |"), "missing GFM separator:\n{md}");
+    assert!(md.contains("| Abonnement | 1 | 12,50 | 12,50 |"), "missing data row:\n{md}");
+    assert!(md.contains("| Consommation | 240 | 0,1726 | 41,42 |"), "missing data row:\n{md}");
+    assert!(md.contains("| Réduction | -1 | -3,00 | -3,00 |"), "missing data row:\n{md}");
+    // Each cell must keep its whole text (no merged or dropped words).
+    assert!(md.contains("Prix unitaire"), "cell words merged:\n{md}");
+    assert!(md.contains("Taxes diverses"), "cell words merged:\n{md}");
+}
