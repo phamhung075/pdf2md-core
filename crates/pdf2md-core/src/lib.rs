@@ -597,6 +597,18 @@ fn cstring_into_raw(s: String) -> *mut c_char {
 ///   { "ok": false, "error": "..." }
 #[no_mangle]
 pub extern "C" fn pdf2md_convert(pdf_ptr: *const u8, pdf_len: usize) -> *mut c_char {
+    pdf2md_convert_impl(pdf_ptr, pdf_len, None)
+}
+
+/// Same as `pdf2md_convert`, but with an explicit `detect_vectors` flag
+/// (0 = off, nonzero = on) so sandbox/FFI consumers can request vector figure
+/// cuts per call instead of relying on the `P2M_DETECT_VECTORS` env hatch.
+#[no_mangle]
+pub extern "C" fn pdf2md_convert_ex(pdf_ptr: *const u8, pdf_len: usize, detect_vectors: i32) -> *mut c_char {
+    pdf2md_convert_impl(pdf_ptr, pdf_len, Some(detect_vectors != 0))
+}
+
+fn pdf2md_convert_impl(pdf_ptr: *const u8, pdf_len: usize, vectors_override: Option<bool>) -> *mut c_char {
     let json = if pdf_ptr.is_null() {
         serde_json::json!({ "ok": false, "error": "null input pointer" })
     } else {
@@ -604,7 +616,10 @@ pub extern "C" fn pdf2md_convert(pdf_ptr: *const u8, pdf_len: usize) -> *mut c_c
         let mut opts = ConversionOptions::default();
         // Optional escape hatch so sandbox/FFI consumers can request vector
         // figure cuts without an ABI change.
-        if std::env::var("P2M_DETECT_VECTORS").map_or(false, |v| v == "1" || v == "true") {
+        let vectors_on = vectors_override.unwrap_or_else(|| {
+            std::env::var("P2M_DETECT_VECTORS").map_or(false, |v| v == "1" || v == "true")
+        });
+        if vectors_on {
             opts.detect_vectors = true;
         }
         match convert_pdf_bytes_to_markdown(bytes, &opts) {
