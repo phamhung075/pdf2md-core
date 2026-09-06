@@ -130,27 +130,39 @@ pub struct ConversionResult {
 
 /// Probes whether raw PDF bytes contain a digital text stream without full rendering.
 pub fn is_digital_pdf_bytes(bytes: &[u8]) -> bool {
-    if bytes.len() < 32 {
+    if bytes.len() < 32 || !bytes.starts_with(b"%PDF-") {
         return false;
     }
 
-    // PDF magic check: %PDF-
-    if !bytes.starts_with(b"%PDF-") {
+    // Structural check: parse and look for a real text layer. Unlike a raw
+    // string scan, this handles content streams that are FlateDecode-compressed
+    // (where "BT"/"Tj" never appear in the raw bytes) — e.g. PDFCreator/
+    // Ghostscript tickets and most modern PDFs. A page is "digital" if it
+    // references any font or issues any text-show operator.
+    if let Ok(doc) = lopdf::Document::load_mem(bytes) {
+        for (_page_num, page_id) in doc.get_pages() {
+            if doc.get_page_fonts(page_id).map_or(false, |f| !f.is_empty()) {
+                return true;
+            }
+            if let Ok(content) = doc.get_and_decode_page_content(page_id) {
+                if content.operations.iter().any(|op| {
+                    matches!(op.operator.as_str(), "Tj" | "TJ" | "'" | "\"")
+                }) {
+                    return true;
+                }
+            }
+        }
         return false;
     }
 
-    // Scan for text operator indicators: BT (Begin Text), Tj, TJ, ET (End Text)
-    // and font definitions /Font
+    // Fallback (failed parse / truncated input): raw markers.
     let text_markers: &[&[u8]] = &[b"BT\n", b"BT\r", b"BT ", b"/Font", b"Tj", b"TJ"];
     let mut matches = 0;
-
     for marker in text_markers {
         if bytes.windows(marker.len()).any(|w| w == *marker) {
             matches += 1;
         }
     }
-
-    // If multiple distinct text operators are present, text layer is present
     matches >= 2
 }
 
@@ -219,10 +231,6 @@ pub fn reconstruct_canvas_tables(spans: &[TextSpan]) -> Vec<CanvasTable> {
 pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) -> Result<ConversionResult, String> {
     let t0 = Instant::now();
 
-    if !is_digital_pdf_bytes(bytes) {
-        return Err("Document lacks a digital text layer or is scanned".to_string());
-    }
-
     // Try parsing with lopdf
     let doc = lopdf::Document::load_mem(bytes)
         .map_err(|e| format!("lopdf parsing error: {}", e))?;
@@ -231,9 +239,10 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
     let total_pages = doc.get_pages().len();
     let mut total_words = 0;
     let mut any_text_ops = false;
+    let mut any_fonts = false;
     let tables_detected = 0;
 
-    for (page_num, _page_id) in doc.get_pages() {
+    for (page_num, page_id) in doc.get_pages() {
         // Prefer our own multilingual decoder (correct WinAnsi/Differences/
         // ToUnicode handling — see text_extract.rs) and only fall back to
         // lopdf's extractor when the page content cannot be parsed at all.
@@ -242,9 +251,11 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
             Err(_) => text_extract::PageText {
                 text: doc.extract_text(&[page_num]).unwrap_or_default(),
                 text_ops_seen: true,
+                has_fonts: doc.get_page_fonts(page_id).map_or(false, |f| !f.is_empty()),
             },
         };
         any_text_ops |= page_text.text_ops_seen;
+        any_fonts |= page_text.has_fonts;
         let text = page_text.text;
 
         let words: Vec<&str> = text.split_whitespace().collect();
@@ -258,14 +269,28 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
         full_markdown.push_str("\n\n");
     }
 
-    // Some documents carry text-show operators but no recoverable text: the
-    // glyphs are either vectorised (Ghostscript/PDFCreator Type3 output) or
-    // mapped through fonts with no Unicode info. Instead of returning a silent
-    // empty markdown, tell the caller to route through OCR.
-    if total_words == 0 && any_text_ops {
+    // When nothing was decoded, give an actionable reason instead of a silent
+    // empty markdown:
+    //  * text-show operators but no readable text -> glyph-encoded (Type3) doc;
+    //  * no fonts and no text-show operators at all -> scanned/image page.
+    if total_words == 0 {
+        if any_text_ops {
+            return Err(
+                "Document text layer is glyph-encoded (e.g. Type3/outlined) with no Unicode mapping; \
+                 no readable text found — route through the OCR/Vision pipeline (Docling/Gemini)."
+                    .to_string(),
+            );
+        }
+        if !any_fonts {
+            return Err(
+                "Document lacks a digital text layer or is scanned (images only); \
+                 route through the OCR/Vision pipeline (Docling/Gemini)."
+                    .to_string(),
+            );
+        }
         return Err(
-            "Document text layer is glyph-encoded (e.g. Type3/outlined) with no Unicode mapping; \
-             no readable text found — route through the OCR/Vision pipeline (Docling/Gemini)."
+            "Document references fonts but no readable text was found (scanned or outlined); \
+             route through the OCR/Vision pipeline (Docling/Gemini)."
                 .to_string(),
         );
     }

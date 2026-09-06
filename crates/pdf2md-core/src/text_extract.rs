@@ -515,10 +515,12 @@ fn show_text(out: &mut String, codec: &Codec, operands: &[Object]) {
 pub struct PageText {
     pub text: String,
     pub text_ops_seen: bool,
+    pub has_fonts: bool,
 }
 
 fn extract_page(doc: &Document, page_id: ObjectId) -> Result<PageText, String> {
     let fonts = doc.get_page_fonts(page_id).map_err(|e| format!("{e}"))?;
+    let has_fonts = !fonts.is_empty();
     let codecs: Vec<(Vec<u8>, Codec)> = fonts
         .iter()
         .filter_map(|(name, fd)| resolve_codec(doc, fd).map(|c| (name.clone(), c)))
@@ -576,6 +578,7 @@ fn extract_page(doc: &Document, page_id: ObjectId) -> Result<PageText, String> {
     Ok(PageText {
         text: out.trim_end().to_string(),
         text_ops_seen,
+        has_fonts,
     })
 }
 

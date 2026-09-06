@@ -62,3 +62,31 @@ fn type3_glyph_encoded_reports_ocr_required() {
         "error should mention OCR, got: {err}"
     );
 }
+
+#[test]
+fn compressed_text_layer_ticket_is_detected_and_extracted() {
+    // Electronic tickets (e.g. "billet électronique") store their content
+    // streams FlateDecode-compressed, so the raw bytes contain no "BT"/"Tj"
+    // markers. The digital-text-layer detector must still recognise it (by
+    // decompressing the stream / checking fonts), and the extractor must turn
+    // the French/English text into Markdown.
+    // A synthetic ticket whose content stream is FlateDecode-compressed (no
+    // personal data). Raw bytes carry no "BT"/"Tj" markers.
+    let bytes = std::fs::read("tests/fixtures/synth_ticket_compressed.pdf").expect("fixture missing");
+    assert!(!bytes.windows(2).any(|w| w == b"BT"), "fixture should store text compressed");
+    assert!(
+        pdf2md_core::is_digital_pdf_bytes(&bytes),
+        "compressed text-stream PDF should be detected as digital"
+    );
+    let md = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
+        .expect("digital ticket should extract, not be rejected as scanned")
+        .markdown;
+    for expected in [
+        "BILLET ÉLECTRONIQUE",
+        "RÉFÉRENCE DE VOTRE RÉSERVATION",
+        "pièce d'identité",
+        "carte d'embarquement",
+    ] {
+        assert!(md.contains(expected), "missing {expected:?} in:\n{md}");
+    }
+}
