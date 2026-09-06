@@ -230,16 +230,22 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
     let mut full_markdown = String::new();
     let total_pages = doc.get_pages().len();
     let mut total_words = 0;
+    let mut any_text_ops = false;
     let tables_detected = 0;
 
     for (page_num, _page_id) in doc.get_pages() {
         // Prefer our own multilingual decoder (correct WinAnsi/Differences/
         // ToUnicode handling — see text_extract.rs) and only fall back to
         // lopdf's extractor when the page content cannot be parsed at all.
-        let text = match text_extract::extract_page_text(&doc, page_num) {
-            Ok(t) => t,
-            Err(_) => doc.extract_text(&[page_num]).unwrap_or_default(),
+        let page_text = match text_extract::extract_page_text_report(&doc, page_num) {
+            Ok(pt) => pt,
+            Err(_) => text_extract::PageText {
+                text: doc.extract_text(&[page_num]).unwrap_or_default(),
+                text_ops_seen: true,
+            },
         };
+        any_text_ops |= page_text.text_ops_seen;
+        let text = page_text.text;
 
         let words: Vec<&str> = text.split_whitespace().collect();
         total_words += words.len();
@@ -250,6 +256,18 @@ pub fn convert_pdf_bytes_to_markdown(bytes: &[u8], options: &ConversionOptions) 
 
         full_markdown.push_str(&text);
         full_markdown.push_str("\n\n");
+    }
+
+    // Some documents carry text-show operators but no recoverable text: the
+    // glyphs are either vectorised (Ghostscript/PDFCreator Type3 output) or
+    // mapped through fonts with no Unicode info. Instead of returning a silent
+    // empty markdown, tell the caller to route through OCR.
+    if total_words == 0 && any_text_ops {
+        return Err(
+            "Document text layer is glyph-encoded (e.g. Type3/outlined) with no Unicode mapping; \
+             no readable text found — route through the OCR/Vision pipeline (Docling/Gemini)."
+                .to_string(),
+        );
     }
 
     let duration_us = t0.elapsed().as_micros() as u64;

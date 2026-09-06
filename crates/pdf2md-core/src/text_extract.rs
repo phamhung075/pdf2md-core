@@ -509,7 +509,15 @@ fn show_text(out: &mut String, codec: &Codec, operands: &[Object]) {
     }
 }
 
-fn extract_page(doc: &Document, page_id: ObjectId) -> Result<String, String> {
+/// Page text result plus whether the page's content stream contains any
+/// text-show operators (used to detect glyph-encoded / outlined documents
+/// whose text cannot be recovered, so the caller can ask for OCR).
+pub struct PageText {
+    pub text: String,
+    pub text_ops_seen: bool,
+}
+
+fn extract_page(doc: &Document, page_id: ObjectId) -> Result<PageText, String> {
     let fonts = doc.get_page_fonts(page_id).map_err(|e| format!("{e}"))?;
     let codecs: Vec<(Vec<u8>, Codec)> = fonts
         .iter()
@@ -522,6 +530,7 @@ fn extract_page(doc: &Document, page_id: ObjectId) -> Result<String, String> {
 
     let mut out = String::new();
     let mut cur: Option<usize> = None;
+    let mut text_ops_seen = false;
 
     for op in &content.operations {
         match op.operator.as_str() {
@@ -530,11 +539,13 @@ fn extract_page(doc: &Document, page_id: ObjectId) -> Result<String, String> {
                 cur = name.and_then(|nm| codecs.iter().position(|(n, _)| n == nm));
             }
             "Tj" | "TJ" => {
+                text_ops_seen = true;
                 if let Some(ci) = cur {
                     show_text(&mut out, &codecs[ci].1, &op.operands);
                 }
             }
             "'" => {
+                text_ops_seen = true;
                 if !ends_with_ws(&out) {
                     out.push('\n');
                 }
@@ -543,6 +554,7 @@ fn extract_page(doc: &Document, page_id: ObjectId) -> Result<String, String> {
                 }
             }
             "\"" => {
+                text_ops_seen = true;
                 if !ends_with_ws(&out) {
                     out.push('\n');
                 }
@@ -561,13 +573,27 @@ fn extract_page(doc: &Document, page_id: ObjectId) -> Result<String, String> {
         }
     }
 
-    Ok(out.trim_end().to_string())
+    Ok(PageText {
+        text: out.trim_end().to_string(),
+        text_ops_seen,
+    })
 }
 
 /// Extract readable text for one page (1-based page numbers, as used by
 /// `Document::get_pages`). Errors only when the page content cannot be parsed;
 /// the caller may then fall back to lopdf's own extractor.
 pub fn extract_page_text(doc: &Document, page_number: u32) -> Result<String, String> {
+    let pages: std::collections::BTreeMap<u32, ObjectId> = doc.get_pages();
+    let page_id = pages
+        .get(&page_number)
+        .copied()
+        .ok_or_else(|| format!("page {page_number} not found"))?;
+    extract_page(doc, page_id).map(|pt| pt.text)
+}
+
+/// Like [`extract_page_text`] but also reports whether the page contains
+/// text-show operators at all.
+pub fn extract_page_text_report(doc: &Document, page_number: u32) -> Result<PageText, String> {
     let pages: std::collections::BTreeMap<u32, ObjectId> = doc.get_pages();
     let page_id = pages
         .get(&page_number)

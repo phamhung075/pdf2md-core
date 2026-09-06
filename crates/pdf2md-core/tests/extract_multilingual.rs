@@ -47,3 +47,18 @@ fn vietnamese_extracts_via_tounicode_cmap() {
         assert!(md.contains(expected), "missing {expected:?} in:\n{md}");
     }
 }
+
+#[test]
+fn type3_glyph_encoded_reports_ocr_required() {
+    // Ghostscript/PDFCreator-style output: a Type3 font with numeric glyph
+    // names and no ToUnicode. No text is recoverable from the text layer, so
+    // the engine must report a clear "needs OCR" error instead of a silent
+    // empty markdown / "0 words".
+    let bytes = std::fs::read("tests/fixtures/type3_glyph.pdf").expect("fixture missing");
+    let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default());
+    let err = res.expect_err("glyph-encoded document should not produce markdown");
+    assert!(
+        err.contains("OCR"),
+        "error should mention OCR, got: {err}"
+    );
+}
