@@ -115,8 +115,13 @@ function mdEscape(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-function mdInline(s) {
+function mdInline(s, allowBr) {
   let t = mdEscape(s);
+  // GFM table cells encode intra-cell line breaks as a raw <br> token in the
+  // Markdown source (e.g. bilingual headers: "Départ<br>Departure"). The
+  // escape above would render that as visible "<br>" text, so whitelist the
+  // <br> token back to a real line break when rendering cell content.
+  if (allowBr) t = t.replace(/&lt;br(?:\s*\/)?&gt;/gi, '<br>');
   t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
   t = t.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function (all, alt, url) {
     if (/^data:image\/(png|jpe?g|gif|webp);base64,/i.test(url) || /^https?:\/\//i.test(url)) {
@@ -143,19 +148,19 @@ function splitCells(r) {
 }
 
 function mdTable(rows) {
-  if (rows.length < 2) return '<p>' + mdInline(rows[0]) + '</p>';
+  if (rows.length < 2) return '<p>' + mdInline(rows[0], true) + '</p>';
   const sep = splitCells(rows[1]).filter(c => c !== '');
   const isSep = sep.length > 0 && sep.every(c => /^:?-+:?$/.test(c));
   if (!isSep) {
-    return '<p>' + rows.map(r => mdInline(r)).join('<br>') + '</p>';
+    return '<p>' + rows.map(r => mdInline(r, true)).join('<br>') + '</p>';
   }
   const header = splitCells(rows[0]);
   const body = rows.slice(2).map(splitCells);
-  let h = '<table><thead><tr>' + header.map(c => '<th>' + mdInline(c) + '</th>').join('') + '</tr></thead>';
+  let h = '<table><thead><tr>' + header.map(c => '<th>' + mdInline(c, true) + '</th>').join('') + '</tr></thead>';
   if (body.length) {
     h += '<tbody>';
     for (const r of body) {
-      h += '<tr>' + r.map(c => '<td>' + mdInline(c) + '</td>').join('') + '</tr>';
+      h += '<tr>' + r.map(c => '<td>' + mdInline(c, true) + '</td>').join('') + '</tr>';
     }
     h += '</tbody>';
   }
