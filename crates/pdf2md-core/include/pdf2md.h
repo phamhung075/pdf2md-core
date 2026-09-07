@@ -1,3 +1,9 @@
+/*
+ * Copyright (c) 2026 Dai Hung PHAM. All rights reserved.
+ * SPDX-License-Identifier: BSL-1.1
+ * Licensed under the Business Source License 1.1 (BSL-1.1).
+ */
+
 #ifndef PDF2MD_H
 #define PDF2MD_H
 
@@ -16,6 +22,9 @@ extern "C" {
  *   { "ok": false, "error": "..." }
  */
 char *pdf2md_convert(const uint8_t *pdf_bytes, size_t pdf_len);
+
+/* Same as pdf2md_convert, but with explicit vector figure detection flag. */
+char *pdf2md_convert_ex(const uint8_t *pdf_bytes, size_t pdf_len, int detect_vectors);
 
 /* Returns 1 when the PDF has a digital text layer, 0 otherwise. */
 int pdf2md_is_digital(const uint8_t *pdf_bytes, size_t pdf_len);

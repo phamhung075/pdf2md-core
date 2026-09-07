@@ -1,177 +1,35 @@
 //! pdf2md-core — High-performance native Rust core engine for sub-millisecond
 //! PDF-to-Markdown extraction and 2D spatial canvas table reconstruction.
 //!
-//! Licensed under MIT OR Apache-2.0. Zero AGPL/GPL dependencies.
+//! Copyright (c) 2026 Dai Hung PHAM. All rights reserved.
+//! SPDX-License-Identifier: BSL-1.1
+//! Licensed under the Business Source License 1.1 (BSL-1.1).
 
-mod glyph_data;
-mod layout;
-mod media;
-mod text_extract;
+pub mod cpdf_textpage;
+pub mod ffi;
+pub mod glyph_data;
+pub mod layout;
+pub mod media;
+pub mod models;
+pub mod text_extract;
 
-use serde::{Deserialize, Serialize};
+pub use cpdf_textpage::{
+    CharInfo, ClusterConfig, Matrix3x3, PdfTextState, Rect, SpatialClusterer, TextBlock, TextLine,
+    TextWord,
+};
+pub use ffi::{
+    pdf2md_convert, pdf2md_convert_ex, pdf2md_free_string, pdf2md_is_digital, pdf2md_version,
+};
+pub use layout::{
+    analyze_char_stream, analyze_layout, analyze_pages_parallel, extract_tables, AstNode,
+    DocumentStatistics, LayoutAST, LineSegment, ModernLayoutEngine, TableCell, XyCutOptions,
+};
+pub use media::{extract_page_media, extract_page_vector_figures, MediaItem, MediaKind};
+pub use models::{
+    BoundingBox, CanvasTable, ColumnAlignment, ConversionOptions, ConversionResult, TextSpan,
+};
+
 use std::time::Instant;
-
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-
-/// 2D Bounding Box in PDF coordinate space (points).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BoundingBox {
-    pub x0: f64,
-    pub y0: f64,
-    pub x1: f64,
-    pub y1: f64,
-}
-
-impl BoundingBox {
-    pub fn new(x0: f64, y0: f64, x1: f64, y1: f64) -> Self {
-        Self { x0, y0, x1, y1 }
-    }
-
-    pub fn intersects(&self, other: &BoundingBox) -> bool {
-        self.x0 < other.x1 && self.x1 > other.x0 && self.y0 < other.y1 && self.y1 > other.y0
-    }
-
-    pub fn width(&self) -> f64 {
-        (self.x1 - self.x0).abs()
-    }
-
-    pub fn height(&self) -> f64 {
-        (self.y1 - self.y0).abs()
-    }
-}
-
-/// Extracted text span with spatial coordinates.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TextSpan {
-    pub text: String,
-    pub bbox: BoundingBox,
-    pub font_size: f64,
-    pub is_bold: bool,
-    pub page_number: usize,
-}
-
-/// Reconstructed 2D table grid from text positions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CanvasTable {
-    pub rows: Vec<Vec<String>>,
-    pub bbox: BoundingBox,
-}
-
-impl CanvasTable {
-    /// Escapes a cell for GFM pipe tables: `|` and `\` must be backslash
-    /// escaped, newlines flattened (a cell must stay on one physical row).
-    fn md_cell(raw: &str) -> String {
-        let v = raw.trim();
-        if v.is_empty() {
-            return " ".to_string();
-        }
-        let mut s = String::with_capacity(v.len() + 4);
-        for ch in v.chars() {
-            match ch {
-                '|' => s.push_str("\\|"),
-                '\\' => s.push_str("\\\\"),
-                '\n' | '\r' => s.push(' '),
-                _ => s.push(ch),
-            }
-        }
-        s
-    }
-
-    /// Renders the reconstructed table into standard GitHub Flavored Markdown (GFM) pipe table.
-    pub fn to_markdown(&self) -> String {
-        if self.rows.is_empty() {
-            return String::new();
-        }
-
-        let num_cols = self.rows.iter().map(|r| r.len()).max().unwrap_or(0);
-        if num_cols == 0 {
-            return String::new();
-        }
-
-        let mut md = String::new();
-
-        // Header row (row 0 or synthesized)
-        let header = &self.rows[0];
-        md.push('|');
-        for c in 0..num_cols {
-            let val = header.get(c).map(|s| s.as_str()).unwrap_or("");
-            md.push_str(&format!(" {} |", Self::md_cell(val)));
-        }
-        md.push('\n');
-
-        // Separator row
-        md.push('|');
-        for _ in 0..num_cols {
-            md.push_str(" --- |");
-        }
-        md.push('\n');
-
-        // Data rows
-        for row in self.rows.iter().skip(1) {
-            md.push('|');
-            for c in 0..num_cols {
-                let val = row.get(c).map(|s| s.as_str()).unwrap_or("");
-                md.push_str(&format!(" {} |", Self::md_cell(val)));
-            }
-            md.push('\n');
-        }
-
-        md
-    }
-}
-
-/// Conversion and parsing options.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversionOptions {
-    pub detect_tables: bool,
-    pub detect_headings: bool,
-    pub min_words_per_page: usize,
-    /// Extract placed images and return them as base64 media items.
-    pub detect_media: bool,
-    /// Rebuild reading order with zones/columns/furniture handling on the
-    /// geometry path (fallback is byte-identical for simple single-column
-    /// pages).
-    pub detect_layout: bool,
-    /// Embed extracted, non-decorative images into the markdown itself as
-    /// self-contained data-URI lines (placed top-to-bottom per page). When
-    /// false, images are only returned in the `media` JSON list.
-    pub embed_media: bool,
-    /// Detect pure-vector figure regions (charts/diagrams/logos drawn with
-    /// paths, no raster) and cut them out as standalone clipped PDFs.
-    pub detect_vectors: bool,
-}
-
-impl Default for ConversionOptions {
-    fn default() -> Self {
-        Self {
-            detect_tables: true,
-            detect_headings: true,
-            min_words_per_page: 5,
-            detect_media: true,
-            detect_layout: true,
-            embed_media: true,
-            detect_vectors: false,
-        }
-    }
-}
-
-/// Conversion result summary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversionResult {
-    pub markdown: String,
-    pub total_pages: usize,
-    pub total_words: usize,
-    pub tables_detected: usize,
-    pub duration_us: u64,
-    /// Extracted image placements (base64 payloads) when `detect_media`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub media: Vec<media::MediaItem>,
-    /// Structured reading-order blocks for pages handled by the geometry
-    /// layout engine.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub blocks: Vec<layout::DocBlock>,
-}
 
 /// Probes whether raw PDF bytes contain a digital text stream without full rendering.
 pub fn is_digital_pdf_bytes(bytes: &[u8]) -> bool {
@@ -288,10 +146,10 @@ pub fn reconstruct_canvas_tables(spans: &[TextSpan]) -> Vec<CanvasTable> {
         .map(|s| s.bbox.y1)
         .fold(f64::NEG_INFINITY, f64::max);
 
-    vec![CanvasTable {
-        rows: table_rows,
-        bbox: BoundingBox::new(min_x, min_y, max_x, max_y),
-    }]
+    vec![CanvasTable::new(
+        table_rows,
+        BoundingBox::new(min_x, min_y, max_x, max_y),
+    )]
 }
 
 /// Best-effort device page box ([x0, y0, x1, y1]) from the page /MediaBox,
@@ -371,6 +229,124 @@ fn tag_running_furniture(blocks: &mut [layout::DocBlock]) {
             }
         }
     }
+}
+
+/// Formats raw URLs as markdown links [url](url) and unglues leading footnote digits (e.g. 1https:// -> 1 [https://..](..)).
+fn format_urls_and_footnotes(text: &str) -> String {
+    let mut out = String::new();
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let mut processed_line = line.to_string();
+
+        // 1. Unglue leading footnote numbers:
+        // E.g. "1https://" -> "1 https://"
+        // E.g. "4Since" -> "4 Since" (digit at start of line followed by capital letter)
+        if let Some(first_char) = processed_line.chars().next() {
+            if first_char.is_ascii_digit() {
+                let digit_end = processed_line.find(|c: char| !c.is_ascii_digit()).unwrap_or(0);
+                if digit_end > 0 && digit_end < processed_line.len() {
+                    let rem = &processed_line[digit_end..];
+                    if rem.starts_with("http://") || rem.starts_with("https://") {
+                        processed_line = format!("{} {}", &processed_line[..digit_end], rem);
+                    } else if rem.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+                        processed_line = format!("{} {}", &processed_line[..digit_end], rem);
+                    }
+                }
+            }
+        }
+
+        // 2. Detect URLs and format as markdown links: [url](url)
+        let mut result = String::new();
+        let mut cursor = 0;
+        while let Some(start_idx) = processed_line[cursor..]
+            .find("http://")
+            .or_else(|| processed_line[cursor..].find("https://"))
+        {
+            let abs_start = cursor + start_idx;
+            result.push_str(&processed_line[cursor..abs_start]);
+
+            let is_already_linked = (abs_start > 0 && processed_line.as_bytes()[abs_start - 1] == b'(')
+                || (abs_start > 0 && processed_line.as_bytes()[abs_start - 1] == b'<');
+
+            let url_sub = &processed_line[abs_start..];
+            let end_offset = url_sub
+                .find(|c: char| c.is_whitespace() || c == ')' || c == '>' || c == '\"' || c == '\'')
+                .unwrap_or(url_sub.len());
+
+            let raw_url = &url_sub[..end_offset];
+            let trimmed_len = raw_url
+                .trim_end_matches(|c: char| c == '.' || c == ',' || c == ';' || c == ':')
+                .len();
+            let trailing_punct = &raw_url[trimmed_len..];
+            let clean_url = &raw_url[..trimmed_len];
+
+            if !is_already_linked && !clean_url.is_empty() {
+                result.push_str(&format!("[{0}]({0})", clean_url));
+            } else {
+                result.push_str(clean_url);
+            }
+            result.push_str(trailing_punct);
+            cursor = abs_start + end_offset;
+        }
+        result.push_str(&processed_line[cursor..]);
+        out.push_str(&result);
+    }
+    out
+}
+
+/// Finds the start and end indices of the markdown table enclosing `pos` in `text`.
+/// If `pos` is inside or on a table row, returns `(table_start, table_end)` where
+/// `table_end` is the end index of the last row of the table.
+/// If `pos` is not in a table, returns `(pos, pos)`.
+fn find_table_boundaries(text: &str, pos: usize) -> (usize, usize) {
+    let is_table_line = |line: &str| -> bool {
+        let t = line.trim();
+        t.starts_with('|') && t.ends_with('|')
+    };
+
+    let line_start = text[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let line_end = text[pos..].find('\n').map(|p| pos + p).unwrap_or(text.len());
+    let current_line = &text[line_start..line_end];
+
+    if !is_table_line(current_line) {
+        return (pos, pos);
+    }
+
+    // Scan backwards for table start
+    let mut t_start = line_start;
+    let mut cur = line_start;
+    while cur > 0 {
+        let prev_start = text[..cur - 1].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let prev_line = &text[prev_start..cur - 1];
+        if is_table_line(prev_line) {
+            t_start = prev_start;
+            cur = prev_start;
+        } else {
+            break;
+        }
+    }
+
+    // Scan forward for table end
+    let mut t_end = line_end;
+    cur = line_end;
+    while cur < text.len() {
+        let next_start = cur + 1;
+        if next_start >= text.len() {
+            break;
+        }
+        let next_end = text[next_start..].find('\n').map(|p| next_start + p).unwrap_or(text.len());
+        let next_line = &text[next_start..next_end];
+        if is_table_line(next_line) {
+            t_end = next_end;
+            cur = next_end;
+        } else {
+            break;
+        }
+    }
+
+    (t_start, t_end)
 }
 
 /// Converts PDF byte slice to clean Markdown with 2D spatial table reconstruction.
@@ -478,6 +454,8 @@ pub fn convert_pdf_bytes_to_markdown(
                         x1: m.x0.max(m.x1),
                         y1: m.y0.max(m.y1),
                         text: format!("[{}]", m.kind.as_str()),
+                        is_bold: false,
+                        is_italic: false,
                     })
                     .collect();
                 // Highest figure first.
@@ -496,7 +474,6 @@ pub fn convert_pdf_bytes_to_markdown(
                 }
             }
         }
-        block_items.extend(page_blocks);
 
         // Words are counted from the text layer only, so corpus text-word
         // baselines are unaffected by image embedding.
@@ -516,11 +493,9 @@ pub fn convert_pdf_bytes_to_markdown(
             chunk.push_str(&format!("\n## Page {}\n\n", page_num));
         }
 
-        chunk.push_str(&text);
-        chunk.push_str("\n\n");
+        let mut processed_text = format_urls_and_footnotes(&text);
+
         if options.embed_media {
-            // Non-decorative images of this page, reading order top-to-bottom
-            // (larger device y first), as self-contained markdown images.
             let mut imgs: Vec<&media::MediaItem> = page_media
                 .iter()
                 .filter(|m| {
@@ -529,23 +504,74 @@ pub fn convert_pdf_bytes_to_markdown(
                         && (m.format == "image/jpeg" || m.format == "image/png")
                 })
                 .collect();
+            // Sort ascending by y (lowest y first) so bottom-most images are inserted first,
+            // preserving string character offsets for images higher up on the page.
             imgs.sort_by(|a, b| {
                 let ay = (a.y0 + a.y1) / 2.0;
                 let by = (b.y0 + b.y1) / 2.0;
-                by.partial_cmp(&ay).unwrap_or(std::cmp::Ordering::Equal)
+                ay.partial_cmp(&by).unwrap_or(std::cmp::Ordering::Equal)
             });
-            if !imgs.is_empty() {
-                for m in imgs {
-                    chunk.push_str(&format!(
-                        "![{}](data:{};base64,{})\n\n",
-                        m.kind.as_str(),
-                        m.format,
-                        m.data_b64
-                    ));
+
+            let mut remaining_imgs = Vec::new();
+            for m in imgs {
+                let my = (m.y0 + m.y1) / 2.0;
+                let img_md = format!(
+                    "![{}](data:{};base64,{})\n\n",
+                    m.kind.as_str(),
+                    m.format,
+                    m.data_b64
+                );
+
+                // Find the first block strictly below the image
+                let next_block = page_blocks
+                    .iter()
+                    .find(|b| b.kind != "figure" && (b.y0 + b.y1) / 2.0 <= my);
+
+                let mut inserted = false;
+                if let Some(b) = next_block {
+                    let search_key = b
+                        .text
+                        .lines()
+                        .map(|l| l.trim())
+                        .find(|l| l.len() >= 4)
+                        .unwrap_or_else(|| b.text.lines().next().unwrap_or(&b.text).trim());
+                    if !search_key.is_empty() {
+                        if let Some(mut pos) = processed_text.find(search_key) {
+                            let (t_start, t_end) = find_table_boundaries(&processed_text, pos);
+                            if t_start != t_end {
+                                pos = t_end;
+                            }
+                            let mut prefix = String::new();
+                            if !processed_text[..pos].ends_with("\n\n") {
+                                if processed_text[..pos].ends_with('\n') {
+                                    prefix.push('\n');
+                                } else {
+                                    prefix.push_str("\n\n");
+                                }
+                            }
+                            let full_img = format!("{}{}", prefix, img_md);
+                            processed_text.insert_str(pos, &full_img);
+                            inserted = true;
+                        }
+                    }
+                }
+                if !inserted {
+                    remaining_imgs.push(img_md);
                 }
             }
+
+            chunk.push_str(&processed_text);
+            chunk.push_str("\n\n");
+            remaining_imgs.reverse();
+            for img_md in remaining_imgs {
+                chunk.push_str(&img_md);
+            }
+        } else {
+            chunk.push_str(&processed_text);
+            chunk.push_str("\n\n");
         }
         page_md.push((page_num, chunk));
+        block_items.extend(page_blocks);
     }
 
     // When nothing was decoded, give an actionable reason instead of a silent
@@ -633,170 +659,65 @@ pub fn convert_pdf_bytes_to_markdown(
     })
 }
 
-// ==============================================================================
-// C ABI (FFI) — for embedding in Go (cgo), Node, and other native consumers
-// ==============================================================================
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
 
-use std::ffi::CString;
-use std::os::raw::c_char;
+    #[test]
+    fn test_billet_electronique_itinerary_table_cohesion() {
+        let pdf_path = "../../../scratch/tests/fixtures/billet_electronique.pdf";
+        if let Ok(bytes) = std::fs::read(pdf_path) {
+            let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default()).unwrap();
+            let md = &res.markdown;
+            assert!(md.contains("AF7331"), "Must extract Marseille->Paris flight");
+            assert!(md.contains("AF0258"), "Must extract Paris->SGN flight");
+            assert!(md.contains("AF0253"), "Must extract SGN->Paris flight");
+            assert!(md.contains("AF7342"), "Must extract Paris->Marseille flight");
 
-fn cstring_into_raw(s: String) -> *mut c_char {
-    match CString::new(s) {
-        Ok(c) => c.into_raw(),
-        Err(_) => CString::new("")
-            .map(|c| c.into_raw())
-            .unwrap_or(std::ptr::null_mut()),
-    }
-}
-
-/// Converts PDF bytes to Markdown and returns the result as a heap-allocated JSON
-/// C string. The caller MUST free it with `pdf2md_free_string`.
-///
-/// JSON shape:
-///   { "ok": true, "markdown": "...", "pages": N, "words": N, "tables": N,
-///     "media": [ { page, x0,y0,x1,y1, width,height, format, kind, decorative, repeat, data_b64 } ],
-///     "duration_us": N }
-///   { "ok": false, "error": "..." }
-#[no_mangle]
-pub extern "C" fn pdf2md_convert(pdf_ptr: *const u8, pdf_len: usize) -> *mut c_char {
-    pdf2md_convert_impl(pdf_ptr, pdf_len, None)
-}
-
-/// Same as `pdf2md_convert`, but with an explicit `detect_vectors` flag
-/// (0 = off, nonzero = on) so sandbox/FFI consumers can request vector figure
-/// cuts per call instead of relying on the `P2M_DETECT_VECTORS` env hatch.
-#[no_mangle]
-pub extern "C" fn pdf2md_convert_ex(
-    pdf_ptr: *const u8,
-    pdf_len: usize,
-    detect_vectors: i32,
-) -> *mut c_char {
-    pdf2md_convert_impl(pdf_ptr, pdf_len, Some(detect_vectors != 0))
-}
-
-fn pdf2md_convert_impl(
-    pdf_ptr: *const u8,
-    pdf_len: usize,
-    vectors_override: Option<bool>,
-) -> *mut c_char {
-    let json = if pdf_ptr.is_null() {
-        serde_json::json!({ "ok": false, "error": "null input pointer" })
-    } else {
-        let bytes = unsafe { std::slice::from_raw_parts(pdf_ptr, pdf_len) };
-        let mut opts = ConversionOptions::default();
-        // Optional escape hatch so sandbox/FFI consumers can request vector
-        // figure cuts without an ABI change.
-        let vectors_on = vectors_override.unwrap_or_else(|| {
-            std::env::var("P2M_DETECT_VECTORS").map_or(false, |v| v == "1" || v == "true")
-        });
-        if vectors_on {
-            opts.detect_vectors = true;
+            // Must be in a single unified table containing all 4 flights
+            let table_blocks: Vec<&str> = md
+                .split("\n\n")
+                .filter(|b| b.contains("| Date |") || (b.contains("AF7331") && b.contains('|')))
+                .collect();
+            assert_eq!(table_blocks.len(), 1, "Itinerary table must NOT be split into multiple blocks: {:?}", table_blocks);
+            let itinerary = table_blocks[0];
+            assert!(itinerary.contains("AF7331") && itinerary.contains("AF0258") && itinerary.contains("AF0253") && itinerary.contains("AF7342"),
+                "Unified itinerary table must contain all 4 flights: {}", itinerary);
         }
-        match convert_pdf_bytes_to_markdown(bytes, &opts) {
-            Ok(r) => {
-                let media_json =
-                    serde_json::to_value(&r.media).unwrap_or_else(|_| serde_json::json!([]));
-                let blocks_json =
-                    serde_json::to_value(&r.blocks).unwrap_or_else(|_| serde_json::json!([]));
-                serde_json::json!({
-                    "ok": true,
-                    "markdown": r.markdown,
-                    "pages": r.total_pages,
-                    "words": r.total_words,
-                    "tables": r.tables_detected,
-                    "media": media_json,
-                    "blocks": blocks_json,
-                    "duration_us": r.duration_us,
-                })
-            }
-            Err(e) => serde_json::json!({ "ok": false, "error": e }),
+    }
+
+    #[test]
+    fn test_edf_facture_complex_extraction() {
+        let pdf_path = "../../../scratch/samples/edf-facture-complex.pdf";
+        if let Ok(bytes) = std::fs::read(pdf_path) {
+            let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default()).unwrap();
+            assert_eq!(res.total_pages, 10, "Must have 10 pages");
+            let md = &res.markdown;
+
+            // 1. Unified address & proper French text without artificial spaces
+            assert!(md.contains("Mlle PALMA BRIGITTE"), "Must contain unified 'Mlle PALMA BRIGITTE'");
+            assert!(!md.contains("Ml l e PALMA"), "Must NOT contain letter-split 'Ml l e PALMA'");
+            assert!(!md.contains("BRI GI TTE"), "Must NOT contain letter-split 'BRI GI TTE'");
+            assert!(md.contains("LE GALOIS"), "Must contain unified 'LE GALOIS'");
+            assert!(!md.contains("LE GALOI S"), "Must NOT contain letter-split 'LE GALOI S'");
+            assert!(md.contains("13014 MARSEILLE"), "Must contain unified '13014 MARSEILLE'");
+            assert!(!md.contains("13014 MARSEI LLE"), "Must NOT contain letter-split '13014 MARSEI LLE'");
+
+            // 2. Sidebar contact preservation
+            assert!(md.contains("NOUS CONTACTER"), "Must extract 'NOUS CONTACTER' header");
+            assert!(md.contains("5 002 674 443"), "Must extract client number");
+
+            // 3. French diacritics & elision preservation
+            assert!(md.contains("d'électricité") || md.contains("d’électricité"), "Must preserve elision in 'd'électricité'");
+            assert!(md.contains("Médiateur"), "Must preserve French accent in 'Médiateur'");
+            assert!(md.contains("Détail de la facture"), "Must preserve French accent in 'Détail de la facture'");
+
+            // 4. Page 9 separated blocks
+            assert!(md.contains("MA CONSO"), "Must contain 'MA CONSO'");
+            assert!(md.contains("& MOI"), "Must contain '& MOI'");
+
+            // 5. Margin text partitioned and not interleaved into prose
+            assert!(!md.contains("Mademoiselle, 7 1 3 1 8"), "Vertical margin must not interleave into letter greeting");
         }
-    };
-    cstring_into_raw(json.to_string())
-}
-
-/// Probes whether raw PDF bytes contain a digital text layer (no full render).
-/// Returns 1 when a digital text layer is present, 0 otherwise.
-#[no_mangle]
-pub extern "C" fn pdf2md_is_digital(pdf_ptr: *const u8, pdf_len: usize) -> i32 {
-    if pdf_ptr.is_null() {
-        return 0;
     }
-    let bytes = unsafe { std::slice::from_raw_parts(pdf_ptr, pdf_len) };
-    if is_digital_pdf_bytes(bytes) {
-        1
-    } else {
-        0
-    }
-}
-
-/// Frees a heap-allocated C string returned by `pdf2md_convert` / `pdf2md_version`.
-#[no_mangle]
-pub extern "C" fn pdf2md_free_string(ptr: *mut c_char) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        drop(CString::from_raw(ptr));
-    }
-}
-
-/// Returns the engine version as a heap-allocated C string (caller frees it).
-#[no_mangle]
-pub extern "C" fn pdf2md_version() -> *mut c_char {
-    cstring_into_raw(env!("CARGO_PKG_VERSION").to_string())
-}
-
-// ==============================================================================
-// PyO3 Bindings (Active when compiled as Python wheel)
-// ==============================================================================
-
-#[cfg(feature = "python")]
-#[pyfunction]
-fn is_digital_pdf(bytes: &[u8]) -> PyResult<bool> {
-    Ok(is_digital_pdf_bytes(bytes))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction]
-fn convert_pdf_bytes(bytes: &[u8], detect_tables: Option<bool>) -> PyResult<String> {
-    let options = ConversionOptions {
-        detect_tables: detect_tables.unwrap_or(true),
-        ..Default::default()
-    };
-    match convert_pdf_bytes_to_markdown(bytes, &options) {
-        Ok(res) => Ok(res.markdown),
-        Err(e) => Err(pyo3::exceptions::PyValueError::new_err(e)),
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction]
-fn reconstruct_tables_from_json(spans_json: &str) -> PyResult<String> {
-    let spans: Vec<TextSpan> = serde_json::from_str(spans_json).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("Invalid spans JSON: {}", e))
-    })?;
-    let tables = reconstruct_canvas_tables(&spans);
-    let mut output = String::new();
-    for t in tables {
-        output.push_str(&t.to_markdown());
-        output.push_str("\n\n");
-    }
-    Ok(output)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction]
-fn version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
-}
-
-#[cfg(feature = "python")]
-#[pymodule]
-fn pdf2md_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(is_digital_pdf, m)?)?;
-    m.add_function(wrap_pyfunction!(convert_pdf_bytes, m)?)?;
-    m.add_function(wrap_pyfunction!(reconstruct_tables_from_json, m)?)?;
-    m.add_function(wrap_pyfunction!(version, m)?)?;
-    Ok(())
 }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["PDF2MD Core Team"]
 description = "High-performance native Rust core engine for sub-millisecond PDF-to-Markdown extraction and 2D spatial canvas geometry"
-license = "MIT OR Apache-2.0"
+license = "BSL-1.1"
 readme = "README.md"
 repository = "https://github.com/phamhung075/pdf2md-core"
 keywords = ["pdf", "markdown", "parser", "ocr", "table-extraction"]
@@ -12,15 +12,13 @@ categories = ["text-processing", "parser-implementations"]
 
 [lib]
 name = "pdf2md_core"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
-default = ["python"]
-python = ["dep:pyo3"]
+default = []
 wasm = []
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

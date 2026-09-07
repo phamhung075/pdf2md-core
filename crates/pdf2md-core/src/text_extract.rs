@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Dai Hung PHAM. All rights reserved.
+// SPDX-License-Identifier: BSL-1.1
+// Licensed under the Business Source License 1.1 (BSL-1.1).
+
 //! Robust multilingual (FR / VI / EN) PDF text extraction for the fast path.
 //!
 //! This module replaces `lopdf::Document::extract_text` for the digital-PDF
@@ -603,7 +607,12 @@ fn extract_page(
     let has_tj_plain = content.operations.iter().any(|op| op.operator == "Tj");
     let has_td = content.operations.iter().any(|op| op.operator == "TD");
     let has_tm = content.operations.iter().any(|op| op.operator == "Tm");
-    if has_tj && !has_tj_plain && (has_td || (detect_tables && has_tm)) {
+    let route_to_layout = if detect_tables {
+        (has_tj || has_tj_plain) && (has_td || has_tm)
+    } else {
+        has_tj && !has_tj_plain && has_td
+    };
+    if route_to_layout {
         return crate::layout::extract_page_glyphs(doc, page_id, detect_tables, detect_layout);
     }
 
