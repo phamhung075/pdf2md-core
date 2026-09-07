@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Dai Hung PHAM. All rights reserved.
+// SPDX-License-Identifier: BSL-1.1
+// Licensed under the Business Source License 1.1 (BSL-1.1).
+
 //! pdf2md CLI — High-performance native command-line PDF-to-Markdown extractor.
 //!
 //! Sub-millisecond text extraction and 2D spatial canvas table reconstruction.
@@ -16,7 +20,7 @@ use pdf2md_core::{convert_pdf_bytes_to_markdown, is_digital_pdf_bytes, Conversio
     author = "PDF2MD Core Team",
     version = env!("CARGO_PKG_VERSION"),
     about = "Sub-millisecond native PDF-to-Markdown extraction with 2D spatial table reconstruction",
-    long_about = "pdf2md is a high-speed, dual-licensed (MIT/Apache-2.0) native CLI tool for extracting clean GitHub Flavored Markdown (GFM) and tables from digital PDFs with zero cloud cost."
+    long_about = "pdf2md is a high-speed native CLI tool licensed under BSL-1.1 for extracting clean GitHub Flavored Markdown (GFM) and tables from digital PDFs with zero cloud cost."
 )]
 struct Args {
     /// Input PDF document path (use '-' to read from standard input)

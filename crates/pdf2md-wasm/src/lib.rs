@@ -1,5 +1,9 @@
 //! pdf2md-wasm — In-browser client-side WebAssembly engine for PDF-to-Markdown extraction.
 //!
+//! Copyright (c) 2026 Dai Hung PHAM. All rights reserved.
+//! SPDX-License-Identifier: BSL-1.1
+//! Licensed under the Business Source License 1.1 (BSL-1.1).
+//!
 //! Compiles to WebAssembly (wasm32-unknown-unknown) via wasm-bindgen for 100% private,
 //! $0.00 cloud-cost document conversions directly inside the user's browser.
 

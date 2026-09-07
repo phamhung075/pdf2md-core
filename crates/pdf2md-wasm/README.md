@@ -36,4 +36,4 @@ async function run() {
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0. Permissive and commercial-friendly.
+Licensed under the **[Business Source License 1.1 (BSL-1.1)](../../LICENSE)**. Free for client-side applications, web sandboxes, and Obsidian plugins; commercial SaaS hosting prohibited. Converts to Apache-2.0 / MIT on Sept 1, 2029.

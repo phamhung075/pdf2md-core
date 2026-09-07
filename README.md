@@ -1,11 +1,11 @@
 # pdf2md-core
 
 > **Sub-millisecond, native Rust PDF→Markdown engine** — digital text-layer
-> extraction with 2D spatial canvas table reconstruction. Dual-licensed MIT /
-> Apache-2.0. Zero GPL/AGPL dependencies.
+> extraction with 2D spatial canvas table reconstruction. Source-available under
+> the Business Source License 1.1 (BSL-1.1). Zero GPL/AGPL copyleft dependencies.
 
-[![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/license-BSL--1.1-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 
 `pdf2md-core` is a compiled, native engine that converts digital (text-layer)
 PDFs into clean GitHub Flavored Markdown (GFM) — including pipe tables
@@ -17,7 +17,7 @@ in-browser document processing.
 
 | Component | Description |
 | :--- | :--- |
-| [`crates/pdf2md-core`](crates/pdf2md-core) | The native Rust engine: byte-level parsing, digital-PDF triage, 2D canvas table reconstruction. Ships as a Rust library, a Python wheel (PyO3/Maturin), and a C ABI (`libpdf2md_core`) for Go/cgo and other languages. |
+| [`crates/pdf2md-core`](crates/pdf2md-core) | The native Rust engine: byte-level parsing, digital-PDF triage, 2D canvas table reconstruction, AST generation. Ships as a Rust library, static archive (`libpdf2md_core.a`), Python wheel (PyO3/Maturin), and C ABI (`pdf2md.h`). |
 | [`crates/pdf2md-cli`](crates/pdf2md-cli) | `pdf2md` — a pipe-friendly, native command-line tool built on the core. |
 | [`crates/pdf2md-wasm`](crates/pdf2md-wasm) | WebAssembly target for 100% client-side, in-browser conversion. |
 | [`server`](server) | A minimal Go dev server (`/health`, `/convert`, sandbox UI) that calls the Rust core directly via cgo. |
@@ -31,7 +31,7 @@ cargo install --path crates/pdf2md-cli
 pdf2md document.pdf -o document.md
 ```
 
-### Go mini dev server
+### Go dev server
 
 ```bash
 cd server
@@ -68,26 +68,44 @@ wasm-pack build --target web --out-dir pkg --release
 
 ```c
 char *pdf2md_convert(const uint8_t *bytes, size_t len);  /* -> JSON, free with pdf2md_free_string */
+char *pdf2md_convert_ex(const uint8_t *bytes, size_t len, int detect_vectors);
 int   pdf2md_is_digital(const uint8_t *bytes, size_t len);
 void  pdf2md_free_string(char *ptr);
 char *pdf2md_version(void);
 ```
 
-Build the shared library without Python bindings:
+Build the static and shared libraries:
 
 ```bash
 cd crates/pdf2md-core
 cargo build --release --no-default-features
-# -> target/release/libpdf2md_core.so
+# -> target/release/libpdf2md_core.a  (static archive for cgo / musl)
+# -> target/release/libpdf2md_core.so (shared object)
 ```
 
-## Scope
+## Modular Engine Architecture
+
+The core engine is structured into clean, modular submodules:
+- `layout::ast`: CommonMark/GFM semantic AST representation.
+- `layout::xy_cut`: Dynamic recursive XY-Cut++ bounding box segmentation.
+- `layout::semantic`: Statistical heading (H1–H6), list, and task classifiers.
+- `layout::glyph_stream`: CTM matrix transformation tracking, font advance width lookup.
+- `layout::reading_order`: Prose multi-column flow and structured DocBlock generation.
+- `layout::tables`: Bordered and borderless 2D spatial table reconstruction with multi-pass ruler scanning.
+- `media`: Raster XObject extraction, PNG re-encoding, and vector diagram clipping.
+
+## Scope & Tiered Architecture
 
 `pdf2md-core` handles **digital PDFs** — documents that already contain a text
-layer. Scanned / image-only documents (OCR, vision LLM rescue) and heavy ML
-layout models are intentionally out of scope here and belong to the hosted
-service tier.
+layer. Scanned / image-only documents, multi-modal Vision LLM rescue (Gemini Flash),
+deep OCR layout, and enterprise `/dev/shm` RAM isolation
+belong to the commercial hosted microservice tier (`commercial-server`).
 
-## License
+## License & Commercial Use
 
-Licensed under either of [MIT](LICENSE) or Apache License 2.0, at your option.
+Licensed under the **[Business Source License 1.1 (BSL-1.1)](LICENSE)**.
+
+- **Free for Developers & Local Use:** You are free to use, test, modify, and build local software, academic research, desktop applications, and personal knowledge management tools (such as Obsidian or Logseq plugins).
+- **Anti-Competition SaaS Restriction:** You may **NOT** use this software or any derivative works to offer a commercial hosted, managed, or cloud-based document conversion service / API that competes directly with the Licensor.
+- **Conversion to Open Source:** On **September 1, 2029**, this license automatically converts to the permissive **Apache License, Version 2.0 OR MIT License**.
+- **Commercial SaaS Licensing:** For enterprise cloud exemptions, white-label licenses, or proprietary integration, please contact the author ([@phamhung075](https://github.com/phamhung075)).
