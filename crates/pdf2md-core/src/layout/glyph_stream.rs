@@ -472,6 +472,34 @@ pub fn build_lines(spans: &[Span]) -> Vec<Vec<Span>> {
         line.sort_by(|a, b| {
             a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal)
         });
+
+        // Deduplicate overstrike / shadow spans (faux-bolding):
+        // In many PDFs (invoices, pay slips, forms), bold text is created by drawing identical
+        // glyphs twice at the same or micro-shifted coordinates (dx <= 0.75 pt or 0.2 * size).
+        let mut deduped: Vec<Span> = Vec::with_capacity(line.len());
+        for span in line.drain(..) {
+            let is_duplicate = if let Some(prev) = deduped.last_mut() {
+                if prev.text == span.text {
+                    let dx = (span.x - prev.x).abs();
+                    let dy = (span.y - prev.y).abs();
+                    let max_dx = (0.2 * span.size).max(0.75);
+                    if dx <= max_dx && dy <= 0.75 {
+                        prev.is_bold = true;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !is_duplicate {
+                deduped.push(span);
+            }
+        }
+        *line = deduped;
     }
 
     lines
@@ -661,6 +689,7 @@ pub fn extract_page_glyphs(
     let (horizontal_spans, vertical_spans): (Vec<Span>, Vec<Span>) =
         spans.into_iter().partition(|s| !s.is_vertical);
 
+
     let mut vertical_blocks: Vec<crate::layout::reading_order::DocBlock> = Vec::new();
     let mut vertical_text = String::new();
     if !vertical_spans.is_empty() {
@@ -789,4 +818,102 @@ pub fn extract_page_glyphs(
         tables: if table_rendered { hits.len() } else { 0 },
         blocks,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_faux_bold_overstrike_deduplication() {
+        let spans = vec![
+            Span {
+                text: "B".into(),
+                x: 100.0,
+                y: 200.0,
+                size: 12.0,
+                advance: 8.0,
+                is_bold: false,
+                is_italic: false,
+                is_vertical: false,
+            },
+            Span {
+                text: "B".into(),
+                x: 100.2,
+                y: 200.0,
+                size: 12.0,
+                advance: 8.0,
+                is_bold: false,
+                is_italic: false,
+                is_vertical: false,
+            },
+            Span {
+                text: "U".into(),
+                x: 108.0,
+                y: 200.0,
+                size: 12.0,
+                advance: 8.0,
+                is_bold: false,
+                is_italic: false,
+                is_vertical: false,
+            },
+            Span {
+                text: "U".into(),
+                x: 108.2,
+                y: 200.0,
+                size: 12.0,
+                advance: 8.0,
+                is_bold: false,
+                is_italic: false,
+                is_vertical: false,
+            },
+            Span {
+                text: "L".into(),
+                x: 116.0,
+                y: 200.0,
+                size: 12.0,
+                advance: 8.0,
+                is_bold: false,
+                is_italic: false,
+                is_vertical: false,
+            },
+            Span {
+                text: "L".into(),
+                x: 116.2,
+                y: 200.0,
+                size: 12.0,
+                advance: 8.0,
+                is_bold: false,
+                is_italic: false,
+                is_vertical: false,
+            },
+            // Legitimate second 'L' in BULLETIN at normal horizontal offset:
+            Span {
+                text: "L".into(),
+                x: 124.0,
+                y: 200.0,
+                size: 12.0,
+                advance: 8.0,
+                is_bold: false,
+                is_italic: false,
+                is_vertical: false,
+            },
+            Span {
+                text: "L".into(),
+                x: 124.2,
+                y: 200.0,
+                size: 12.0,
+                advance: 8.0,
+                is_bold: false,
+                is_italic: false,
+                is_vertical: false,
+            },
+        ];
+        let lines = build_lines(&spans);
+        assert_eq!(lines.len(), 1);
+        let text: String = lines[0].iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, "BULL");
+        assert!(lines[0][0].is_bold);
+        assert_eq!(lines[0].len(), 4);
+    }
 }
