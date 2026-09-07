@@ -1,118 +1,33 @@
+// Copyright (c) 2026 Dai Hung PHAM. All rights reserved.
+// SPDX-License-Identifier: BSL-1.1
+// Licensed under the Business Source License 1.1 (BSL-1.1).
+//
 // Command pdf2md-server is a minimal, high-performance HTTP wrapper around the
-// native Rust pdf2md-core engine. It exists so users can test and develop
-// against the conversion engine locally without any Python or ML dependencies.
+// native Rust pdf2md-core engine. It serves as the standalone public conversion
+// server for local tooling, dev sandboxes, and desktop integration without
+// Python or external ML dependencies.
 //
 // Endpoints:
-//   GET  /            — tiny in-browser upload sandbox
-//   GET  /health      — liveness probe
-//   POST /convert     — convert a PDF (raw body) to Markdown (JSON)
+//   GET  /health          — liveness probe ({"status": "ok", "version": "public-core"})
+//   POST /api/v1/convert  — converts digital PDF (multipart or binary) to Markdown
+//   POST /convert         — legacy alias for /api/v1/convert
+//   GET  /                — in-browser test sandbox
 package main
-
-/*
-#cgo LDFLAGS: -L${SRCDIR}/../crates/pdf2md-core/target/release -lpdf2md_core -lm -ldl
-#include <stdint.h>
-#include <stddef.h>
-#include <stdlib.h>
-
-char *pdf2md_convert(const uint8_t *data, size_t len);
-char *pdf2md_convert_ex(const uint8_t *data, size_t len, int detect_vectors);
-int   pdf2md_is_digital(const uint8_t *data, size_t len);
-void  pdf2md_free_string(char *ptr);
-char *pdf2md_version(void);
-*/
-import "C"
 
 import (
 	_ "embed"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"strings"
 	"time"
-	"unsafe"
 )
 
 const maxUploadBytes = 100 << 20 // 100 MB
-
-type mediaItem struct {
-	Page       int     `json:"page"`
-	X0         float64 `json:"x0"`
-	Y0         float64 `json:"y0"`
-	X1         float64 `json:"x1"`
-	Y1         float64 `json:"y1"`
-	Width      int     `json:"width"`
-	Height     int     `json:"height"`
-	Format     string  `json:"format"`
-	Kind       string  `json:"kind"`
-	Decorative bool    `json:"decorative"`
-	Repeat     int     `json:"repeat"`
-	DataB64    string  `json:"data_b64,omitempty"`
-}
-
-type docBlock struct {
-	Page int     `json:"page,omitempty"`
-	Kind string  `json:"kind"`
-	X0   float64 `json:"x0"`
-	Y0   float64 `json:"y0"`
-	X1   float64 `json:"x1"`
-	Y1   float64 `json:"y1"`
-	Text string  `json:"text"`
-}
-
-type convertResponse struct {
-	OK         bool        `json:"ok"`
-	Markdown   string      `json:"markdown,omitempty"`
-	Pages      int         `json:"pages"`
-	Words      int         `json:"words"`
-	Tables     int         `json:"tables"`
-	Media      []mediaItem `json:"media,omitempty"`
-	Blocks     []docBlock  `json:"blocks,omitempty"`
-	DurationUs uint64      `json:"duration_us"`
-	DurationMs int64       `json:"duration_ms,omitempty"`
-	Engine     string      `json:"engine"`
-	Version    string      `json:"version,omitempty"`
-	Error      string      `json:"error,omitempty"`
-}
-
-func engineVersion() string {
-	c := C.pdf2md_version()
-	if c == nil {
-		return "unknown"
-	}
-	defer C.pdf2md_free_string(c)
-	return C.GoString(c)
-}
-
-func convertPDF(data []byte, detectVectors bool) convertResponse {
-	start := time.Now()
-	if len(data) == 0 {
-		return convertResponse{OK: false, Engine: "pdf2md-core", Error: "empty request body"}
-	}
-
-	var ptr *C.uint8_t
-	ptr = (*C.uint8_t)(unsafe.Pointer(&data[0]))
-	var cstr *C.char
-	if detectVectors {
-		cstr = C.pdf2md_convert_ex(ptr, C.size_t(len(data)), 1)
-	} else {
-		cstr = C.pdf2md_convert(ptr, C.size_t(len(data)))
-	}
-	if cstr == nil {
-		return convertResponse{OK: false, Engine: "pdf2md-core", Error: "engine returned null"}
-	}
-	defer C.pdf2md_free_string(cstr)
-
-	var out convertResponse
-	if err := json.Unmarshal([]byte(C.GoString(cstr)), &out); err != nil {
-		return convertResponse{OK: false, Engine: "pdf2md-core", Error: "failed to parse engine output: " + err.Error()}
-	}
-	out.Engine = "pdf2md-core"
-	out.Version = engineVersion()
-	out.DurationMs = time.Since(start).Milliseconds()
-	return out
-}
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -125,33 +40,99 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSON(w, http.StatusOK, map[string]string{
 		"status":  "ok",
-		"service": "pdf2md-core",
-		"version": engineVersion(),
-		"engine":  "rust-core",
+		"version": "public-core",
 	})
+}
+
+func extractPDFBytes(r *http.Request) ([]byte, error) {
+	contentType := r.Header.Get("Content-Type")
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
+			return nil, fmt.Errorf("failed to parse multipart form: %w", err)
+		}
+		var fileHeaders []*struct {
+			Filename string
+		}
+		_ = fileHeaders
+
+		headers := r.MultipartForm.File["file"]
+		if len(headers) == 0 {
+			headers = r.MultipartForm.File["pdf"]
+		}
+		if len(headers) == 0 {
+			for _, hList := range r.MultipartForm.File {
+				if len(hList) > 0 {
+					headers = hList
+					break
+				}
+			}
+		}
+		if len(headers) == 0 {
+			return nil, errors.New("no file uploaded in multipart form (expected field 'file')")
+		}
+		file, err := headers[0].Open()
+		if err != nil {
+			return nil, fmt.Errorf("failed to open uploaded file: %w", err)
+		}
+		defer file.Close()
+		return io.ReadAll(file)
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxUploadBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read body: %w", err)
+	}
+	return body, nil
 }
 
 func handleConvert(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, convertResponse{OK: false, Engine: "pdf2md-core", Error: "method not allowed"})
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
 	}
 
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxUploadBytes))
+	pdfBytes, err := extractPDFBytes(r)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, convertResponse{OK: false, Engine: "pdf2md-core", Error: "failed to read body: " + err.Error()})
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if len(pdfBytes) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "empty PDF payload"})
+		return
+	}
+
+	// Sanity check: Ensure the PDF has a digital text layer
+	if !IsDigitalPDF(pdfBytes) {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"status": "error",
+			"error":  "Scanned or non-digital PDF detected. OCR and vision processing require the commercial engine.",
+		})
 		return
 	}
 
 	detectVectors := r.URL.Query().Get("vectors") == "1" || r.URL.Query().Get("vectors") == "true"
-	resp := convertPDF(body, detectVectors)
-	status := http.StatusOK
-	if !resp.OK {
-		status = http.StatusUnprocessableEntity
+	res, err := ConvertPDF(pdfBytes, detectVectors)
+	if err != nil {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"status": "error",
+			"error":  err.Error(),
+		})
+		return
 	}
-	writeJSON(w, status, resp)
+
+	accept := r.Header.Get("Accept")
+	format := r.URL.Query().Get("format")
+	if format == "raw" || format == "text" || format == "markdown" ||
+		strings.Contains(accept, "text/markdown") || strings.Contains(accept, "text/plain") {
+		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(res.Markdown))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, res)
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -166,11 +147,12 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 func main() {
 	port := strings.TrimSpace(os.Getenv("PORT"))
 	if port == "" {
-		port = "8989"
+		port = "8080"
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", handleHealth)
+	mux.HandleFunc("/api/v1/convert", handleConvert)
 	mux.HandleFunc("/convert", handleConvert)
 	mux.HandleFunc("/", handleIndex)
 
@@ -183,10 +165,10 @@ func main() {
 		IdleTimeout:       2 * time.Minute,
 	}
 
-	log.Printf("pdf2md-core server listening on http://0.0.0.0:%s (engine v%s)", port, engineVersion())
-	log.Printf("  sandbox: http://127.0.0.1:%s/", port)
+	log.Printf("pdf2md-core public server listening on http://0.0.0.0:%s (engine v%s)", port, EngineVersion())
 	log.Printf("  health:  http://127.0.0.1:%s/health", port)
-	log.Printf("  convert: POST http://127.0.0.1:%s/convert", port)
+	log.Printf("  convert: POST http://127.0.0.1:%s/api/v1/convert", port)
+	log.Printf("  sandbox: http://127.0.0.1:%s/", port)
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server error: %v", err)
