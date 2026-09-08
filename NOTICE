@@ -1,0 +1,41 @@
+pdf2md-core - Third-Party Attribution Notices
+=============================================
+
+This repository distributes software that incorporates or is derived from the
+following third-party projects. Full license texts are in THIRD_PARTY_LICENSES.
+
+---------------------------------------------------------------------------
+PDFium
+---------------------------------------------------------------------------
+    Copyright 2014 The PDFium Authors
+
+    PDFium source location: https://pdfium.googlesource.com/pdfium
+
+    This product includes a Rust port/derivative of PDFium's `CPDF_TextPage`
+    analytic algorithms (PDFium file `core/fpdftext/cpdf_textpage.cpp`),
+    substantially rewritten for the `pdf2md-core` engine
+    (file `crates/pdf2md-core/src/cpdf_textpage.rs`). The PDFium-derived
+    algorithmic portions are licensed under the Apache License, Version 2.0,
+    and the BSD-3-Clause notice reproduced in the source file and in
+    THIRD_PARTY_LICENSES. These portions are a modified form of the original
+    PDFium work.
+
+---------------------------------------------------------------------------
+Adobe Glyph List (AGL) / Adobe Glyph List For New Fonts (AGLFN)
+---------------------------------------------------------------------------
+    Copyright (c) 2002-2023 Adobe (https://www.adobe.com/).
+
+    Source location: https://github.com/adobe-type-tools/agl-aglfn
+
+    The encoding/glyph tables in `crates/pdf2md-core/src/glyph_data.rs`
+    incorporate character name mappings from the Adobe Glyph List, distributed
+    under the BSD-3-Clause license. See THIRD_PARTY_LICENSES.
+
+---------------------------------------------------------------------------
+Rust / Go third-party dependencies (MIT, Apache-2.0, BSD-2/3, Zlib, ISC,
+Unlicense, Unicode-3.0)
+---------------------------------------------------------------------------
+    The Rust and Go dependencies listed in THIRD_PARTY_LICENSES are used to
+    build this product. Where a dependency is statically linked into the
+    distributed binary/static/shared/WASM artifacts, their license texts are
+    reproduced in THIRD_PARTY_LICENSES as required by the respective licenses.

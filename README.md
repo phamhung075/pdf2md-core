@@ -2,7 +2,9 @@
 
 > **Sub-millisecond, native Rust PDF→Markdown engine** — digital text-layer
 > extraction with 2D spatial canvas table reconstruction. Source-available under
-> the Business Source License 1.1 (BSL-1.1). Zero GPL/AGPL copyleft dependencies.
+> the Business Source License 1.1 (BSL-1.1). Zero GPL/AGPL copyleft dependencies
+> (permissive third-party attribution is in [NOTICE](NOTICE) and
+> [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)).
 
 [![License](https://img.shields.io/badge/license-BSL--1.1-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
@@ -109,3 +111,13 @@ Licensed under the **[Business Source License 1.1 (BSL-1.1)](LICENSE)**.
 - **Anti-Competition SaaS Restriction:** You may **NOT** use this software or any derivative works to offer a commercial hosted, managed, or cloud-based document conversion service / API that competes directly with the Licensor.
 - **Conversion to Open Source:** On **September 1, 2029**, this license automatically converts to the permissive **Apache License, Version 2.0 OR MIT License**.
 - **Commercial SaaS Licensing:** For enterprise cloud exemptions, white-label licenses, or proprietary integration, please contact the author ([@phamhung075](https://github.com/phamhung075)).
+
+### Third-Party Notices
+
+`pdf2md-core` has **zero GPL/AGPL copyleft dependencies**. However, one module
+(`crates/pdf2md-core/src/cpdf_textpage.rs`) is a Rust port/derivative of
+PDFium's `CPDF_TextPage` analytic algorithms and is therefore distributed under
+the **Apache License 2.0** with the **BSD-3-Clause** copyright notice from the
+PDFium Authors. The `glyph_data.rs` tables use the Adobe Glyph List.
+All required attribution, dependency inventory, and license texts are in
+**[NOTICE](NOTICE)** and **[THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)**.

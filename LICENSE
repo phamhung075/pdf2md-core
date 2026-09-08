@@ -3,7 +3,8 @@ Business Source License 1.1
 Parameters
 
 Licensor:               Dai Hung PHAM
-Licensed Work:          pdf2md-core, pdf2md-cli, pdf2md-wasm, and associated libraries
+Licensed Work:          pdf2md-core, pdf2md-cli, pdf2md-wasm, the pdf2md-core/server
+                        Go development server, and associated libraries
                         (collectively, the "Software").
 
 Additional Use Grant:   You are granted a non-exclusive, royalty-free license to copy,
