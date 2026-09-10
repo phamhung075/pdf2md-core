@@ -209,6 +209,71 @@ mod table_detection_tests {
         rows
     }
 
+    /// A left-aligned word at `x0` (fixed start, like `row`'s words) next to
+    /// a right-aligned word whose `x0` is back-computed from `right_x1` so
+    /// its *end* (`x + advance`) lands exactly there — unlike `row`, `advance`
+    /// is a real synthetic character width so `x1` is meaningful, letting a
+    /// test line up a numeric column by its right edge instead of its start.
+    fn left_and_right_aligned_row(y: f64, left_x0: f64, left: &str, right_x1: f64, right: &str) -> Vec<Span> {
+        let size = 10.0;
+        let right_advance = right.chars().count() as f64 * size * 0.55;
+        vec![
+            Span {
+                text: left.to_string(),
+                x: left_x0,
+                y,
+                size,
+                advance: left.chars().count() as f64 * size * 0.55,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_vertical: false,
+            },
+            Span {
+                text: right.to_string(),
+                x: right_x1 - right_advance,
+                y,
+                size,
+                advance: right_advance,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_vertical: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn right_aligned_numeric_column_is_recovered_by_its_end_not_its_start() {
+        // Three amounts of different digit counts — "9,20 €", "145,50 €",
+        // "1 200,00 €" — so their x0 (word start) scatters across the page,
+        // but they all right-align to the same column edge (x1 = 250.0). A
+        // start-only ruler scan finds no common x0 here and drops the whole
+        // column; only the end-based (x1) clustering recovers it.
+        let lines = page(vec![
+            left_and_right_aligned_row(700.0, 50.0, "Frais", 250.0, "9,20 €"),
+            left_and_right_aligned_row(690.0, 50.0, "Abonnement", 250.0, "145,50 €"),
+            left_and_right_aligned_row(680.0, 50.0, "Consommation", 250.0, "1 200,00 €"),
+        ]);
+
+        // Every row's amount has a distinct x0 — the exact case a start-only
+        // scan cannot cluster.
+        let x0s: std::collections::HashSet<i64> = lines
+            .iter()
+            .map(|l| (l[1].x * 100.0).round() as i64)
+            .collect();
+        assert_eq!(x0s.len(), 3, "fixture must actually vary x0 across rows");
+
+        let hits = find_tables(&lines);
+        assert_eq!(hits.len(), 1, "right-aligned amount column must be recovered as a table");
+        let rows = &hits[0].rows;
+        assert_eq!(rows.len(), 3, "all 3 rows expected: {rows:?}");
+        assert_eq!(rows[0][0].trim(), "Frais");
+        assert_eq!(rows[0][1].trim(), "9,20 €");
+        assert_eq!(rows[1][1].trim(), "145,50 €");
+        assert_eq!(rows[2][1].trim(), "1 200,00 €");
+    }
+
     #[test]
     fn aligned_two_column_grid_is_detected() {
         let lines = page(vec![

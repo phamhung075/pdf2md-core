@@ -26,11 +26,16 @@ pub struct WordTok {
     pub x1: f64,
 }
 
-/// Word tokens + sorted start positions per visual line.
+/// Word tokens + sorted start/end positions per visual line. `ends` (word
+/// `x1`) exists alongside `starts` (word `x0`) so a column can be recognized
+/// by either its left edge (ordinary left-aligned text: descriptions, names)
+/// or its right edge (right-aligned numeric columns: quantities, unit prices,
+/// Montant HT/TVA/TTC) — see `table_rulers`'s doc comment.
 #[derive(Debug, Clone)]
 pub struct RowInfo {
     pub words: Vec<WordTok>,
     pub starts: Vec<f64>,
+    pub ends: Vec<f64>,
     pub size: f64,
 }
 
@@ -85,8 +90,54 @@ pub fn line_words(line: &[Span]) -> Vec<WordTok> {
     out
 }
 
-/// Table column rulers in rows lo..=hi (inclusive): word-start x positions
-/// that appear in at least 2 rows within tolerance, spaced by at least min_gutter.
+/// Sequentially clusters sorted `(x, row)` pairs within `tol` of the running
+/// cluster mean, keeping only clusters that span at least 2 distinct rows.
+/// Shared by `table_rulers`'s two clustering passes (word starts, word ends)
+/// so both use exactly the same tolerance/majority logic.
+fn cluster_positions(mut points: Vec<(f64, usize)>, tol: f64) -> Vec<f64> {
+    points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    struct Clust {
+        sum_x: f64,
+        count: usize,
+        rows: std::collections::HashSet<usize>,
+    }
+    let mut clusters: Vec<Clust> = Vec::new();
+    for (x, ri) in points {
+        let mut matched = false;
+        if let Some(last) = clusters.last_mut() {
+            let mean = last.sum_x / last.count as f64;
+            if (x - mean).abs() <= tol {
+                last.sum_x += x;
+                last.count += 1;
+                last.rows.insert(ri);
+                matched = true;
+            }
+        }
+        if !matched {
+            let mut rows = std::collections::HashSet::new();
+            rows.insert(ri);
+            clusters.push(Clust { sum_x: x, count: 1, rows });
+        }
+    }
+
+    clusters
+        .into_iter()
+        .filter(|c| c.rows.len() >= 2)
+        .map(|c| c.sum_x / c.count as f64)
+        .collect()
+}
+
+/// Table column rulers in rows lo..=hi (inclusive): x positions that appear
+/// in at least 2 rows within tolerance, spaced by at least min_gutter.
+///
+/// Two independent clustering passes feed the candidate list: word *starts*
+/// (left-aligned columns — descriptions, names, dates) and word *ends*
+/// (right-aligned columns — quantities, unit prices, Montant HT/TVA/TTC).
+/// A purely start-based scan misses financial tables entirely: "145,50 €",
+/// "9,20 €", and "1 200,00 €" have wildly different `x0` (their digit counts
+/// differ) but a common `x1` (they're right-aligned to the column edge), so
+/// only the end-based pass produces a ruler for that column at all.
 ///
 /// A candidate ruler is dropped if any word in the window *straddles* it
 /// (starts strictly to its left and ends strictly to its right). Such an x is
@@ -104,50 +155,27 @@ pub fn table_rulers(info: &[RowInfo], tol: f64, lo: usize, hi: usize, min_gutter
         return Vec::new();
     }
     let mut starts_with_row: Vec<(f64, usize)> = Vec::new();
+    let mut ends_with_row: Vec<(f64, usize)> = Vec::new();
     for ri in lo..=hi {
         for &s in &info[ri].starts {
             starts_with_row.push((s, ri));
         }
+        for &e in &info[ri].ends {
+            ends_with_row.push((e, ri));
+        }
     }
-    starts_with_row.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    if starts_with_row.is_empty() {
+    if starts_with_row.is_empty() && ends_with_row.is_empty() {
         return Vec::new();
     }
 
-    struct Clust {
-        sum_x: f64,
-        count: usize,
-        rows: std::collections::HashSet<usize>,
-    }
-    let mut clusters: Vec<Clust> = Vec::new();
-    for (x, ri) in starts_with_row {
-        let mut matched = false;
-        if let Some(last) = clusters.last_mut() {
-            let mean = last.sum_x / last.count as f64;
-            if (x - mean).abs() <= tol {
-                last.sum_x += x;
-                last.count += 1;
-                last.rows.insert(ri);
-                matched = true;
-            }
-        }
-        if !matched {
-            let mut rows = std::collections::HashSet::new();
-            rows.insert(ri);
-            clusters.push(Clust {
-                sum_x: x,
-                count: 1,
-                rows,
-            });
-        }
-    }
+    let mut candidates = cluster_positions(starts_with_row, tol);
+    candidates.extend(cluster_positions(ends_with_row, tol));
+    candidates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    let rulers: Vec<f64> = clusters
+    let rulers: Vec<f64> = candidates
         .into_iter()
-        .filter(|c| c.rows.len() >= 2)
-        .map(|c| c.sum_x / c.count as f64)
-        // Drop "rulers" that are actually interior word-starts of one cell:
-        // a column boundary is never straddled by text in any row.
+        // Drop "rulers" that are actually interior word-starts/ends of one
+        // cell: a column boundary is never straddled by text in any row.
         .filter(|&x| {
             (lo..=hi).all(|ri| {
                 !info[ri]
@@ -166,6 +194,17 @@ pub fn table_rulers(info: &[RowInfo], tol: f64, lo: usize, hi: usize, min_gutter
         }
     }
     merged
+}
+
+/// Whether row `row` has a word aligned to ruler `r` — by its start (an
+/// ordinary left-aligned column) or its end (a right-aligned numeric
+/// column). Used wherever a row is checked for "does it actually populate
+/// this column", so seed/continuation validation accepts a right-aligned
+/// ruler on the same footing as a left-aligned one — checking only `starts`
+/// would reject every row of a financial table whose only reliable column
+/// signal is its aligned right edge.
+fn row_matches_ruler(row: &RowInfo, r: f64, tol: f64) -> bool {
+    row.starts.iter().any(|&s| (r - s).abs() <= tol) || row.ends.iter().any(|&e| (r - e).abs() <= tol)
 }
 
 /// Diagnostic tracer: prints when TABLE_TRACE env is set.
@@ -194,9 +233,12 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
             let words = line_words(l);
             let mut starts: Vec<f64> = words.iter().map(|w| w.x0).collect();
             starts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mut ends: Vec<f64> = words.iter().map(|w| w.x1).collect();
+            ends.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             RowInfo {
                 words,
                 starts,
+                ends,
                 size: l[0].size.max(0.1),
             }
         })
@@ -262,8 +304,8 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
             let mut hi = lo + 1;
             let mut rulers = table_rulers(&info, tol, band[lo], band[hi], min_gutter);
             // Verify that the seed rows (lo and hi) both match at least 2 column rulers
-            let match_lo = rulers.iter().filter(|&&r| info[band[lo]].starts.iter().any(|&s| (r - s).abs() <= tol * 1.5)).count();
-            let match_hi = rulers.iter().filter(|&&r| info[band[hi]].starts.iter().any(|&s| (r - s).abs() <= tol * 1.5)).count();
+            let match_lo = rulers.iter().filter(|&&r| row_matches_ruler(&info[band[lo]], r, tol * 1.5)).count();
+            let match_hi = rulers.iter().filter(|&&r| row_matches_ruler(&info[band[hi]], r, tol * 1.5)).count();
             if rulers.len() < 2 || match_lo < 2 || match_hi < 2 {
                 t(&format!(
                     "  REJECT at lo={} (line {} '{}') seed hi={} (line {} '{}'): rulers={:?} match_lo={} match_hi={} [seed check]",
@@ -277,7 +319,7 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
             while hi + 1 < band.len() && rulers.len() >= 2 {
                 let next_ri = band[hi + 1];
                 let next_r = table_rulers(&info, tol, band[lo], next_ri, min_gutter);
-                let next_match = next_r.iter().filter(|&&r| info[next_ri].starts.iter().any(|&s| (r - s).abs() <= tol * 1.5)).count();
+                let next_match = next_r.iter().filter(|&&r| row_matches_ruler(&info[next_ri], r, tol * 1.5)).count();
                 if next_r.len() >= 2 && next_match >= 2 {
                     hi += 1;
                     rulers = next_r;
@@ -291,7 +333,7 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
                     if !straddles {
                         let has_future_match = (hi + 2..band.len().min(hi + 4)).any(|fut_idx| {
                             let fut_ri = band[fut_idx];
-                            rulers.iter().filter(|&&r| info[fut_ri].starts.iter().any(|&s| (r - s).abs() <= tol * 1.5)).count() >= 2
+                            rulers.iter().filter(|&&r| row_matches_ruler(&info[fut_ri], r, tol * 1.5)).count() >= 2
                         });
                         if has_future_match {
                             hi += 1;
