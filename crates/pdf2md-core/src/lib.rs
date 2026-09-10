@@ -416,6 +416,16 @@ pub fn convert_pdf_bytes_to_markdown(
     let mut full_markdown = String::new();
     let total_pages = doc.get_pages().len();
     let mut total_words = 0;
+    // Pages whose own word count falls below `options.min_words_per_page`.
+    // Unlike `total_words == 0` (checked once, document-wide, below), this
+    // catches the case a whole-document zero-check misses entirely: a
+    // mostly-scanned document where a handful of pages carry real text (a
+    // cover sheet, a signed last page) so the document-level total is well
+    // above zero, but most individual pages are near-empty. Callers (the
+    // gateway's escalation decision) compare this against `total_pages` as a
+    // ratio — a document-wide count alone can't distinguish "a few blank
+    // pages in an otherwise fine document" from "mostly blank".
+    let mut pages_below_word_floor = 0usize;
     let mut any_text_ops = false;
     let mut any_fonts = false;
     let mut tables_detected = 0usize;
@@ -581,6 +591,9 @@ pub fn convert_pdf_bytes_to_markdown(
         // baselines are unaffected by image embedding.
         let words: Vec<&str> = text.split_whitespace().collect();
         total_words += words.len();
+        if words.len() < options.min_words_per_page {
+            pages_below_word_floor += 1;
+        }
         for m in &page_media {
             media_items.push(m.clone());
         }
@@ -791,6 +804,7 @@ pub fn convert_pdf_bytes_to_markdown(
         markdown: full_markdown,
         total_pages,
         total_words,
+        pages_below_word_floor,
         tables_detected,
         duration_us,
         media: media_items,
@@ -1053,6 +1067,45 @@ mod regression_tests {
             assert!(
                 res.markdown.contains("data:image/"),
                 "a small fixture image must not trip the default 512KB budget"
+            );
+        }
+    }
+
+    #[test]
+    fn pages_below_word_floor_is_low_for_a_text_rich_document() {
+        let pdf_path = "../../../scratch/samples/edf-facture-complex.pdf";
+        if let Ok(bytes) = std::fs::read(pdf_path) {
+            let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default()).unwrap();
+            // A real 10-page invoice legitimately has a couple of sparse pages
+            // (a mostly-blank separator, a footer-only page) below the 5-word
+            // floor without the document being "mostly scanned" — the gateway's
+            // escalation decision cares about the *ratio* (well under its ~30%
+            // threshold here), not a strict zero.
+            assert!(
+                res.pages_below_word_floor <= 2,
+                "expected at most 2 of 10 pages below the word floor, got {} (failures would indicate the \
+                 per-page counter is over-firing, not that the document changed)",
+                res.pages_below_word_floor
+            );
+        }
+    }
+
+    #[test]
+    fn pages_below_word_floor_counts_pages_under_a_custom_threshold() {
+        // This fixture's single page carries exactly 5 words of real text next
+        // to an embedded logo image — below the default floor (5) it passes,
+        // but a caller asking for a stricter per-page floor must see it counted.
+        let pdf_path = "../../../scratch/tests/fixtures/synth_logo_image.pdf";
+        if let Ok(bytes) = std::fs::read(pdf_path) {
+            let opts = ConversionOptions {
+                min_words_per_page: 10,
+                ..Default::default()
+            };
+            let res = convert_pdf_bytes_to_markdown(&bytes, &opts).unwrap();
+            assert_eq!(res.total_pages, 1);
+            assert_eq!(
+                res.pages_below_word_floor, 1,
+                "the single page must be counted below a raised 10-word floor"
             );
         }
     }

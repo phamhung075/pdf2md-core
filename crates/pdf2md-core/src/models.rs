@@ -219,6 +219,12 @@ pub struct ConversionResult {
     pub markdown: String,
     pub total_pages: usize,
     pub total_words: usize,
+    /// Count of pages whose own word count is below
+    /// `ConversionOptions::min_words_per_page`. A document-wide `total_words`
+    /// total can be nonzero while most individual pages are still near-empty
+    /// (a few real pages carrying an otherwise-scanned document); callers use
+    /// this vs. `total_pages` as a ratio to catch that case.
+    pub pages_below_word_floor: usize,
     pub tables_detected: usize,
     pub duration_us: u64,
     /// Extracted image placements (base64 payloads) when `detect_media`.

@@ -22,7 +22,8 @@ pub(crate) fn cstring_into_raw(s: String) -> *mut c_char {
 /// C string. The caller MUST free it with `pdf2md_free_string`.
 ///
 /// JSON shape:
-///   { "ok": true, "markdown": "...", "pages": N, "words": N, "tables": N,
+///   { "ok": true, "markdown": "...", "pages": N, "words": N,
+///     "pages_below_word_floor": N, "tables": N,
 ///     "media": [ { page, x0,y0,x1,y1, width,height, format, kind, decorative, repeat, data_b64 } ],
 ///     "duration_us": N }
 ///   { "ok": false, "error": "..." }
@@ -95,6 +96,7 @@ fn pdf2md_convert_impl(
                     "markdown": r.markdown,
                     "pages": r.total_pages,
                     "words": r.total_words,
+                    "pages_below_word_floor": r.pages_below_word_floor,
                     "tables": r.tables_detected,
                     "media": media_json,
                     "blocks": blocks_json,
