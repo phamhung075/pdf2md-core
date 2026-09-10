@@ -976,7 +976,127 @@ pub fn build_doc_blocks(lines: &[Vec<Span>], page_height: f64) -> Vec<DocBlock> 
             }
         }
     }
-    blocks
+    merge_paragraph_lines(blocks)
+}
+
+/// Merges consecutive "body" blocks that read as one continuous paragraph
+/// into a single block, instead of leaving one block per *visual line*
+/// (typically 4-7 words). Two problems this fixes directly: RAG chunkers
+/// consuming the `blocks` JSON see whole paragraphs instead of shattered
+/// single lines, and CheckColumnInterleaving (which needs >= 10 real prose
+/// blocks on a page before its column-alternation check even engages) was
+/// starved of blocks to reason about.
+///
+/// Two adjacent "body" lines merge only when ALL of:
+///   - kind boundary: both are "body" — a heading/list/table-zone/figure/
+///     caption/header/footer never merges with anything, in either direction
+///     (enforced simply by requiring `kind == "body"` on both sides: a
+///     non-body line always closes out whatever paragraph came before it).
+///   - line pitch: the vertical gap between them is normal single-spaced
+///     leading, not a paragraph break — capped at 1.8x the line's own font
+///     size (`y1 - y0`).
+///   - left-edge alignment: within ~3pt of the paragraph's established body
+///     indent — except the *first* merge into a paragraph, which is exempt so
+///     a first-line indent doesn't wrongly split a paragraph from its own
+///     second line; the second line then sets the body indent every further
+///     line in that paragraph must match.
+///
+/// De-hyphenation: when the earlier line's text ends in a hyphen preceded by
+/// a letter (a line-wrap break, not a bullet/dash/range), the hyphen is
+/// dropped and the next line's text is joined directly with no space;
+/// otherwise a single space joins them.
+fn merge_paragraph_lines(blocks: Vec<DocBlock>) -> Vec<DocBlock> {
+    const LEFT_EDGE_TOL: f64 = 3.0;
+    const MAX_PITCH_RATIO: f64 = 1.8;
+
+    /// A paragraph being accumulated: `block` grows in place (text joined,
+    /// bbox unioned) as more lines merge into it.
+    struct Para {
+        block: DocBlock,
+        line_count: usize,
+        body_x0: f64,
+        last_y0: f64,
+        last_size: f64,
+    }
+
+    let mut out: Vec<DocBlock> = Vec::with_capacity(blocks.len());
+    let mut cur: Option<Para> = None;
+
+    for b in blocks {
+        if b.kind != "body" {
+            if let Some(p) = cur.take() {
+                out.push(p.block);
+            }
+            out.push(b);
+            continue;
+        }
+
+        if let Some(p) = &mut cur {
+            let gap = p.last_y0 - b.y1;
+            let pitch_ok = gap >= 0.0 && gap <= MAX_PITCH_RATIO * p.last_size;
+            // The paragraph's first merge (bringing in its 2nd line) is
+            // exempt from the left-edge check — the first line may carry a
+            // first-line indent that legitimately differs from the body's
+            // real left edge, which the 2nd line then establishes for every
+            // merge after this one (see the `line_count == 1` branch below).
+            let edge_ok = p.line_count == 1 || (b.x0 - p.body_x0).abs() <= LEFT_EDGE_TOL;
+            if pitch_ok && edge_ok {
+                join_paragraph_text(&mut p.block.text, &b.text);
+                p.block.x0 = p.block.x0.min(b.x0);
+                p.block.y0 = p.block.y0.min(b.y0);
+                p.block.x1 = p.block.x1.max(b.x1);
+                p.block.y1 = p.block.y1.max(b.y1);
+                p.block.is_bold |= b.is_bold;
+                p.block.is_italic |= b.is_italic;
+                p.block.is_underline |= b.is_underline;
+                if p.line_count == 1 {
+                    // The paragraph's first line may carry a first-line
+                    // indent; its *second* line establishes the real body
+                    // left edge every subsequent line must match.
+                    p.body_x0 = b.x0;
+                }
+                p.line_count += 1;
+                p.last_y0 = b.y0;
+                p.last_size = (b.y1 - b.y0).max(1.0);
+                continue;
+            }
+            out.push(cur.take().unwrap().block);
+        }
+
+        cur = Some(Para {
+            block: b.clone(),
+            line_count: 1,
+            body_x0: b.x0,
+            last_y0: b.y0,
+            last_size: (b.y1 - b.y0).max(1.0),
+        });
+    }
+    if let Some(p) = cur.take() {
+        out.push(p.block);
+    }
+    out
+}
+
+/// Joins `next` onto `text` as a paragraph continuation: de-hyphenates a
+/// genuine line-wrap break (a hyphen preceded by a letter, e.g. "infor-" +
+/// "mation" -> "information"), otherwise joins with a plain space.
+fn join_paragraph_text(text: &mut String, next: &str) {
+    let trimmed_len = text.trim_end().len();
+    let is_hyphenated_break = trimmed_len > 0
+        && text.as_bytes()[..trimmed_len].last() == Some(&b'-')
+        && text[..trimmed_len - 1]
+            .chars()
+            .last()
+            .map_or(false, |c| c.is_alphabetic());
+
+    text.truncate(trimmed_len);
+    if is_hyphenated_break {
+        text.pop(); // drop the trailing '-'
+        text.push_str(next.trim_start());
+    } else {
+        text.push(' ');
+        text.push_str(next);
+    }
 }
 
 #[cfg(test)]
@@ -1360,5 +1480,180 @@ mod structural_tests {
             !md.contains("**Document Title**"),
             "heading text must not be redundantly bold-wrapped, got:\n{md}"
         );
+    }
+}
+
+#[cfg(test)]
+mod paragraph_merge_tests {
+    use super::*;
+
+    // Font size 10, single-spaced leading (~12pt pitch): y1-y0 = 10.0 so the
+    // block's own "font size" for pitch math is 10.0.
+    fn body_block(x0: f64, y0: f64, text: &str) -> DocBlock {
+        DocBlock {
+            page: 0,
+            kind: "body".to_string(),
+            x0,
+            y0,
+            x1: x0 + text.len() as f64 * 5.0,
+            y1: y0 + 10.0,
+            text: text.to_string(),
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+        }
+    }
+
+    fn kind_block(kind: &str, x0: f64, y0: f64, text: &str) -> DocBlock {
+        let mut b = body_block(x0, y0, text);
+        b.kind = kind.to_string();
+        b
+    }
+
+    #[test]
+    fn two_aligned_normally_spaced_lines_merge_into_one_paragraph() {
+        // Line 2's baseline is 12pt below line 1's (typical 1.2x leading for
+        // a 10pt font) — gap = prev.y0(700) - b.y1(698) = 2, well within the
+        // 1.8*10=18 pitch cap.
+        let blocks = vec![
+            body_block(100.0, 700.0, "First line of the paragraph"),
+            body_block(100.0, 688.0, "second line continues it"),
+        ];
+        let merged = merge_paragraph_lines(blocks);
+        assert_eq!(merged.len(), 1, "two aligned, normally-spaced lines must merge");
+        assert_eq!(merged[0].text, "First line of the paragraph second line continues it");
+    }
+
+    #[test]
+    fn three_line_paragraph_merges_fully() {
+        let blocks = vec![
+            body_block(100.0, 700.0, "Line one"),
+            body_block(100.0, 688.0, "line two"),
+            body_block(100.0, 676.0, "line three"),
+        ];
+        let merged = merge_paragraph_lines(blocks);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "Line one line two line three");
+        // Bounding box must union across all 3 merged lines.
+        assert_eq!(merged[0].y1, 710.0, "y1 from the topmost line");
+        assert_eq!(merged[0].y0, 676.0, "y0 from the bottommost line");
+    }
+
+    #[test]
+    fn heading_between_two_body_lines_prevents_merge_across_it() {
+        let blocks = vec![
+            body_block(100.0, 700.0, "Paragraph before the heading"),
+            kind_block("heading", 100.0, 688.0, "A Heading"),
+            body_block(100.0, 676.0, "Paragraph after the heading"),
+        ];
+        let merged = merge_paragraph_lines(blocks);
+        assert_eq!(merged.len(), 3, "a heading must never merge, and must not bridge two body blocks");
+        assert_eq!(merged[0].kind, "body");
+        assert_eq!(merged[1].kind, "heading");
+        assert_eq!(merged[2].kind, "body");
+    }
+
+    #[test]
+    fn list_item_never_merges_with_surrounding_body_text() {
+        let blocks = vec![
+            body_block(100.0, 700.0, "Some intro text"),
+            kind_block("list", 100.0, 688.0, "A list item"),
+            body_block(100.0, 676.0, "Trailing text"),
+        ];
+        let merged = merge_paragraph_lines(blocks);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[1].kind, "list");
+        assert_eq!(merged[1].text, "A list item");
+    }
+
+    #[test]
+    fn a_wide_vertical_gap_is_a_paragraph_break_not_a_merge() {
+        // Gap = prev.y0(700) - b.y1(b.y0+10). For a break we need
+        // gap > 1.8*10=18, so put the next line's y0 well below that.
+        let blocks = vec![
+            body_block(100.0, 700.0, "End of one paragraph."),
+            body_block(100.0, 660.0, "Start of an unrelated paragraph."),
+        ];
+        let merged = merge_paragraph_lines(blocks);
+        assert_eq!(merged.len(), 2, "a large vertical gap must read as a paragraph break");
+    }
+
+    #[test]
+    fn misaligned_left_edges_do_not_merge() {
+        // Line 2 establishes body_x0=100; line 3 is indented far enough right
+        // (a new nested/quoted block, not a paragraph continuation) to miss
+        // the ~3pt tolerance.
+        let blocks = vec![
+            body_block(100.0, 700.0, "Paragraph line one"),
+            body_block(100.0, 688.0, "paragraph line two"),
+            body_block(140.0, 676.0, "a differently indented block"),
+        ];
+        let merged = merge_paragraph_lines(blocks);
+        assert_eq!(merged.len(), 2, "a line whose left edge doesn't match the body indent must not merge");
+        assert_eq!(merged[0].text, "Paragraph line one paragraph line two");
+    }
+
+    #[test]
+    fn first_line_indent_is_exempt_from_left_edge_check() {
+        // Line 1 (the paragraph's first line) is indented +15pt from line 2 —
+        // a classic first-line indent — and must not block the merge; line 2
+        // then sets the real body_x0 that line 3 is checked against.
+        let blocks = vec![
+            body_block(115.0, 700.0, "Indented first line of paragraph"),
+            body_block(100.0, 688.0, "flush second line"),
+            body_block(100.0, 676.0, "flush third line"),
+        ];
+        let merged = merge_paragraph_lines(blocks);
+        assert_eq!(merged.len(), 1, "a first-line indent must not prevent merging with the rest of the paragraph");
+        assert_eq!(
+            merged[0].text,
+            "Indented first line of paragraph flush second line flush third line"
+        );
+    }
+
+    #[test]
+    fn table_zone_and_figure_never_merge_with_body_text() {
+        for kind in ["table", "figure", "caption", "header", "footer", "title"] {
+            let blocks = vec![
+                body_block(100.0, 700.0, "Text before"),
+                kind_block(kind, 100.0, 688.0, "Zone content"),
+                body_block(100.0, 676.0, "Text after"),
+            ];
+            let merged = merge_paragraph_lines(blocks);
+            assert_eq!(merged.len(), 3, "kind {kind:?} must never merge with body text");
+        }
+    }
+
+    // -- join_paragraph_text / de-hyphenation -----------------------------
+
+    #[test]
+    fn hyphenated_line_wrap_joins_without_space_or_hyphen() {
+        let mut text = "This is infor-".to_string();
+        join_paragraph_text(&mut text, "mation you need.");
+        assert_eq!(text, "This is information you need.");
+    }
+
+    #[test]
+    fn trailing_dash_preceded_by_space_is_not_treated_as_hyphenation() {
+        // A dash used as punctuation (range, aside) — the character right
+        // before it is a space, not a letter — must join with a space and
+        // keep the dash.
+        let mut text = "A notable fact -".to_string();
+        join_paragraph_text(&mut text, "worth remembering.");
+        assert_eq!(text, "A notable fact - worth remembering.");
+    }
+
+    #[test]
+    fn ordinary_lines_join_with_a_single_space() {
+        let mut text = "First part".to_string();
+        join_paragraph_text(&mut text, "second part.");
+        assert_eq!(text, "First part second part.");
+    }
+
+    #[test]
+    fn trailing_whitespace_before_hyphen_is_ignored() {
+        let mut text = "infor-  ".to_string(); // trailing spaces after the hyphen
+        join_paragraph_text(&mut text, "mation");
+        assert_eq!(text, "information");
     }
 }
