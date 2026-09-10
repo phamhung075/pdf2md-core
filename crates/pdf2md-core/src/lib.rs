@@ -420,6 +420,14 @@ pub fn convert_pdf_bytes_to_markdown(
     let mut any_fonts = false;
     let mut tables_detected = 0usize;
     let mut media_items: Vec<media::MediaItem> = Vec::new();
+    // Running total of base64 bytes inlined into the markdown as `data:`
+    // URIs so far, across every page. Once `options.max_media_bytes_per_doc`
+    // is reached, further images are replaced with a text placeholder
+    // instead of another data URI (see the `embed_media` loop below) — this
+    // is what actually bounds the emitted markdown size for scan-heavy
+    // documents; the per-image downscale in `media::extract_page_media`
+    // only shrinks the common case.
+    let mut media_budget_used: usize = 0;
     let mut block_items: Vec<layout::DocBlock> = Vec::new();
     // Per-page markdown chunks (page number, content) so running headers and
     // footers can be suppressed after the doc-level furniture pass.
@@ -489,7 +497,13 @@ pub fn convert_pdf_bytes_to_markdown(
 
         let page_media: Vec<media::MediaItem> = if options.detect_media {
             let page_bbox = page_media_box(&doc, page_id);
-            let mut m = media::extract_page_media(&doc, page_id, page_num as usize, page_bbox);
+            let mut m = media::extract_page_media(
+                &doc,
+                page_id,
+                page_num as usize,
+                page_bbox,
+                options.max_image_dimension,
+            );
             if options.detect_vectors {
                 m.extend(media::extract_page_vector_figures(
                     &doc,
@@ -607,22 +621,44 @@ pub fn convert_pdf_bytes_to_markdown(
             let mut remaining_imgs = Vec::new();
             for m in imgs {
                 let my = (m.y0 + m.y1) / 2.0;
-                let img_md = match embed_width_frac(m, page_bbox) {
-                    Some(frac) => format!(
-                        "<img alt=\"{}\" src=\"data:{};base64,{}\" width=\"{}\" />\n\n",
+                let b64_len = m.data_b64.len();
+                let img_md = if media_budget_used.saturating_add(b64_len)
+                    > options.max_media_bytes_per_doc
+                {
+                    // Over the per-document embed budget: keep the figure's
+                    // reading-order position (so surrounding text still makes
+                    // sense) but drop the payload instead of inlining another
+                    // multi-hundred-KB data URI. `media_items`/`media` (the
+                    // JSON side-channel) still carries the full image for
+                    // callers that want it.
+                    format!(
+                        "*[{} omitted: {}x{} {}, {} KB — over the {} KB per-document image budget]*\n\n",
                         m.kind.as_str(),
+                        m.width,
+                        m.height,
                         m.format,
-                        m.data_b64,
-                        // Emit as a percent of the reader's content width, which
-                        // matches the fraction of the page the image occupied.
-                        format!("{}%", (frac * 100.0).round() as u32),
-                    ),
-                    None => format!(
-                        "![{}](data:{};base64,{})\n\n",
-                        m.kind.as_str(),
-                        m.format,
-                        m.data_b64
-                    ),
+                        b64_len / 1024,
+                        options.max_media_bytes_per_doc / 1024,
+                    )
+                } else {
+                    media_budget_used += b64_len;
+                    match embed_width_frac(m, page_bbox) {
+                        Some(frac) => format!(
+                            "<img alt=\"{}\" src=\"data:{};base64,{}\" width=\"{}\" />\n\n",
+                            m.kind.as_str(),
+                            m.format,
+                            m.data_b64,
+                            // Emit as a percent of the reader's content width, which
+                            // matches the fraction of the page the image occupied.
+                            format!("{}%", (frac * 100.0).round() as u32),
+                        ),
+                        None => format!(
+                            "![{}](data:{};base64,{})\n\n",
+                            m.kind.as_str(),
+                            m.format,
+                            m.data_b64
+                        ),
+                    }
                 };
 
                 // Find the first block strictly below the image
@@ -976,6 +1012,47 @@ mod regression_tests {
             assert!(
                 md.contains("width=") && md.contains("%\""),
                 "embedded image must carry a percent width attribute"
+            );
+        }
+    }
+
+    #[test]
+    fn media_budget_replaces_data_uri_with_placeholder_once_exhausted() {
+        let pdf_path = "../../../scratch/tests/fixtures/synth_logo_image.pdf";
+        if let Ok(bytes) = std::fs::read(pdf_path) {
+            let opts = ConversionOptions {
+                max_media_bytes_per_doc: 1, // any real image blows this instantly
+                ..Default::default()
+            };
+            let res = convert_pdf_bytes_to_markdown(&bytes, &opts).unwrap();
+            let md = &res.markdown;
+
+            assert!(
+                !md.contains("data:image/"),
+                "over-budget image must not be inlined as a data URI, got: {md}"
+            );
+            assert!(
+                md.contains("omitted") && md.contains("per-document image budget"),
+                "over-budget image must leave a placeholder, got: {md}"
+            );
+            // The JSON media side-channel is a separate opt-in payload and must
+            // still carry the full image — only the inline markdown embed is
+            // budget-capped.
+            assert!(
+                res.media.iter().any(|m| !m.data_b64.is_empty()),
+                "media list must still report the full image out-of-band"
+            );
+        }
+    }
+
+    #[test]
+    fn media_budget_default_still_embeds_a_normal_sized_image() {
+        let pdf_path = "../../../scratch/tests/fixtures/synth_logo_image.pdf";
+        if let Ok(bytes) = std::fs::read(pdf_path) {
+            let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default()).unwrap();
+            assert!(
+                res.markdown.contains("data:image/"),
+                "a small fixture image must not trip the default 512KB budget"
             );
         }
     }

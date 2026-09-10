@@ -73,11 +73,16 @@ pub(crate) struct Placement {
 }
 
 /// Extract every image placement on one page.
+///
+/// `max_image_dimension` caps the pixel width/height a raw/PNG-reconstructed
+/// raster is downscaled to before base64 encoding (see
+/// `ConversionOptions::max_image_dimension`); pass `u32::MAX` to disable.
 pub fn extract_page_media(
     doc: &Document,
     page_id: ObjectId,
     page_num: usize,
     page_bbox: Option<(f64, f64, f64, f64)>,
+    max_image_dimension: u32,
 ) -> Vec<MediaItem> {
     let Some(xobjects) = page_xobjects(doc, page_id) else {
         return Vec::new();
@@ -167,7 +172,7 @@ pub fn extract_page_media(
         Id(ObjectId),
         Name(Vec<u8>),
     }
-    let mut cache: HashMap<Key, Option<Vec<u8>>> = HashMap::new();
+    let mut cache: HashMap<Key, Option<(Vec<u8>, u32, u32)>> = HashMap::new();
     for want in wants {
         let key = want
             .p
@@ -177,7 +182,7 @@ pub fn extract_page_media(
         let bytes = match cache.get(&key) {
             Some(d) => d.clone(),
             None => {
-                let d = decode_xobject_bytes(doc, &want.p.obj);
+                let d = decode_xobject_bytes(doc, &want.p.obj, max_image_dimension);
                 cache.insert(key, d.clone());
                 d
             }
@@ -189,15 +194,20 @@ pub fn extract_page_media(
             continue;
         }
         match bytes {
-            Some(data) => {
+            Some((data, enc_w, enc_h)) => {
                 out.push(MediaItem {
                     page: page_num,
                     x0: want.p.x0,
                     y0: want.p.y0,
                     x1: want.p.x1,
                     y1: want.p.y1,
-                    width: want.w,
-                    height: want.h,
+                    // Report the actually-encoded pixel dimensions (post
+                    // downscale for raw rasters; unchanged for JPEG
+                    // passthrough) rather than the pre-decode probe, so
+                    // callers never see a `width`/`height` that disagrees
+                    // with the bytes they got.
+                    width: enc_w,
+                    height: enc_h,
                     format: want.fmt.clone(),
                     kind,
                     decorative: false,
@@ -369,8 +379,63 @@ pub fn probe_stream(xobj: &Object) -> Option<(u32, u32, String)> {
     }
 }
 
-/// Decode an XObject stream into encoded bytes (JPEG passthrough or PNG).
-pub fn decode_xobject_bytes(doc: &Document, xobj: &Object) -> Option<Vec<u8>> {
+/// Box-downsample an RGBA buffer so neither dimension exceeds `max_dim`,
+/// preserving aspect ratio; a no-op (returns the input unchanged) when the
+/// image already fits or `max_dim` is 0/disabled. Each output pixel is the
+/// average of its source box (not nearest-neighbor), so downscaled scans of
+/// text stay legible instead of aliasing into noise.
+fn downscale_rgba(rgba: &[u8], width: u32, height: u32, max_dim: u32) -> (Vec<u8>, u32, u32) {
+    if max_dim == 0 || (width <= max_dim && height <= max_dim) || width == 0 || height == 0 {
+        return (rgba.to_vec(), width, height);
+    }
+    let scale = max_dim as f64 / width.max(height) as f64;
+    let new_w = ((width as f64 * scale).round() as u32).max(1);
+    let new_h = ((height as f64 * scale).round() as u32).max(1);
+
+    let mut out = vec![0u8; new_w as usize * new_h as usize * 4];
+    for oy in 0..new_h {
+        let y0 = (oy as u64 * height as u64 / new_h as u64) as u32;
+        let y1 = (((oy + 1) as u64 * height as u64).div_ceil(new_h as u64)) as u32;
+        let y1 = y1.max(y0 + 1).min(height);
+        for ox in 0..new_w {
+            let x0 = (ox as u64 * width as u64 / new_w as u64) as u32;
+            let x1 = (((ox + 1) as u64 * width as u64).div_ceil(new_w as u64)) as u32;
+            let x1 = x1.max(x0 + 1).min(width);
+
+            let (mut r, mut g, mut b, mut a, mut n) = (0u64, 0u64, 0u64, 0u64, 0u64);
+            for sy in y0..y1 {
+                let row = sy as usize * width as usize * 4;
+                for sx in x0..x1 {
+                    let i = row + sx as usize * 4;
+                    r += rgba[i] as u64;
+                    g += rgba[i + 1] as u64;
+                    b += rgba[i + 2] as u64;
+                    a += rgba[i + 3] as u64;
+                    n += 1;
+                }
+            }
+            let n = n.max(1);
+            let oi = (oy as usize * new_w as usize + ox as usize) * 4;
+            out[oi] = (r / n) as u8;
+            out[oi + 1] = (g / n) as u8;
+            out[oi + 2] = (b / n) as u8;
+            out[oi + 3] = (a / n) as u8;
+        }
+    }
+    (out, new_w, new_h)
+}
+
+/// Decode an XObject stream into encoded bytes (JPEG passthrough or PNG),
+/// plus the actually-encoded pixel width/height. Non-JPEG rasters are
+/// downscaled to fit `max_image_dimension` (pass `u32::MAX` to disable)
+/// before PNG encoding; JPEG streams pass through unchanged since re-encoding
+/// them needs a JPEG codec this crate does not link outside the `vision`
+/// feature.
+pub fn decode_xobject_bytes(
+    doc: &Document,
+    xobj: &Object,
+    max_image_dimension: u32,
+) -> Option<(Vec<u8>, u32, u32)> {
     let Object::Stream(s) = xobj else {
         return None;
     };
@@ -395,7 +460,7 @@ pub fn decode_xobject_bytes(doc: &Document, xobj: &Object) -> Option<Vec<u8>> {
         }
     }
     if is_jpeg {
-        return Some(data);
+        return Some((data, width, height));
     }
     // PNG-style predictors (DecodeParms Predictor 10..=15) are common on
     // Flate image streams: undo the per-row filtering before interpreting
@@ -451,7 +516,8 @@ pub fn decode_xobject_bytes(doc: &Document, xobj: &Object) -> Option<Vec<u8>> {
         None => Object::Name(b"DeviceRGB".to_vec()),
     };
     let rgba = raster_to_rgba(doc, width, height, bits as u32, &cs, &data)?;
-    Some(encode_png_rgba(width, height, &rgba))
+    let (rgba, out_w, out_h) = downscale_rgba(&rgba, width, height, max_image_dimension);
+    Some((encode_png_rgba(out_w, out_h, &rgba), out_w, out_h))
 }
 
 pub fn stream_width_height(s: &lopdf::Stream) -> Option<(u32, u32)> {
@@ -1041,4 +1107,69 @@ pub fn classify_geometry(
         return (MediaKind::Chart, false);
     }
     (MediaKind::Photo, false)
+}
+
+#[cfg(test)]
+mod downscale_tests {
+    use super::downscale_rgba;
+
+    fn solid(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(width as usize * height as usize * 4);
+        for _ in 0..(width as usize * height as usize) {
+            out.extend_from_slice(&rgba);
+        }
+        out
+    }
+
+    #[test]
+    fn noop_when_already_within_bounds() {
+        let buf = solid(100, 50, [10, 20, 30, 255]);
+        let (out, w, h) = downscale_rgba(&buf, 100, 50, 1536);
+        assert_eq!((w, h), (100, 50));
+        assert_eq!(out, buf);
+    }
+
+    #[test]
+    fn noop_when_disabled_via_zero() {
+        let buf = solid(3000, 3000, [1, 2, 3, 4]);
+        let (out, w, h) = downscale_rgba(&buf, 3000, 3000, 0);
+        assert_eq!((w, h), (3000, 3000));
+        assert_eq!(out.len(), buf.len());
+    }
+
+    #[test]
+    fn caps_longest_side_and_preserves_aspect_ratio() {
+        let buf = solid(3000, 1500, [7, 7, 7, 255]);
+        let (out, w, h) = downscale_rgba(&buf, 3000, 1500, 1500);
+        assert_eq!((w, h), (1500, 750), "aspect ratio must be preserved");
+        assert_eq!(out.len(), (w as usize) * (h as usize) * 4);
+    }
+
+    #[test]
+    fn averages_a_uniform_color_block_exactly() {
+        // A uniform-color source must downscale to the exact same color —
+        // any averaging bug would show up as drift here.
+        let buf = solid(8, 8, [200, 100, 50, 255]);
+        let (out, w, h) = downscale_rgba(&buf, 8, 8, 4);
+        assert_eq!((w, h), (4, 4));
+        for px in out.chunks_exact(4) {
+            assert_eq!(px, [200, 100, 50, 255]);
+        }
+    }
+
+    #[test]
+    fn averages_two_tone_halves_to_the_midpoint() {
+        // Left half black, right half white; downscaling to 1 column must
+        // average the whole row, landing on the midpoint gray.
+        let mut buf = Vec::new();
+        for _y in 0..2 {
+            for x in 0..4 {
+                let v = if x < 2 { 0 } else { 255 };
+                buf.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let (out, w, h) = downscale_rgba(&buf, 4, 2, 1);
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(out, vec![127, 127, 127, 255]);
+    }
 }

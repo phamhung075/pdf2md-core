@@ -144,7 +144,9 @@ pub fn page_dominant_raster_bytes(doc: &Document, page_id: ObjectId) -> Option<V
                 continue;
             }
         }
-        if let Some(bytes) = decode_xobject_bytes(doc, &p.obj) {
+        // u32::MAX: hashing wants the raster at its native resolution, not
+        // downscaled to the markdown-embed budget applied elsewhere.
+        if let Some((bytes, _w, _h)) = decode_xobject_bytes(doc, &p.obj, u32::MAX) {
             if !bytes.is_empty() {
                 best = Some((area, bytes));
             }

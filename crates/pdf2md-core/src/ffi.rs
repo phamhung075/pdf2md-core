@@ -70,6 +70,20 @@ fn pdf2md_convert_impl(
                 _ => opts.detect_math = true,
             }
         }
+        // Optional overrides for the media-embed size guardrails (R1): cap the
+        // pixel dimension a raster is downscaled to, and the total base64
+        // bytes inlined into the markdown per document. Unset uses the
+        // ConversionOptions defaults (1536px / 512KB).
+        if let Ok(v) = std::env::var("P2M_MAX_IMAGE_DIM") {
+            if let Ok(n) = v.parse::<u32>() {
+                opts.max_image_dimension = n;
+            }
+        }
+        if let Ok(v) = std::env::var("P2M_MAX_MEDIA_BYTES") {
+            if let Ok(n) = v.parse::<usize>() {
+                opts.max_media_bytes_per_doc = n;
+            }
+        }
         match convert_pdf_bytes_to_markdown(bytes, &opts) {
             Ok(r) => {
                 let media_json =

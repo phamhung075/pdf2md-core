@@ -180,6 +180,20 @@ pub struct ConversionOptions {
     /// `$a_{i}$`) as inline LaTeX before export. On by default; set to `false`
     /// for byte-identical plain extraction (no `$...$` synthesis).
     pub detect_math: bool,
+    /// Maximum pixel dimension (width or height) for a raw/PNG-reconstructed
+    /// raster before it is downscaled proportionally. Only applies to the
+    /// non-JPEG decode path (`decode_xobject_bytes`) — JPEG streams are kept
+    /// as a byte-for-byte passthrough since re-encoding them needs a JPEG
+    /// codec that the default (non-`vision`) build does not link. Bounds
+    /// per-image payload size and markdown-render latency for scanned pages.
+    pub max_image_dimension: u32,
+    /// Maximum total bytes of base64-encoded image data inlined into the
+    /// markdown across the whole document (`embed_media`). Once this budget
+    /// is exhausted, further images are replaced with a short text
+    /// placeholder instead of a `data:` URI, so a scan-heavy document can
+    /// never blow the emitted markdown up to megabytes (which both slows
+    /// rendering and can overflow a downstream LLM prompt/token limit).
+    pub max_media_bytes_per_doc: usize,
 }
 
 impl Default for ConversionOptions {
@@ -193,6 +207,8 @@ impl Default for ConversionOptions {
             embed_media: true,
             detect_vectors: false,
             detect_math: true,
+            max_image_dimension: 1536,
+            max_media_bytes_per_doc: 512 * 1024,
         }
     }
 }
