@@ -191,12 +191,31 @@ pub fn is_tabular_rows(rows: &[Vec<String>]) -> bool {
     for r in &data {
         for c in r.iter() {
             let replaced = c.replace("<br>", " ");
-            for word in replaced.split_whitespace() {
+            let tokens: Vec<&str> = replaced.split_whitespace().collect();
+            for (i, word) in tokens.iter().enumerate() {
                 let clean = word.trim_matches(|ch: char| !ch.is_alphabetic()).to_lowercase();
                 if !clean.is_empty() {
                     total_words_count += 1;
                     if STOPWORDS.contains(&clean.as_str()) {
-                        stopword_count += 1;
+                        // A function word immediately adjacent to a numeric/date
+                        // token is part of a structured label (date-range span
+                        // "du 17/05/25 au ...", amount "de 19/05/2026"), not
+                        // prose. Excluding it keeps genuine bill grids whose
+                        // description cells carry date spans from being
+                        // misclassified as flowing paragraphs.
+                        let numtok = |t: &&str| {
+                            t.trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
+                                .chars()
+                                .any(|ch| ch.is_ascii_digit())
+                        };
+                        let next_num = tokens.get(i + 1).map_or(false, numtok);
+                        let prev_num = i
+                            .checked_sub(1)
+                            .and_then(|j| tokens.get(j))
+                            .map_or(false, numtok);
+                        if !next_num && !prev_num {
+                            stopword_count += 1;
+                        }
                     }
                 }
             }

@@ -61,6 +61,15 @@ fn pdf2md_convert_impl(
         if vectors_on {
             opts.detect_vectors = true;
         }
+        // Optional hatch for LaTeX math AST synthesis (fractions and simple
+        // super/subscripts). Default on; set `P2M_DETECT_MATH=0`/`false` to
+        // disable, or `1`/`true` to force on (e.g. over a non-standard default).
+        if let Ok(v) = std::env::var("P2M_DETECT_MATH") {
+            match v.as_str() {
+                "0" | "false" | "False" | "FALSE" => opts.detect_math = false,
+                _ => opts.detect_math = true,
+            }
+        }
         match convert_pdf_bytes_to_markdown(bytes, &opts) {
             Ok(r) => {
                 let media_json =
@@ -114,4 +123,47 @@ pub extern "C" fn pdf2md_free_string(ptr: *mut c_char) {
 #[no_mangle]
 pub extern "C" fn pdf2md_version() -> *mut c_char {
     cstring_into_raw(env!("CARGO_PKG_VERSION").to_string())
+}
+
+/// Computes a 64-bit perceptual hash (DCT-pHash) of an encoded image buffer
+/// (PNG/JPEG). Returns a heap-allocated C string holding 16 lowercase hex chars,
+/// or an empty string when the payload is not a decodable image.
+/// Caller frees it with `pdf2md_free_string`.
+#[cfg(feature = "vision")]
+#[no_mangle]
+pub extern "C" fn pdf2md_perceptual_hash(img_ptr: *const u8, img_len: usize) -> *mut c_char {
+    if img_ptr.is_null() {
+        return cstring_into_raw(String::new());
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(img_ptr, img_len) };
+    let out = crate::phash::perceptual_hash_64(bytes)
+        .map(|h| format!("{:016x}", h))
+        .unwrap_or_default();
+    cstring_into_raw(out)
+}
+
+/// Computes a whole-document perceptual signature from raw PDF bytes: one 64-bit
+/// DCT-pHash per page (up to `max_pages`, 0 = default 8), comma-joined as hex.
+/// Returns a heap-allocated C string (caller frees with `pdf2md_free_string`),
+/// or "" when the document has no hashable raster (scanned/form pages normally
+/// do — see `phash::page_dominant_raster_bytes`).
+#[cfg(feature = "vision")]
+#[no_mangle]
+pub extern "C" fn pdf2md_vision_signature(
+    pdf_ptr: *const u8,
+    pdf_len: usize,
+    max_pages: i32,
+) -> *mut c_char {
+    if pdf_ptr.is_null() {
+        return cstring_into_raw(String::new());
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(pdf_ptr, pdf_len) };
+    let sig = match lopdf::Document::load_mem(bytes) {
+        Ok(doc) => {
+            let cap = if max_pages > 0 { max_pages as usize } else { 8 };
+            crate::phash::vision_signature(&doc, cap)
+        }
+        Err(_) => String::new(),
+    };
+    cstring_into_raw(sig)
 }

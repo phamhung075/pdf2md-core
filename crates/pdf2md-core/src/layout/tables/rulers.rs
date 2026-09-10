@@ -87,6 +87,17 @@ pub fn line_words(line: &[Span]) -> Vec<WordTok> {
 
 /// Table column rulers in rows lo..=hi (inclusive): word-start x positions
 /// that appear in at least 2 rows within tolerance, spaced by at least min_gutter.
+///
+/// A candidate ruler is dropped if any word in the window *straddles* it
+/// (starts strictly to its left and ends strictly to its right). Such an x is
+/// not a column boundary — it is an interior word-start of a multi-word cell
+/// (e.g. a long line-item description like "Base - 03kVA - du 17/05/25 au
+/// 31/07/25"), which would otherwise fragment that single cell into bogus
+/// columns and, worse, make the whole window fail the downstream straddle
+/// check. A genuine column edge can never be cut through by text, so this
+/// pruning can only remove spurious rulers; it never removes a ruler from a
+/// table that the caller would already accept (such tables already pass the
+/// same straddle test for every interior ruler).
 pub fn table_rulers(info: &[RowInfo], tol: f64, lo: usize, hi: usize, min_gutter: f64) -> Vec<f64> {
     let num_rows = hi - lo + 1;
     if num_rows < 2 {
@@ -135,6 +146,16 @@ pub fn table_rulers(info: &[RowInfo], tol: f64, lo: usize, hi: usize, min_gutter
         .into_iter()
         .filter(|c| c.rows.len() >= 2)
         .map(|c| c.sum_x / c.count as f64)
+        // Drop "rulers" that are actually interior word-starts of one cell:
+        // a column boundary is never straddled by text in any row.
+        .filter(|&x| {
+            (lo..=hi).all(|ri| {
+                !info[ri]
+                    .words
+                    .iter()
+                    .any(|w| w.x0 < x - tol && w.x1 > x + tol)
+            })
+        })
         .collect();
 
     let mut merged: Vec<f64> = Vec::new();
@@ -147,9 +168,23 @@ pub fn table_rulers(info: &[RowInfo], tol: f64, lo: usize, hi: usize, min_gutter
     merged
 }
 
+/// Diagnostic tracer: prints when TABLE_TRACE env is set.
+fn t(msg: &str) {
+    if std::env::var("TABLE_TRACE").is_ok() {
+        eprintln!("[tbl] {}", msg);
+    }
+}
+
+/// Reconstruct a line's text (for diagnostics).
+fn line_text(line: &[Span]) -> String {
+    line.iter().map(|s| s.text.as_str()).collect()
+}
+
 /// Detect grid tables on a page's visual lines.
 pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHit]) -> Vec<TableHit> {
-    if lines.len() < 3 {
+    // A grid needs at least a header row and one data row (2 lines). A single
+    // visual line can never hold a table, so reject below 2.
+    if lines.len() < 2 {
         return Vec::new();
     }
 
@@ -204,6 +239,16 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
         if band.len() < 2 {
             continue;
         }
+        t(&format!(
+            "BAND [{}-{}] rows={}: {}",
+            band[0],
+            band[band.len() - 1],
+            band.len(),
+            band.iter()
+                .map(|&i| format!("[{}:{}]", i, line_text(&lines[i])))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
         let mut lo = 0usize;
         while lo < band.len() {
             if lo + 1 >= band.len() {
@@ -220,6 +265,12 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
             let match_lo = rulers.iter().filter(|&&r| info[band[lo]].starts.iter().any(|&s| (r - s).abs() <= tol * 1.5)).count();
             let match_hi = rulers.iter().filter(|&&r| info[band[hi]].starts.iter().any(|&s| (r - s).abs() <= tol * 1.5)).count();
             if rulers.len() < 2 || match_lo < 2 || match_hi < 2 {
+                t(&format!(
+                    "  REJECT at lo={} (line {} '{}') seed hi={} (line {} '{}'): rulers={:?} match_lo={} match_hi={} [seed check]",
+                    lo, band[lo], line_text(&lines[band[lo]]),
+                    hi, band[hi], line_text(&lines[band[hi]]),
+                    rulers, match_lo, match_hi
+                ));
                 lo += 1;
                 continue;
             }
@@ -251,10 +302,20 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
                 break;
             }
             if rulers.len() < 2 {
+                t(&format!(
+                    "  REJECT at lo={} (line {} '{}'): after-hi rulers={:?} [rulers<2]",
+                    lo, band[lo], line_text(&lines[band[lo]]), rulers
+                ));
                 lo += 1;
                 continue;
             }
             let win_rows: Vec<usize> = band[lo..=hi].to_vec();
+            t(&format!(
+                "  WINDOW lo={} (line {}, '{}') hi={} (line {}, '{}') rulers={:?}",
+                lo, band[lo], line_text(&lines[band[lo]]),
+                hi, band[hi], line_text(&lines[band[hi]]),
+                rulers
+            ));
 
             // No indivisible word can straddle an interior column ruler.
             let has_straddling_word = win_rows.iter().any(|&ri| {
@@ -263,6 +324,10 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
                 })
             });
             if has_straddling_word {
+                t(&format!(
+                    "  REJECT window [{}-{}]: straddling word [straddle]",
+                    band[lo], band[hi]
+                ));
                 lo += 1;
                 continue;
             }
@@ -275,6 +340,10 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
                 })
                 .count();
             if multi_col_rows < 2 {
+                t(&format!(
+                    "  REJECT window [{}-{}]: multi_col_rows={} [multi_col<2]",
+                    band[lo], band[hi], multi_col_rows
+                ));
                 lo += 1;
                 continue;
             }
@@ -285,6 +354,12 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
                     .fold(0.0f64, f64::max);
                 let min_gutter = (1.1 * max_size).max(6.0);
                 let ok_gutter = rulers.windows(2).all(|p| p[1] - p[0] >= min_gutter);
+                if !ok_gutter {
+                    t(&format!(
+                        "  REJECT window [{}-{}]: min_gutter={} rulers={:?} [gutter]",
+                        band[lo], band[hi], min_gutter, rulers
+                    ));
+                }
                 if ok_gutter {
                     let mid1 = (rulers[0] + rulers[1]) / 2.0;
                     let mut distinct: std::collections::HashSet<String> =
@@ -300,6 +375,12 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
                         if !first.trim().is_empty() {
                             distinct.insert(first);
                         }
+                    }
+                    if distinct.len() < 2 {
+                        t(&format!(
+                            "  REJECT window [{}-{}]: distinct_first_cols={} [no 2 distinct first cols]",
+                            band[lo], band[hi], distinct.len()
+                        ));
                     }
                     if distinct.len() >= 2 {
                         let flowing_rows = win_rows
@@ -321,6 +402,10 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
                             })
                             .count();
                         if flowing_rows >= 2 && flowing_rows * 2 >= multi_col_rows {
+                            t(&format!(
+                                "  REJECT window [{}-{}]: flowing_rows={} multi_col_rows={} [flowing]",
+                                band[lo], band[hi], flowing_rows, multi_col_rows
+                            ));
                             lo += 1;
                             continue;
                         }
@@ -345,6 +430,10 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
                             let rows2: Vec<Vec<String>> =
                                 table_rows.iter().map(|r| r[c0..c1].to_vec()).collect();
                             if !is_tabular_rows(&rows2) {
+                                t(&format!(
+                                    "  REJECT window [{}-{}]: is_tabular_rows false rows2={:?} [not_tabular]",
+                                    band[lo], band[hi], rows2
+                                ));
                                 lo += 1;
                                 continue;
                             }

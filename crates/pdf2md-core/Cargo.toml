@@ -16,7 +16,12 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
 default = []
-wasm = []
+wasm = ["dep:wasm-bindgen", "dep:js-sys"]
+# `vision` enables the on-device perceptual image-hashing primitive
+# (DCT-pHash + page-raster extraction) used by the commercial server's
+# Vision-rescue caching layer, plus the adjacent FFI exports. It is opt-in so
+# the public core / WASM builds stay dependency-light (no image codec stack).
+vision = ["dep:image"]
 
 [dependencies]
 rayon = "1.10"
@@ -25,6 +30,15 @@ serde_json = "1.0"
 lopdf = "0.44"
 flate2 = "1.1"
 crc32fast = "1.5"
+# Wasm-only deps. `std::time::Instant` is unsupported (panics) on
+# wasm32-unknown-unknown, so the wasm build measures durations with the JS clock
+# from js-sys/wasm-bindgen instead.
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+# Perceptual image hashing (DCT-pHash) for Vision-rescue form/template
+# deduplication. Only PNG + JPEG codecs are enabled; the whole stack is opt-in
+# behind the `vision` feature so public/WASM builds are untouched.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 
 [profile.release]
 opt-level = 3

@@ -574,6 +574,7 @@ fn extract_page(
     page_id: ObjectId,
     detect_tables: bool,
     detect_layout: bool,
+    detect_math: bool,
 ) -> Result<PageText, String> {
     let fonts = doc.get_page_fonts(page_id).map_err(|e| format!("{e}"))?;
     let has_fonts = !fonts.is_empty();
@@ -613,7 +614,7 @@ fn extract_page(
         has_tj && !has_tj_plain && has_td
     };
     if route_to_layout {
-        return crate::layout::extract_page_glyphs(doc, page_id, detect_tables, detect_layout);
+        return crate::layout::extract_page_glyphs(doc, page_id, detect_tables, detect_layout, detect_math);
     }
 
     let mut out = String::new();
@@ -784,13 +785,14 @@ pub fn extract_page_text_report(
     page_number: u32,
     detect_tables: bool,
     detect_layout: bool,
+    detect_math: bool,
 ) -> Result<PageText, String> {
     let pages: std::collections::BTreeMap<u32, ObjectId> = doc.get_pages();
     let page_id = pages
         .get(&page_number)
         .copied()
         .ok_or_else(|| format!("page {page_number} not found"))?;
-    extract_page(doc, page_id, detect_tables, detect_layout)
+    extract_page(doc, page_id, detect_tables, detect_layout, detect_math)
 }
 
 #[cfg(test)]

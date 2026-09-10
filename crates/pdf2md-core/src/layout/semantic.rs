@@ -6,13 +6,18 @@
 
 use crate::cpdf_textpage::{TextBlock, TextLine};
 use crate::layout::ast::AstNode;
+use crate::layout::latex_math::synthesize_block_text;
 use crate::layout::xy_cut::DocumentStatistics;
 
 /// Classifies structured text blocks into semantic AST nodes (Headings, Lists, Code, Paragraphs)
 /// using relative statistical deviation rather than fixed point sizes.
+/// When `detect_math` is set, heading/paragraph text is synthesised through the
+/// LaTeX math AST so built-up fractions and simple super/subscripts become
+/// inline `$...$` before the AST is serialised to Markdown.
 pub fn classify_semantic_blocks(
     blocks: &[TextBlock],
     stats: &DocumentStatistics,
+    detect_math: bool,
 ) -> Vec<(f64, AstNode)> {
     let mut result = Vec::new();
 
@@ -26,7 +31,11 @@ pub fn classify_semantic_blocks(
             let all_heading = block.lines.iter().all(|l| detect_heading(l, stats).is_some());
             if all_heading {
                 let level = detect_heading(&block.lines[0], stats).map(|(lvl, _)| lvl).unwrap_or(1);
-                let h_text = block.lines.iter().map(|l| l.text.trim()).collect::<Vec<_>>().join(" ");
+                let h_text = if detect_math {
+                    synthesize_block_text(&block.lines, &[], " ")
+                } else {
+                    block.lines.iter().map(|l| l.text.trim()).collect::<Vec<_>>().join(" ")
+                };
                 result.push((block.block_bbox.max_y, AstNode::Heading { level, text: h_text }));
                 continue;
             }
@@ -70,10 +79,15 @@ pub fn classify_semantic_blocks(
         }
 
         // 4. Default: Paragraph
+        let para_text = if detect_math {
+            synthesize_block_text(&block.lines, &[], "\n")
+        } else {
+            block.text.clone()
+        };
         result.push((
             block.block_bbox.max_y,
             AstNode::Paragraph {
-                text: block.text.clone(),
+                text: para_text,
             },
         ));
     }

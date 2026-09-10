@@ -35,6 +35,23 @@ void pdf2md_free_string(char *ptr);
 /* Returns the engine version as a heap-allocated C string (caller frees it). */
 char *pdf2md_version(void);
 
+/*
+ * Computes a 64-bit perceptual hash (DCT-pHash) of an encoded image buffer
+ * (PNG/JPEG). Returns a heap-allocated C string (caller frees with
+ * pdf2md_free_string): 16 lowercase hex chars, or "" if not a decodable image.
+ * Only present when the core is built with the `vision` feature.
+ */
+char *pdf2md_perceptual_hash(const uint8_t *img_bytes, size_t img_len);
+
+/*
+ * Computes a whole-document perceptual signature from raw PDF bytes: one 64-bit
+ * DCT-pHash per page (up to max_pages, 0 = default 8), comma-joined as hex.
+ * Returns a heap-allocated C string (caller frees with pdf2md_free_string), or
+ * "" when the document has no hashable raster. Only present when the core is
+ * built with the `vision` feature.
+ */
+char *pdf2md_vision_signature(const uint8_t *pdf_bytes, size_t pdf_len, int max_pages);
+
 #ifdef __cplusplus
 }
 #endif

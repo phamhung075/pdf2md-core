@@ -23,6 +23,8 @@ pub struct DocBlock {
     pub is_bold: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_italic: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_underline: bool,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -226,6 +228,12 @@ pub fn detect_projection_two_columns(lines: &[Vec<Span>]) -> Option<PageColumns>
         if b.x1 > min_x + 50.0 && b.x1 < max_x - 50.0 {
             candidate_xs.push(b.x1 + 5.0);
         }
+        for seg in split_line_segments(&b.line) {
+            let seg_x1 = seg.iter().map(|s| s.x + s.advance).fold(f64::NEG_INFINITY, f64::max);
+            if seg_x1 > min_x + 50.0 && seg_x1 < max_x - 50.0 {
+                candidate_xs.push(seg_x1 + 5.0);
+            }
+        }
     }
     candidate_xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     candidate_xs.dedup_by(|a, b| (*a - *b).abs() < 5.0);
@@ -265,9 +273,9 @@ pub fn detect_projection_two_columns(lines: &[Vec<Span>]) -> Option<PageColumns>
         }
 
         let gutter_width = min_r_x - max_l_x;
-        if gutter_width >= 15.0 && left_count >= 3 && right_count >= 3 && crossing_count <= 2 {
+        if gutter_width >= 15.0 && left_count >= 3 && right_count >= 3 {
             let score = gutter_width * (left_count.min(right_count) as f64) - (crossing_count as f64 * 100.0);
-            if best_gutter.map_or(true, |(_, _, s)| score > s) {
+            if crossing_count <= 2 && best_gutter.map_or(true, |(_, _, s)| score > s) {
                 best_gutter = Some((max_l_x, min_r_x, score));
             }
         }
@@ -377,43 +385,124 @@ pub fn is_page_number_line(spans: &[Span], page_height: f64) -> bool {
 
 /// Render a single visual line to text (no surrounding blank-line logic).
 pub fn render_line_text(spans: &[Span]) -> String {
-    let size = spans.iter().map(|s| s.size).fold(0.0f64, f64::max).max(0.1);
+    render_spans(spans)
+}
+
+// ---------------------------------------------------------------------------
+// Inline emphasis rendering (bold / italic / underline)
+// ---------------------------------------------------------------------------
+
+/// Inline text style of one span run. A span is drawn entirely in one font so
+/// its bold/italic/underline state is uniform.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct InlineStyle {
+    bold: bool,
+    italic: bool,
+    underline: bool,
+}
+
+impl InlineStyle {
+    fn of(span: &Span) -> Self {
+        Self {
+            bold: span.is_bold,
+            italic: span.is_italic,
+            underline: span.is_underline,
+        }
+    }
+}
+
+/// Open the Markdown emphasis delimiters for `st`. Order matters for the
+/// combined bold+italic case: `<u>` then `*` then `**` yields `***text***`
+/// (bold-italic) wrapped in `<u>`.
+fn open_style(out: &mut String, st: InlineStyle) {
+    if st.underline {
+        out.push_str("<u>");
+    }
+    if st.italic {
+        out.push('*');
+    }
+    if st.bold {
+        out.push_str("**");
+    }
+}
+
+/// Close the Markdown emphasis delimiters for `st` (reverse order of `open_style`).
+fn close_style(out: &mut String, st: InlineStyle) {
+    if st.bold {
+        out.push_str("**");
+    }
+    if st.italic {
+        out.push('*');
+    }
+    if st.underline {
+        out.push_str("</u>");
+    }
+}
+
+/// Render one visual line's spans to text with inline `**bold**` / `*italic*` /
+/// `<u>underline</u>` emphasis. The spatial spacing rules are identical to the
+/// legacy plain-text renderer (`render_cluster`), so a line of unstyled spans
+/// produces byte-identical output; only runs whose style is non-plain gain
+/// emphasis delimiters.
+pub(crate) fn render_spans(line: &[Span]) -> String {
     let mut out = String::new();
     let mut prev_x: Option<f64> = None;
     let mut prev_advance = 0.0f64;
-    for span in spans {
+    let mut cur = InlineStyle::default();
+
+    for span in line {
         if span.text.is_empty() {
             continue;
         }
+        let size = span.size.max(0.1);
+        let space_adv = 0.25 * size;
+        let is_space = span.text.chars().all(|c| c == ' ');
+
         if let Some(px) = prev_x {
             let gap = span.x - px;
-            let space_adv = 0.25 * size;
-            if span.text != " " {
-                let diff = gap - prev_advance;
-                let thresh = 0.65 * space_adv;
+            if !is_space {
                 if gap > 2.5 * size {
+                    // A distinct column / element on the same row: break the
+                    // line AND close any open emphasis first.
+                    close_style(&mut out, cur);
+                    cur = InlineStyle::default();
                     if !out.is_empty() && !out.ends_with('\n') {
                         out.push('\n');
                     }
-                } else if diff > thresh {
-                    let prev_ch = out.chars().next_back();
-                    let is_elision = matches!(prev_ch, Some('\'') | Some('’') | Some('`'));
-                    if !is_elision && !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
+                } else if gap - prev_advance > 0.65 * space_adv {
+                    close_style(&mut out, cur);
+                    cur = InlineStyle::default();
+                    if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
                         out.push(' ');
                     }
                 }
             }
         }
-        if span.text == " " {
+
+        if is_space {
+            // A space glyph is never emphasized; close any open emphasis so the
+            // delimiter sits flush against the word (Markdown rejects emphasis
+            // with leading/trailing spaces inside the delimiters).
             if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
+                close_style(&mut out, cur);
+                cur = InlineStyle::default();
                 out.push(' ');
             }
         } else {
+            let st = InlineStyle::of(span);
+            if st != cur {
+                close_style(&mut out, cur);
+                open_style(&mut out, st);
+                cur = st;
+            }
             out.push_str(&span.text);
         }
+
         prev_x = Some(span.x);
         prev_advance = span.advance;
     }
+
+    close_style(&mut out, cur);
     out.trim_end().to_string()
 }
 
@@ -437,49 +526,7 @@ pub fn render_cluster(lines: &[Vec<Span>]) -> String {
             }
         }
 
-        let mut line_text = String::new();
-        let mut prev_x: Option<f64> = None;
-        let mut prev_advance = 0.0f64;
-
-        for span in line {
-            if span.text.is_empty() {
-                continue;
-            }
-            if let Some(px) = prev_x {
-                let gap = span.x - px;
-                let space_adv = 0.25 * size;
-                if span.text != " " {
-                    if gap > 2.5 * size {
-                        // Distinct column / element on the same row.
-                        if !line_text.is_empty() && !line_text.ends_with('\n') {
-                            line_text.push('\n');
-                        }
-                    } else if gap - prev_advance > 0.65 * space_adv {
-                        let prev_ch = line_text.chars().next_back();
-                        let is_elision = matches!(prev_ch, Some('\'') | Some('’') | Some('`'));
-                        if !is_elision
-                            && !line_text.is_empty()
-                            && !line_text.ends_with(' ')
-                            && !line_text.ends_with('\n')
-                        {
-                            line_text.push(' ');
-                        }
-                    }
-                }
-            }
-            // Append the glyph, collapsing runs of spaces (producers often emit
-            // stray extra space glyphs for alignment).
-            if span.text == " " {
-                if !line_text.is_empty() && !line_text.ends_with(' ') && !line_text.ends_with('\n')
-                {
-                    line_text.push(' ');
-                }
-            } else {
-                line_text.push_str(&span.text);
-            }
-            prev_x = Some(span.x);
-            prev_advance = span.advance;
-        }
+        let line_text = render_spans(line);
 
         out.push_str(line_text.trim_end());
         out.push('\n');
@@ -555,15 +602,50 @@ pub fn split_line_segments(line: &[Span]) -> Vec<Vec<Span>> {
     segments
 }
 
+/// Robustly estimate the body (regular prose) font size for a page.
+///
+/// The median is a poor anchor for heading detection: when a page carries many
+/// mid-size headings (outlines, structured reports), the heading sizes pull the
+/// median up to the heading size, so `size >= body * 1.25` no longer fires and
+/// the headings hide themselves. Instead use the most frequent size class — the
+/// mode — and, when several classes tie for frequency, take the *smallest* of
+/// them. Body text is the smallest regular size class and headings are larger,
+/// so this keeps the heading threshold anchored on the body and never lets the
+/// headings inflate it.
+fn estimate_body_size(sizes: &[f64]) -> f64 {
+    use std::collections::HashMap;
+    if sizes.is_empty() {
+        return 10.0;
+    }
+    let mut freq: HashMap<String, usize> = HashMap::new();
+    for s in sizes {
+        // Quantize to a tenth of a point so metric rounding doesn't split a
+        // single nominal size into many near-identical keys.
+        let key = format!("{:.1}", (s * 10.0).round() / 10.0);
+        *freq.entry(key).or_insert(0) += 1;
+    }
+    let max_freq = freq.values().copied().max().unwrap_or(0);
+    let mut best: Option<f64> = None;
+    for s in sizes {
+        let key = format!("{:.1}", (s * 10.0).round() / 10.0);
+        if freq.get(&key).copied().unwrap_or(0) == max_freq {
+            best = Some(match best {
+                None => *s,
+                Some(b) => b.min(*s),
+            });
+        }
+    }
+    best.unwrap_or(10.0).max(1.0)
+}
+
 /// Build the structured block list for a glyph page in reading order.
 pub fn build_doc_blocks(lines: &[Vec<Span>], page_height: f64) -> Vec<DocBlock> {
-    let mut sizes: Vec<f64> = lines
+    let sizes: Vec<f64> = lines
         .iter()
         .map(|l| l.iter().map(|s| s.size).fold(0.0f64, f64::max))
         .filter(|s| *s > 0.0)
         .collect();
-    sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let body = sizes.get(sizes.len() / 2).copied().unwrap_or(10.0).max(1.0);
+    let body = estimate_body_size(&sizes).max(1.0);
     let title_size = body * 1.6;
     let max_y = lines
         .iter()
@@ -594,17 +676,28 @@ pub fn build_doc_blocks(lines: &[Vec<Span>], page_height: f64) -> Vec<DocBlock> 
                 }
                 let is_line_bold = !seg.is_empty() && seg.iter().any(|s| s.is_bold);
                 let is_line_italic = !seg.is_empty() && seg.iter().any(|s| s.is_italic);
+                let is_line_underline = !seg.is_empty() && seg.iter().any(|s| s.is_underline);
                 let kind = if size >= title_size && baseline_min >= max_y - 2.0 {
                     "title"
                 } else if size >= body * 1.25 || (is_line_bold && size >= body * 1.05) {
                     "heading"
-                } else if text
-                    .trim_start()
-                    .starts_with(['-', '•', '●', '◦', '·', '*'])
-                {
-                    "list"
                 } else {
-                    "body"
+                    let t = text.trim_start();
+                    // A leading `*` is a bullet only when it is followed by
+                    // whitespace (e.g. `* item`); `*italic*` is inline emphasis.
+                    let is_star_bullet =
+                        t.starts_with('*') && t[1..].chars().next().map_or(false, |c| c.is_whitespace());
+                    let is_bullet = t.starts_with('-')
+                        || t.starts_with('•')
+                        || t.starts_with('●')
+                        || t.starts_with('◦')
+                        || t.starts_with('·')
+                        || is_star_bullet;
+                    if is_bullet {
+                        "list"
+                    } else {
+                        "body"
+                    }
                 };
                 blocks.push(DocBlock {
                     page: 0,
@@ -616,9 +709,97 @@ pub fn build_doc_blocks(lines: &[Vec<Span>], page_height: f64) -> Vec<DocBlock> 
                     text,
                     is_bold: is_line_bold,
                     is_italic: is_line_italic,
+                    is_underline: is_line_underline,
                 });
             }
         }
     }
     blocks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::glyph_stream::Span;
+
+    fn span(text: &str, x: f64, style: (bool, bool, bool)) -> Span {
+        Span {
+            text: text.to_string(),
+            x,
+            y: 700.0,
+            size: 10.0,
+            advance: text.len() as f64 * 6.0,
+            is_bold: style.0,
+            is_italic: style.1,
+            is_underline: style.2,
+            is_vertical: false,
+        }
+    }
+
+    /// A word + explicit space span + word (space spans are the common case
+    /// from PDF producers).
+    fn words_spaced(pairs: &[(&str, (bool, bool, bool))]) -> Vec<Span> {
+        let mut v = Vec::new();
+        let mut x = 100.0;
+        for (i, (t, st)) in pairs.iter().enumerate() {
+            if i > 0 {
+                v.push(span(" ", x, (false, false, false)));
+                x += 3.0;
+            }
+            v.push(span(t, x, *st));
+            x += text_width(t) + 2.0;
+        }
+        v
+    }
+
+    fn text_width(t: &str) -> f64 {
+        t.len() as f64 * 6.0
+    }
+
+    #[test]
+    fn unstyled_line_has_no_markers() {
+        let line = words_spaced(&[("Hello", (false, false, false)), ("world", (false, false, false))]);
+        assert_eq!(render_spans(&line), "Hello world");
+    }
+
+    #[test]
+    fn bold_run_is_wrapped_in_asterisks_per_word() {
+        let line = words_spaced(&[
+            ("Bold", (true, false, false)),
+            ("text", (true, false, false)),
+        ]);
+        assert_eq!(render_spans(&line), "**Bold** **text**");
+    }
+
+    #[test]
+    fn italic_run_uses_single_asterisk() {
+        let line = words_spaced(&[("Note", (false, true, false))]);
+        assert_eq!(render_spans(&line), "*Note*");
+    }
+
+    #[test]
+    fn underline_run_uses_html_u() {
+        let line = words_spaced(&[("Link", (false, false, true))]);
+        assert_eq!(render_spans(&line), "<u>Link</u>");
+    }
+
+    #[test]
+    fn style_transitions_close_and_reopen() {
+        let line = words_spaced(&[
+            ("Bold", (true, false, false)),
+            ("normal", (false, false, false)),
+            ("Italic", (false, true, false)),
+        ]);
+        assert_eq!(render_spans(&line), "**Bold** normal *Italic*");
+    }
+
+    #[test]
+    fn explicit_space_span_never_emphasized() {
+        let line = vec![
+            span("BoldTail", 100.0, (true, false, false)),
+            span(" ", 160.0, (true, false, false)), // space glyph, style ignored
+            span("After", 165.0, (false, false, false)),
+        ];
+        assert_eq!(render_spans(&line), "**BoldTail** After");
+    }
 }

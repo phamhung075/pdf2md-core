@@ -40,6 +40,10 @@ pub struct TextSpan {
     pub bbox: BoundingBox,
     pub font_size: f64,
     pub is_bold: bool,
+    #[serde(default)]
+    pub is_italic: bool,
+    #[serde(default)]
+    pub is_underline: bool,
     pub page_number: usize,
 }
 
@@ -171,6 +175,11 @@ pub struct ConversionOptions {
     /// Detect pure-vector figure regions (charts/diagrams/logos drawn with
     /// paths, no raster) and cut them out as standalone clipped PDFs.
     pub detect_vectors: bool,
+    /// Synthesize a LaTeX math AST from 2D glyph geometry and emit built-up
+    /// fractions (`$\frac{a}{b}$`) and simple super/subscripts (`$x^{2}$`,
+    /// `$a_{i}$`) as inline LaTeX before export. On by default; set to `false`
+    /// for byte-identical plain extraction (no `$...$` synthesis).
+    pub detect_math: bool,
 }
 
 impl Default for ConversionOptions {
@@ -183,6 +192,7 @@ impl Default for ConversionOptions {
             detect_layout: true,
             embed_media: true,
             detect_vectors: false,
+            detect_math: true,
         }
     }
 }

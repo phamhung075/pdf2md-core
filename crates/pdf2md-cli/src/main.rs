@@ -71,7 +71,7 @@ fn main() {
 
     if !is_digital_pdf_bytes(&bytes) {
         eprintln!("Error: Document lacks a readable digital text layer or is a scanned image.");
-        eprintln!("Tip: Route through the full Docling/Vision OCR pipeline for optical character recognition.");
+        eprintln!("Tip: this CLI only runs the fast digital-text path; route the document through a vision/OCR rescue service for scanned pages.");
         process::exit(2);
     }
 

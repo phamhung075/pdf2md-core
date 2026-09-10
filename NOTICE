@@ -39,3 +39,18 @@ Unlicense, Unicode-3.0)
     build this product. Where a dependency is statically linked into the
     distributed binary/static/shared/WASM artifacts, their license texts are
     reproduced in THIRD_PARTY_LICENSES as required by the respective licenses.
+
+--------------------------------------------------------------------------
+image crate (perceptual image hashing, `vision` feature only)
+--------------------------------------------------------------------------
+    Copyright (c) the image-rs project contributors (https://github.com/image-rs).
+
+    Source location: https://github.com/image-rs/image
+
+    `crates/pdf2md-core` has an opt-in `vision` cargo feature (enabled for the
+    commercial-server build, not for the public/WASM defaults) that uses the Rust
+    `image` crate (0.25.x, dual MIT / Apache-2.0) plus its PNG and JPEG codec
+    dependencies to compute 64-bit DCT perceptual hashes of page rasters. These
+    hashes let the commercial Vision-rescue layer recognise a repeated form and
+    serve a cached result instead of re-invoking the LLM. All such dependencies
+    are permissively licensed (MIT / Apache-2.0 / Zlib); see THIRD_PARTY_LICENSES.
