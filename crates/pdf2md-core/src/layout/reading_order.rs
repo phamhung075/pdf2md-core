@@ -513,6 +513,8 @@ pub fn render_cluster(lines: &[Vec<Span>]) -> String {
         return String::new();
     }
 
+    let body_size = body_size_for(lines);
+    let mut list_state = ListRunState::default();
     let mut out = String::new();
     let mut prev_line_y: Option<f64> = None;
 
@@ -526,7 +528,8 @@ pub fn render_cluster(lines: &[Vec<Span>]) -> String {
             }
         }
 
-        let line_text = render_spans(line);
+        let (role, render_slice) = classify_line(line, body_size, &mut list_state);
+        let line_text = format_structured_line(&role, &render_spans(render_slice));
 
         out.push_str(line_text.trim_end());
         out.push('\n');
@@ -553,12 +556,14 @@ pub fn render_human_order(lines: &[Vec<Span>], page_height: f64, drop_furniture:
             .collect();
         return render_cluster(&keep);
     }
+    let body_size = body_size_for(lines);
     let mut out = String::new();
     for (ci, stream) in streams.iter().enumerate() {
         if ci > 0 && !out.is_empty() {
             out.push('\n');
         }
         let mut prev_y: Option<f64> = None;
+        let mut list_state = ListRunState::default();
         for line in stream {
             if drop_furniture && is_page_number_line(line, page_height) {
                 continue;
@@ -569,7 +574,8 @@ pub fn render_human_order(lines: &[Vec<Span>], page_height: f64, drop_furniture:
                     out.push('\n');
                 }
             }
-            out.push_str(&render_line_text(line));
+            let (role, render_slice) = classify_line(line, body_size, &mut list_state);
+            out.push_str(&format_structured_line(&role, &render_line_text(render_slice)));
             out.push('\n');
             prev_y = Some(line[0].y);
         }
@@ -636,6 +642,262 @@ fn estimate_body_size(sizes: &[f64]) -> f64 {
         }
     }
     best.unwrap_or(10.0).max(1.0)
+}
+
+/// Computes the body (regular prose) font size for a full page's lines — the
+/// same anchor `build_doc_blocks` already uses to classify a line as a
+/// title/heading, now also the anchor the render functions below use to
+/// decide when to emit `#`/`##`/`###` instead of flat text.
+pub(crate) fn body_size_for(lines: &[Vec<Span>]) -> f64 {
+    let sizes: Vec<f64> = lines
+        .iter()
+        .map(|l| l.iter().map(|s| s.size).fold(0.0f64, f64::max))
+        .filter(|s| *s > 0.0)
+        .collect();
+    estimate_body_size(&sizes).max(1.0)
+}
+
+// ---------------------------------------------------------------------------
+// Structural Markdown emission (R7): headings (#, ##, ###) and lists (-, 1.)
+// ---------------------------------------------------------------------------
+//
+// `build_doc_blocks` above already classifies each line into "title" /
+// "heading" / "list" / "body" for the JSON `blocks` output, but nothing
+// consulted that classification when building the actual Markdown string —
+// every renderer in this module emitted flat text with only inline
+// `**bold**`/`*italic*` emphasis, regardless of a line's role. A heading
+// looked exactly like a paragraph that happened to be bold.
+//
+// This section is the shared classifier + formatter every render entry point
+// (`render_cluster`, `render_human_order`, `render_math_stream` in
+// latex_math.rs, `render_with_tables` in tables/mod.rs) now calls per line,
+// so the emitted Markdown and the `blocks` JSON list are never a "heading"
+// according to one and flat text according to the other.
+//
+// The heading-level thresholds mirror `layout::semantic::detect_heading`
+// (a statistical 3-level H1/H2/H3 classifier that already existed, already
+// tested, but lived only in the separate `ModernLayoutEngine`/`xy_cut`
+// pipeline `convert_pdf_bytes_to_markdown` never calls) adapted onto the
+// `Span`-based lines this live pipeline actually uses, anchored on
+// `body_size_for`'s mode-based estimate rather than semantic.rs's median
+// (see `estimate_body_size`'s own doc comment for why the mode is the safer
+// anchor). List-item detection similarly mirrors
+// `layout::semantic::detect_list_item`'s marker checks (bullets, checkboxes,
+// ordered markers), adapted to slice the marker off a `Span` line instead of
+// a `TextLine`'s first `TextWord`.
+
+/// One visual line's structural role.
+#[derive(Debug)]
+pub(crate) enum LineRole {
+    Heading(u8),
+    List { depth: u8, ordered: bool, ordinal: usize },
+    Body,
+}
+
+/// Per-render-pass state so consecutive list items share one indent anchor
+/// and ordered items number consecutively; resets whenever a heading or a
+/// non-list body line breaks the run (mirrors normal Markdown list
+/// semantics: a blank/prose line ends the list).
+#[derive(Default)]
+pub(crate) struct ListRunState {
+    base_x: Option<f64>,
+    counters: Vec<usize>,
+}
+
+impl ListRunState {
+    fn end_run(&mut self) {
+        self.base_x = None;
+        self.counters.clear();
+    }
+
+    /// Depth 0 is the first list item's own indent; deeper items are bucketed
+    /// in units of `1.5 * body_size` from that anchor (mirrors
+    /// `layout::semantic::detect_list_item`'s indent-to-depth formula).
+    fn depth_for(&mut self, x: f64, body_size: f64) -> u8 {
+        let base = *self.base_x.get_or_insert(x);
+        let raw = (x - base) / (1.5 * body_size.max(1.0));
+        raw.round().clamp(0.0, 4.0) as u8
+    }
+
+    /// Next ordinal for an ordered item at `depth`; resets any deeper
+    /// counters (a new depth-0 item restarts nested numbering underneath it).
+    fn next_ordinal(&mut self, depth: u8) -> usize {
+        let d = depth as usize;
+        if self.counters.len() <= d {
+            self.counters.resize(d + 1, 0);
+        }
+        for c in self.counters.iter_mut().skip(d + 1) {
+            *c = 0;
+        }
+        self.counters[d] += 1;
+        self.counters[d]
+    }
+}
+
+/// Statistical 3-level heading detector — see this section's module-level
+/// doc comment for provenance. Returns `None` for anything that doesn't look
+/// like a heading, including prose that merely happens to be short or bold.
+fn detect_heading_level(line: &[Span], body_size: f64) -> Option<u8> {
+    let sized: Vec<&Span> = line.iter().filter(|s| !s.text.trim().is_empty()).collect();
+    if sized.is_empty() {
+        return None;
+    }
+    let plain: String = sized.iter().map(|s| s.text.as_str()).collect();
+    let trimmed = plain.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 180 {
+        return None;
+    }
+    // Trailing full stop with no letters at all, or two-plus sentence
+    // breaks, reads as prose rather than a heading.
+    if trimmed.ends_with('.') && !trimmed.contains(|c: char| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    if trimmed.matches(". ").count() >= 2 {
+        return None;
+    }
+
+    let total_chars: f64 = sized.iter().map(|s| s.text.chars().count().max(1) as f64).sum();
+    let avg_fs = sized
+        .iter()
+        .map(|s| s.size * s.text.chars().count().max(1) as f64)
+        .sum::<f64>()
+        / total_chars.max(1.0);
+    let is_bold = sized.iter().filter(|s| s.is_bold).count() * 2 > sized.len();
+
+    if avg_fs >= 1.6 * body_size || (avg_fs >= 1.4 * body_size && is_bold) {
+        return Some(1);
+    }
+    if avg_fs >= 1.3 * body_size {
+        return Some(2);
+    }
+    if avg_fs >= 1.15 * body_size && is_bold {
+        return Some(3);
+    }
+    None
+}
+
+/// Detects a leading list marker (bullet, checkbox, or ordered) on `line`'s
+/// first non-space span and returns `(ordered, spans_to_skip)` — how many
+/// leading spans are the marker itself (plus a following pure-space span),
+/// to be sliced off before rendering the item's own text. A checkbox marker
+/// (`[ ]`/`[x]`) is kept as part of the item text (GFM task-list syntax is
+/// `- [ ] text`, not a separate marker), so it reports 0 spans to skip.
+fn detect_list_marker(line: &[Span]) -> Option<(bool, usize)> {
+    let mut idx = 0;
+    while idx < line.len() && line[idx].text.trim().is_empty() {
+        idx += 1;
+    }
+    let w0 = line.get(idx)?.text.trim();
+    if w0.is_empty() {
+        return None;
+    }
+
+    let is_checkbox = w0 == "[ ]" || w0.eq_ignore_ascii_case("[x]");
+    if is_checkbox {
+        // Require item text after the checkbox; a lone checkbox is noise.
+        return if idx + 1 < line.len() { Some((false, idx)) } else { None };
+    }
+
+    let is_bullet = matches!(w0, "-" | "*" | "•" | "●" | "+" | "◦" | "▪");
+    let is_ordered = if (w0.ends_with('.') || w0.ends_with(')')) && w0.len() <= 5 {
+        let digits = &w0[..w0.len() - 1];
+        !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+    } else if (w0.starts_with('(') && w0.ends_with(')')) || (w0.starts_with('[') && w0.ends_with(']')) {
+        let inner = &w0[1..w0.len().saturating_sub(1)];
+        !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit())
+    } else {
+        false
+    };
+    if !is_bullet && !is_ordered {
+        return None;
+    }
+
+    let mut skip = idx + 1;
+    if skip < line.len() && line[skip].text.chars().all(|c| c == ' ') {
+        skip += 1;
+    }
+    if skip >= line.len() {
+        return None; // marker with no item text
+    }
+    Some((is_ordered, skip))
+}
+
+/// Classifies one visual line, threading `list_state` across consecutive
+/// calls in one render pass. Returns the role plus the span slice the caller
+/// should actually render as the line's text — the marker sliced off for a
+/// list item (the caller prefixes the Markdown bullet/number itself instead),
+/// the full line otherwise.
+pub(crate) fn classify_line<'a>(
+    line: &'a [Span],
+    body_size: f64,
+    list_state: &mut ListRunState,
+) -> (LineRole, &'a [Span]) {
+    if line.is_empty() {
+        return (LineRole::Body, line);
+    }
+    if let Some(level) = detect_heading_level(line, body_size) {
+        list_state.end_run();
+        return (LineRole::Heading(level), line);
+    }
+    if let Some((ordered, skip)) = detect_list_marker(line) {
+        let depth = list_state.depth_for(line[0].x, body_size);
+        let ordinal = list_state.next_ordinal(depth);
+        return (LineRole::List { depth, ordered, ordinal }, &line[skip..]);
+    }
+    list_state.end_run();
+    (LineRole::Body, line)
+}
+
+/// Strips one or more layers of outer `**`/`*`/`<u></u>` wrapping from an
+/// already-rendered line. Headings render as clean text rather than
+/// redundantly double-marking a `## **Heading**` when the source line
+/// happened to be entirely bold — exactly the common case, since bold is one
+/// of `detect_heading_level`'s own signals (the H3 threshold requires it).
+fn strip_outer_emphasis(s: &str) -> String {
+    let mut t = s.trim();
+    loop {
+        if let Some(inner) = t.strip_prefix("<u>").and_then(|r| r.strip_suffix("</u>")) {
+            t = inner.trim();
+            continue;
+        }
+        if let Some(inner) = t.strip_prefix("**").and_then(|r| r.strip_suffix("**")) {
+            t = inner.trim();
+            continue;
+        }
+        if let Some(inner) = t.strip_prefix('*').and_then(|r| r.strip_suffix('*')) {
+            t = inner.trim();
+            continue;
+        }
+        break;
+    }
+    t.to_string()
+}
+
+/// Formats a classified line's already-rendered inline text with its
+/// structural Markdown prefix. `inline_text` must come from rendering
+/// `classify_line`'s returned span slice (the marker-stripped remainder for
+/// a list item), not the original full line.
+pub(crate) fn format_structured_line(role: &LineRole, inline_text: &str) -> String {
+    match role {
+        LineRole::Heading(level) => {
+            let hashes = "#".repeat((*level).clamp(1, 6) as usize);
+            let text = strip_outer_emphasis(inline_text);
+            if text.is_empty() {
+                inline_text.to_string()
+            } else {
+                format!("{hashes} {text}")
+            }
+        }
+        LineRole::List { depth, ordered, ordinal } => {
+            let indent = "  ".repeat(*depth as usize);
+            if *ordered {
+                format!("{indent}{ordinal}. {inline_text}")
+            } else {
+                format!("{indent}- {inline_text}")
+            }
+        }
+        LineRole::Body => inline_text.to_string(),
+    }
 }
 
 /// Build the structured block list for a glyph page in reading order.
@@ -801,5 +1063,302 @@ mod tests {
             span("After", 165.0, (false, false, false)),
         ];
         assert_eq!(render_spans(&line), "**BoldTail** After");
+    }
+}
+
+#[cfg(test)]
+mod structural_tests {
+    use super::*;
+
+    const BODY: f64 = 10.0;
+
+    fn word(text: &str, x: f64, size: f64, bold: bool) -> Span {
+        Span {
+            text: text.to_string(),
+            x,
+            y: 700.0,
+            size,
+            advance: text.len() as f64 * size * 0.6,
+            is_bold: bold,
+            is_italic: false,
+            is_underline: false,
+            is_vertical: false,
+        }
+    }
+
+    fn one_span_line(text: &str, size: f64, bold: bool) -> Vec<Span> {
+        vec![word(text, 100.0, size, bold)]
+    }
+
+    // -- detect_heading_level ------------------------------------------------
+
+    #[test]
+    fn h1_for_a_line_at_1_6x_body() {
+        let line = one_span_line("Chapter One", BODY * 1.6, false);
+        assert_eq!(detect_heading_level(&line, BODY), Some(1));
+    }
+
+    #[test]
+    fn h1_for_a_bold_line_at_1_4x_body() {
+        let line = one_span_line("Chapter One", BODY * 1.4, true);
+        assert_eq!(detect_heading_level(&line, BODY), Some(1));
+    }
+
+    #[test]
+    fn h2_for_a_line_at_1_3x_body() {
+        let line = one_span_line("Section 1.1", BODY * 1.3, false);
+        assert_eq!(detect_heading_level(&line, BODY), Some(2));
+    }
+
+    #[test]
+    fn h3_for_a_bold_line_at_1_15x_body() {
+        let line = one_span_line("Subsection", BODY * 1.15, true);
+        assert_eq!(detect_heading_level(&line, BODY), Some(3));
+    }
+
+    #[test]
+    fn non_bold_line_at_1_15x_body_is_not_a_heading() {
+        // H3 requires bold; size alone at this ratio is not enough.
+        let line = one_span_line("Subsection", BODY * 1.15, false);
+        assert_eq!(detect_heading_level(&line, BODY), None);
+    }
+
+    #[test]
+    fn body_sized_bold_text_is_not_a_heading() {
+        let line = one_span_line("Just a bold word", BODY, true);
+        assert_eq!(detect_heading_level(&line, BODY), None);
+    }
+
+    #[test]
+    fn trailing_period_on_non_alphabetic_content_is_not_a_heading() {
+        // A stray section/page-number fragment (no letters at all) ending in a
+        // full stop — e.g. a ToC dot-leader remnant — must not read as a title
+        // just because it happens to be large.
+        let line = one_span_line("1.2.3.", BODY * 1.6, true);
+        assert_eq!(detect_heading_level(&line, BODY), None);
+    }
+
+    #[test]
+    fn three_or_more_sentences_is_not_a_heading() {
+        // Two internal ". " separators (three sentences) reads as a dense
+        // prose line rather than a title, regardless of size/boldness.
+        let line = one_span_line("One. Two. Three.", BODY * 1.6, true);
+        assert_eq!(detect_heading_level(&line, BODY), None);
+    }
+
+    #[test]
+    fn a_single_sentence_can_still_be_a_heading_when_large_enough() {
+        // Only an all-numeric/symbol trailing period, or 3+ sentences, is
+        // excluded — an ordinary sentence-like heading ending in a period
+        // (e.g. "Chapter 1.") is not penalized just for having a full stop.
+        let line = one_span_line("This is a complete sentence.", BODY * 1.6, true);
+        assert_eq!(detect_heading_level(&line, BODY), Some(1));
+    }
+
+    #[test]
+    fn empty_line_is_not_a_heading() {
+        let line = one_span_line("   ", BODY * 1.6, true);
+        assert_eq!(detect_heading_level(&line, BODY), None);
+    }
+
+    // -- detect_list_marker ---------------------------------------------------
+
+    fn bulleted_line(marker: &str) -> Vec<Span> {
+        vec![
+            word(marker, 100.0, BODY, false),
+            word(" ", 100.0 + marker.len() as f64 * 6.0, BODY, false),
+            word("Item text", 120.0, BODY, false),
+        ]
+    }
+
+    #[test]
+    fn dash_bullet_is_detected_unordered() {
+        let line = bulleted_line("-");
+        let (ordered, skip) = detect_list_marker(&line).expect("must detect bullet");
+        assert!(!ordered);
+        assert_eq!(skip, 2, "marker span + trailing space span skipped");
+    }
+
+    #[test]
+    fn bullet_glyph_variants_are_detected() {
+        for marker in ["•", "●", "◦", "▪", "+", "*"] {
+            let line = bulleted_line(marker);
+            assert!(
+                detect_list_marker(&line).is_some(),
+                "expected {marker:?} to be recognized as a bullet"
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_dot_marker_is_detected() {
+        let line = bulleted_line("1.");
+        let (ordered, _) = detect_list_marker(&line).expect("must detect ordered marker");
+        assert!(ordered);
+    }
+
+    #[test]
+    fn ordered_paren_marker_is_detected() {
+        let line = bulleted_line("2)");
+        let (ordered, _) = detect_list_marker(&line).expect("must detect ordered marker");
+        assert!(ordered);
+    }
+
+    #[test]
+    fn checkbox_marker_is_unordered_and_keeps_text() {
+        let line = vec![
+            word("[ ]", 100.0, BODY, false),
+            word(" ", 118.0, BODY, false),
+            word("Task", 124.0, BODY, false),
+        ];
+        let (ordered, skip) = detect_list_marker(&line).expect("must detect checkbox");
+        assert!(!ordered);
+        assert_eq!(skip, 0, "checkbox itself stays in the rendered text");
+    }
+
+    #[test]
+    fn plain_prose_line_has_no_list_marker() {
+        let line = one_span_line("This is a normal paragraph.", BODY, false);
+        assert!(detect_list_marker(&line).is_none());
+    }
+
+    #[test]
+    fn lone_marker_with_no_item_text_is_not_a_list_item() {
+        let line = vec![word("-", 100.0, BODY, false)];
+        assert!(detect_list_marker(&line).is_none());
+    }
+
+    // -- classify_line / ListRunState -----------------------------------------
+
+    #[test]
+    fn classify_line_promotes_heading_and_ends_list_run() {
+        let mut state = ListRunState::default();
+        // Start a list run first.
+        let item = bulleted_line("-");
+        let (role, _) = classify_line(&item, BODY, &mut state);
+        assert!(matches!(role, LineRole::List { .. }));
+
+        // A heading line must end the run rather than being treated as list depth.
+        let heading = one_span_line("A Real Heading", BODY * 1.6, false);
+        let (role, _) = classify_line(&heading, BODY, &mut state);
+        assert!(matches!(role, LineRole::Heading(1)));
+
+        // The next list item starts a *fresh* run (ordinal resets to 1), proving
+        // the heading actually cleared state rather than just being skipped.
+        let item2 = bulleted_line("1.");
+        let (role, _) = classify_line(&item2, BODY, &mut state);
+        match role {
+            LineRole::List { ordinal, .. } => assert_eq!(ordinal, 1),
+            other => panic!("expected a fresh list run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn consecutive_ordered_items_number_sequentially() {
+        let mut state = ListRunState::default();
+        let mut ordinals = Vec::new();
+        for _ in 0..3 {
+            let item = bulleted_line("1.");
+            let (role, _) = classify_line(&item, BODY, &mut state);
+            if let LineRole::List { ordinal, .. } = role {
+                ordinals.push(ordinal);
+            }
+        }
+        assert_eq!(ordinals, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn deeper_indent_increases_depth() {
+        let mut state = ListRunState::default();
+        let shallow = vec![
+            word("-", 100.0, BODY, false),
+            word(" ", 106.0, BODY, false),
+            word("Top level", 112.0, BODY, false),
+        ];
+        let (role, _) = classify_line(&shallow, BODY, &mut state);
+        let shallow_depth = match role {
+            LineRole::List { depth, .. } => depth,
+            _ => panic!("expected a list item"),
+        };
+
+        let nested = vec![
+            word("-", 100.0 + 3.0 * BODY, BODY, false), // indented ~2 depth-units right
+            word(" ", 106.0 + 3.0 * BODY, BODY, false),
+            word("Nested", 112.0 + 3.0 * BODY, BODY, false),
+        ];
+        let (role, _) = classify_line(&nested, BODY, &mut state);
+        let nested_depth = match role {
+            LineRole::List { depth, .. } => depth,
+            _ => panic!("expected a list item"),
+        };
+
+        assert_eq!(shallow_depth, 0);
+        assert!(nested_depth > shallow_depth, "indented item must report a deeper depth");
+    }
+
+    // -- format_structured_line / strip_outer_emphasis -------------------------
+
+    #[test]
+    fn heading_strips_redundant_outer_bold() {
+        let out = format_structured_line(&LineRole::Heading(2), "**Section Title**");
+        assert_eq!(out, "## Section Title");
+    }
+
+    #[test]
+    fn heading_with_no_emphasis_is_unchanged() {
+        let out = format_structured_line(&LineRole::Heading(1), "Plain Title");
+        assert_eq!(out, "# Plain Title");
+    }
+
+    #[test]
+    fn unordered_list_item_gets_dash_prefix() {
+        let out = format_structured_line(
+            &LineRole::List { depth: 0, ordered: false, ordinal: 1 },
+            "Item text",
+        );
+        assert_eq!(out, "- Item text");
+    }
+
+    #[test]
+    fn ordered_list_item_gets_numbered_prefix() {
+        let out = format_structured_line(
+            &LineRole::List { depth: 0, ordered: true, ordinal: 3 },
+            "Third item",
+        );
+        assert_eq!(out, "3. Third item");
+    }
+
+    #[test]
+    fn nested_list_item_is_indented() {
+        let out = format_structured_line(
+            &LineRole::List { depth: 2, ordered: false, ordinal: 1 },
+            "Deep item",
+        );
+        assert_eq!(out, "    - Deep item");
+    }
+
+    #[test]
+    fn body_role_passes_text_through_unchanged() {
+        let out = format_structured_line(&LineRole::Body, "Just a paragraph.");
+        assert_eq!(out, "Just a paragraph.");
+    }
+
+    // -- end-to-end: render_cluster now emits structural Markdown --------------
+
+    #[test]
+    fn render_cluster_emits_heading_and_list_markdown() {
+        let lines = vec![
+            one_span_line("Document Title", 20.0, false), // body ~10 -> 2.0x -> H1
+            one_span_line("First paragraph of body text.", 10.0, false),
+            bulleted_line("-"),
+            bulleted_line("-"),
+        ];
+        let md = render_cluster(&lines);
+        assert!(md.contains("# Document Title"), "got:\n{md}");
+        assert!(md.contains("- Item text"), "got:\n{md}");
+        assert!(
+            !md.contains("**Document Title**"),
+            "heading text must not be redundantly bold-wrapped, got:\n{md}"
+        );
     }
 }

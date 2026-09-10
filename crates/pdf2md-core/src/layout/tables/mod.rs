@@ -15,7 +15,9 @@ pub use borderless::extract_borderless_tables;
 pub use rulers::{find_gap_tables, find_tables, scan_aligned_grids, table_rulers, RowInfo, TableHit, WordTok};
 
 use crate::layout::glyph_stream::Span;
-use crate::layout::reading_order::render_spans;
+use crate::layout::reading_order::{
+    body_size_for, classify_line, format_structured_line, render_spans, ListRunState,
+};
 use crate::models::CanvasTable;
 
 /// Collapse duplicate / overlapping table candidates for a page into a
@@ -50,15 +52,21 @@ pub fn render_with_tables(lines: &[Vec<Span>], tables: &[TableHit]) -> String {
     let mut prev_line_y: Option<f64> = None;
     let tables = de_overlap_tables(tables);
     let mut t = 0usize;
+    let body_size = body_size_for(lines);
+    let mut list_state = ListRunState::default();
 
-    let push_line = |out: &mut String, line: &[Span], prev_line_y: &mut Option<f64>| {
+    let push_line = |out: &mut String,
+                      line: &[Span],
+                      prev_line_y: &mut Option<f64>,
+                      list_state: &mut ListRunState| {
         let size = line[0].size.max(0.1);
         if let Some(py) = *prev_line_y {
             if py - line[0].y > 2.0 * size {
                 out.push('\n');
             }
         }
-        out.push_str(render_spans(line).trim_end());
+        let (role, render_slice) = classify_line(line, body_size, list_state);
+        out.push_str(format_structured_line(&role, &render_spans(render_slice)).trim_end());
         out.push('\n');
         *prev_line_y = Some(line[0].y);
     };
@@ -94,11 +102,12 @@ pub fn render_with_tables(lines: &[Vec<Span>], tables: &[TableHit]) -> String {
             }
             out.push('\n'); // blank line after the table
             prev_line_y = Some(lines[hit.end][0].y);
+            list_state = ListRunState::default(); // a table interrupts any list run
             t += 1;
             i = hit.end + 1; // skip the table's own lines
             continue;
         }
-        push_line(&mut out, &lines[i], &mut prev_line_y);
+        push_line(&mut out, &lines[i], &mut prev_line_y, &mut list_state);
         i += 1;
     }
 

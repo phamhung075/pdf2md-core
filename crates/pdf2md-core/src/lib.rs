@@ -689,6 +689,15 @@ pub fn convert_pdf_bytes_to_markdown(
                         .unwrap_or_else(|| b.text.lines().next().unwrap_or(&b.text).trim());
                     if !search_key.is_empty() {
                         if let Some(mut pos) = processed_text.find(search_key) {
+                            // `search_key` is plain block text (from
+                            // build_doc_blocks) with no structural prefix, so a
+                            // match can land mid-line — e.g. after the "# "/
+                            // "- "/"1. " a heading/list line now carries. Snap
+                            // back to the start of that line so the image is
+                            // never spliced into the middle of a marker,
+                            // orphaning it as a bare "#" with nothing after.
+                            let line_start = processed_text[..pos].rfind('\n').map_or(0, |i| i + 1);
+                            pos = line_start;
                             let (t_start, t_end) = find_table_boundaries(&processed_text, pos);
                             if t_start != t_end {
                                 pos = t_end;
@@ -1027,6 +1036,37 @@ mod regression_tests {
                 md.contains("width=") && md.contains("%\""),
                 "embedded image must carry a percent width attribute"
             );
+        }
+    }
+
+    #[test]
+    fn image_insertion_never_splits_a_structural_prefix() {
+        // Regression test for a real bug R7 exposed: the figure-insertion pass
+        // finds an insertion point by searching for a block's plain text (no
+        // "#"/"-"/"1. " prefix) inside the already-rendered markdown. Once
+        // headings/lists gained real Markdown prefixes, a match could land
+        // mid-line — right after the "# " — splicing the image in between and
+        // leaving an orphaned "# " with nothing after it, and the heading's own
+        // text stranded, unprefixed, below the image. The fix snaps the
+        // insertion point back to the start of the matched line.
+        let pdf_path = "../../../scratch/tests/fixtures/billet_electronique.pdf";
+        if let Ok(bytes) = std::fs::read(pdf_path) {
+            let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default()).unwrap();
+            let md = &res.markdown;
+            for line in md.lines() {
+                let trimmed = line.trim_end();
+                let after_hashes = trimmed.trim_start_matches('#');
+                if after_hashes.len() == trimmed.len() {
+                    continue; // doesn't start with '#' — not a heading line
+                }
+                // A line starting with one or more '#' must be a real heading
+                // marker (space then non-empty text), never a bare "#"/"##"
+                // run with nothing — or only whitespace — after it.
+                assert!(
+                    after_hashes.starts_with(' ') && !after_hashes.trim().is_empty(),
+                    "heading marker with no text after it: {trimmed:?}\nfull markdown:\n{md}"
+                );
+            }
         }
     }
 

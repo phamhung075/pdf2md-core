@@ -580,6 +580,7 @@ fn render_math_stream(
     bars: &[RuleSeg],
     page_height: f64,
     drop_furniture: bool,
+    body_size: f64,
 ) -> String {
     let mut fractions = detect_fractions(stream, bars);
     fractions.extend(detect_stacked_fractions(stream));
@@ -605,8 +606,11 @@ fn render_math_stream(
         skip[s.script_line] = true;
     }
 
+    use crate::layout::reading_order::{classify_line, format_structured_line, ListRunState};
+
     let mut out = String::new();
     let mut prev_y: Option<f64> = None;
+    let mut list_state = ListRunState::default();
 
     for (i, line) in stream.iter().enumerate() {
         if drop_furniture && crate::layout::reading_order::is_page_number_line(line, page_height) {
@@ -622,10 +626,14 @@ fn render_math_stream(
                 out.push('\n');
             }
         }
+        // Classification runs on the original line geometry regardless of a
+        // fraction/script replacement — those substitutions target formula
+        // content, which is never itself a heading or list marker.
+        let (role, render_slice) = classify_line(line, body_size, &mut list_state);
         let text = replacement[i]
             .take()
-            .unwrap_or_else(|| render_math_line(line));
-        out.push_str(text.trim_end());
+            .unwrap_or_else(|| render_math_line(render_slice));
+        out.push_str(&format_structured_line(&role, text.trim_end()));
         out.push('\n');
         prev_y = Some(line.first().map(|s| s.y).unwrap_or(0.0));
     }
@@ -643,16 +651,17 @@ pub fn render_math(
     page_height: f64,
     drop_furniture: bool,
 ) -> String {
+    let body_size = crate::layout::reading_order::body_size_for(lines);
     let streams = crate::layout::reading_order::page_read_order(lines);
     if streams.len() == 1 {
-        return render_math_stream(&streams[0], bars, page_height, drop_furniture);
+        return render_math_stream(&streams[0], bars, page_height, drop_furniture, body_size);
     }
     let mut out = String::new();
     for (ci, stream) in streams.iter().enumerate() {
         if ci > 0 && !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(&render_math_stream(stream, bars, page_height, drop_furniture));
+        out.push_str(&render_math_stream(stream, bars, page_height, drop_furniture, body_size));
     }
     out.trim_end().to_string()
 }
