@@ -948,6 +948,23 @@ mod regression_tests {
             assert!(md.contains("NOUS CONTACTER"), "Must extract 'NOUS CONTACTER' header");
             assert!(md.contains("5 002 674 443"), "Must extract client number");
 
+            // 2b. Regression test for a real bug: this document has zero
+            // genuine built-up fractions, but before the is_fraction_bar /
+            // detect_stacked_fractions fixes, a decorative rule under "NOUS
+            // CONTACTER" (misread as a fraction bar between it and the
+            // unrelated "N° client" line below) and a vertical reference-
+            // number strip near "Nimes, le 19 mai 2026" (misread as a long
+            // chain of stacked fractions, one digit per pseudo-fraction)
+            // both produced spurious `\frac{...}{...}` output. The
+            // `md.contains("NOUS CONTACTER")` check above alone would not
+            // have caught this — that substring survives fine inside
+            // `$\frac{NOUS CONTACTER}{...}$` too.
+            assert!(
+                !res.markdown.contains(r"\frac{"),
+                "this document has no genuine built-up fractions; any \\frac{{}} is a false positive:\n{}",
+                res.markdown
+            );
+
             // 3. French diacritics & elision preservation
             assert!(md.contains("d'électricité") || md.contains("d’électricité"), "Must preserve elision in 'd'électricité'");
             assert!(md.contains("Médiateur"), "Must preserve French accent in 'Médiateur'");

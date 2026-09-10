@@ -467,8 +467,36 @@ fn is_fraction_bar(line: RuleSeg, num_line: &[Span], den_line: &[Span]) -> bool 
         .fold(f64::NEG_INFINITY, f64::max)
         .max(0.1);
 
-    // A fraction bar must be a short rule (not a full-width divider).
-    if bar_w <= 0.0 {
+    // A fraction bar must be a short rule (not a full-width divider). The
+    // comment above always said so, but nothing actually checked it — only
+    // `bar_w <= 0.0` was rejected, so any rule of any length overlapping
+    // >= 50% of the (possibly much narrower) numerator/denominator passed.
+    // Measured against a real false-positive case (a decorative rule under
+    // an invoice's "NOUS CONTACTER" heading, separating it from an unrelated
+    // "N° client" line below — bar/content width ratio 1.68), bar-width
+    // proportionality turned out not to discriminate at all: real
+    // false-positive ratios there ranged 0.90-3.32, which fully overlaps a
+    // legitimate single-digit fraction's ratio (this file's own
+    // `detects_built_up_fraction_across_lines` test is 4.0). Width is kept
+    // only as a generous backstop against a truly pathological case (a
+    // page-spanning rule); the actual fix is the numerator/denominator
+    // length cap below.
+    let content_w = (nx1 - nx0).max(dx1 - dx0).max(0.1);
+    if bar_w <= 0.0 || bar_w > 6.0 * content_w {
+        return false;
+    }
+    // A real fraction's numerator/denominator is short (digits, a variable,
+    // maybe an operator) — never a phrase or sentence. This is the actual
+    // signal that separates a genuine fraction from two unrelated lines
+    // that happen to have *some* rule between them (a section divider, a box
+    // border): every false positive found on that same invoice had a
+    // numerator or denominator of 14+ characters, often a full sentence.
+    // `detect_stacked_fractions` (the bar-less sibling detector) already
+    // enforces this; `detect_fractions` never did.
+    const MAX_FRACTION_TEXT_CHARS: usize = 6;
+    let num_len = render_cell_plain(num_line).trim().chars().count();
+    let den_len = render_cell_plain(den_line).trim().chars().count();
+    if num_len == 0 || den_len == 0 || num_len > MAX_FRACTION_TEXT_CHARS || den_len > MAX_FRACTION_TEXT_CHARS {
         return false;
     }
     // The bar must be horizontally near the numerator/denominator (centred),
@@ -584,6 +612,7 @@ fn render_math_stream(
 ) -> String {
     let mut fractions = detect_fractions(stream, bars);
     fractions.extend(detect_stacked_fractions(stream));
+    let fractions = reject_dense_fraction_clusters(fractions);
     let scripts = detect_scripts_cross_line(stream);
 
     let mut replacement: Vec<Option<String>> = vec![None; stream.len()];
@@ -858,7 +887,12 @@ fn detect_stacked_fractions(stream: &[Vec<Span>]) -> Vec<FractionHit> {
         }
         let n_text = render_cell_plain(num);
         let d_text = render_cell_plain(den);
-        if n_text.chars().count() > 6 || d_text.chars().count() > 6 {
+        let n_len = n_text.trim().chars().count();
+        let d_len = d_text.trim().chars().count();
+        // A non-empty `Vec<Span>` line can still be entirely whitespace glyphs
+        // (spacing/underline decoration); reject those too, not just
+        // over-long ones, or a blank line pair renders as an empty `$\frac{}{}$`.
+        if n_len == 0 || d_len == 0 || n_len > 6 || d_len > 6 {
             continue;
         }
         let (nx0, _, nx1, _) = line_bbox(num);
@@ -886,6 +920,51 @@ fn detect_stacked_fractions(stream: &[Vec<Span>]) -> Vec<FractionHit> {
 /// (or numerator) line with `$...$` and skipping the consumed script/denominator
 /// line. Lines with no detected math fall back to `fallback(i, line)` so the
 /// caller can keep the original text for plain content.
+/// Discards fraction hits that are part of a dense run of 3+ closely-spaced
+/// hits — the geometric signature of a vertical reference-number/barcode
+/// strip (a French invoice's account or tracking number, printed as one
+/// short line per character/digit-pair) rather than actual math. Each
+/// adjacent pair in such a strip coincidentally satisfies every check a
+/// real 2-line built-up fraction also has to pass — tight vertical spacing,
+/// near-equal size, narrow width, horizontally centred — because the strip
+/// itself *is* a tight vertical stack of narrow, centred, similar-size
+/// lines. The one thing that tells them apart is repetition: a real
+/// document essentially never has 3+ fractions stacked back-to-back with
+/// only a line or two of gap between them; that pattern is the
+/// reference-number artifact. Runs shorter than 3 (an isolated fraction, or
+/// two unrelated fractions that happen to land near each other) are left
+/// alone.
+fn reject_dense_fraction_clusters(mut hits: Vec<FractionHit>) -> Vec<FractionHit> {
+    const CLUSTER_GAP: usize = 4;
+    const MIN_CLUSTER_LEN: usize = 3;
+    if hits.len() < MIN_CLUSTER_LEN {
+        return hits;
+    }
+
+    hits.sort_by_key(|h| h.numerator_line);
+    let mut keep = vec![true; hits.len()];
+    let mut run_start = 0usize;
+    for i in 1..hits.len() {
+        let gap = hits[i]
+            .numerator_line
+            .saturating_sub(hits[i - 1].denominator_line);
+        if gap > CLUSTER_GAP {
+            if i - run_start >= MIN_CLUSTER_LEN {
+                keep[run_start..i].iter_mut().for_each(|k| *k = false);
+            }
+            run_start = i;
+        }
+    }
+    if hits.len() - run_start >= MIN_CLUSTER_LEN {
+        keep[run_start..].iter_mut().for_each(|k| *k = false);
+    }
+
+    hits.into_iter()
+        .zip(keep)
+        .filter_map(|(h, k)| k.then_some(h))
+        .collect()
+}
+
 fn synthesize_stream_text_joined<F: Fn(usize, &[Span]) -> String>(
     stream: &[Vec<Span>],
     bars: &[RuleSeg],
@@ -894,6 +973,7 @@ fn synthesize_stream_text_joined<F: Fn(usize, &[Span]) -> String>(
 ) -> String {
     let mut hits = detect_fractions(stream, bars);
     hits.extend(detect_stacked_fractions(stream));
+    let hits = reject_dense_fraction_clusters(hits);
     let scripts = detect_scripts_cross_line(stream);
 
     let mut replacement: Vec<Option<String>> = vec![None; stream.len()];
@@ -1131,6 +1211,109 @@ mod tests {
         // A bar that is not vertically between the two runs.
         let bars: Vec<RuleSeg> = vec![(700.0, 150.0, 170.0)];
         assert!(detect_fractions(&stream, &bars).is_empty());
+    }
+
+    // Regression tests for a real bug found on a French utility invoice: a
+    // decorative rule under a "NOUS CONTACTER" heading, separating it from
+    // an unrelated "N° client : ..." line below, was read as a fraction bar
+    // — width-ratio alone (1.68, well inside what a legitimate fraction's
+    // bar/content ratio looks like) could not tell them apart. The real
+    // signal is that a fraction's numerator/denominator is short; a phrase
+    // or sentence never is.
+
+    #[test]
+    fn fraction_bar_rejects_a_long_phrase_numerator_even_at_a_plausible_width_ratio() {
+        let stream = vec![
+            // A short heading-like phrase, 14 chars — same shape as the real
+            // "NOUS CONTACTER" false positive.
+            vec![span("SOME HEADING12", 100.0, 715.0, 8.0, 90.0)],
+            vec![span("42", 100.0, 701.0, 8.0, 90.0)],
+        ];
+        // bar_w=100 vs content_w=90 -> ratio 1.11, comfortably inside a
+        // legitimate fraction's range; only the text-length check can catch this.
+        let bars: Vec<RuleSeg> = vec![(708.0, 100.0, 200.0)];
+        assert!(
+            detect_fractions(&stream, &bars).is_empty(),
+            "a 14-char phrase numerator must never be read as a fraction, regardless of bar width ratio"
+        );
+    }
+
+    #[test]
+    fn fraction_bar_rejects_a_long_phrase_denominator_too() {
+        let stream = vec![
+            vec![span("42", 100.0, 715.0, 8.0, 15.0)],
+            vec![span("An unrelated line", 100.0, 701.0, 8.0, 130.0)],
+        ];
+        let bars: Vec<RuleSeg> = vec![(708.0, 100.0, 150.0)];
+        assert!(detect_fractions(&stream, &bars).is_empty());
+    }
+
+    #[test]
+    fn fraction_bar_rejects_empty_or_whitespace_only_lines() {
+        // A non-empty Vec<Span> that is entirely whitespace glyphs (spacing/
+        // underline decoration) must not produce an empty `$\frac{}{}$`.
+        let stream = vec![
+            vec![span("  ", 150.0, 715.0, 8.0, 10.0)],
+            vec![span(" ", 150.0, 701.0, 8.0, 10.0)],
+        ];
+        let bars: Vec<RuleSeg> = vec![(708.0, 150.0, 170.0)];
+        assert!(detect_fractions(&stream, &bars).is_empty());
+    }
+
+    #[test]
+    fn stacked_fraction_rejects_empty_or_whitespace_only_lines() {
+        let stream = vec![
+            vec![span("  ", 150.0, 715.0, 8.0, 10.0)],
+            vec![span(" ", 150.0, 704.0, 8.0, 10.0)],
+        ];
+        assert!(detect_stacked_fractions(&stream).is_empty());
+    }
+
+    #[test]
+    fn dense_fraction_cluster_is_rejected_but_isolated_hits_survive() {
+        // Simulates the vertical reference-number strip: many tightly-packed
+        // fraction-shaped hits in a row (indices 0..=7) must all be
+        // discarded, while a single isolated hit far below (index 40/41)
+        // must survive untouched.
+        let cluster: Vec<FractionHit> = (0..4)
+            .map(|k| FractionHit {
+                numerator_line: k * 2,
+                denominator_line: k * 2 + 1,
+                expr: LatexExpr::fraction(LatexExpr::text("a"), LatexExpr::text("b")),
+            })
+            .collect();
+        let isolated = FractionHit {
+            numerator_line: 40,
+            denominator_line: 41,
+            expr: LatexExpr::fraction(LatexExpr::text("1"), LatexExpr::text("2")),
+        };
+        let mut hits = cluster;
+        hits.push(isolated.clone());
+
+        let kept = reject_dense_fraction_clusters(hits);
+        assert_eq!(kept.len(), 1, "the dense 4-hit cluster must be fully discarded: {kept:?}");
+        assert_eq!(kept[0].numerator_line, 40);
+        assert_eq!(kept[0].expr.to_latex(), isolated.expr.to_latex());
+    }
+
+    #[test]
+    fn two_isolated_fractions_are_both_kept() {
+        // Below the 3-hit cluster threshold and far apart — a real document
+        // with two unrelated formulas must not lose either one.
+        let hits = vec![
+            FractionHit {
+                numerator_line: 0,
+                denominator_line: 1,
+                expr: LatexExpr::fraction(LatexExpr::text("1"), LatexExpr::text("2")),
+            },
+            FractionHit {
+                numerator_line: 30,
+                denominator_line: 31,
+                expr: LatexExpr::fraction(LatexExpr::text("x"), LatexExpr::text("y")),
+            },
+        ];
+        let kept = reject_dense_fraction_clusters(hits);
+        assert_eq!(kept.len(), 2, "isolated fractions below the cluster-size threshold must survive: {kept:?}");
     }
 
     #[test]
