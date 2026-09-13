@@ -149,6 +149,17 @@ fn cluster_positions(mut points: Vec<(f64, usize)>, tol: f64) -> Vec<f64> {
 /// pruning can only remove spurious rulers; it never removes a ruler from a
 /// table that the caller would already accept (such tables already pass the
 /// same straddle test for every interior ruler).
+///
+/// A row that has no column-like spacing of its own — every one of its words
+/// sits within one ordinary word-space of the next, i.e. it reads as a single
+/// flowing sentence rather than separate cells — is exempt from vetoing any
+/// ruler this way (see `row_straddles`). Such a row is typically a wrapped
+/// continuation of a multi-line description (e.g. "Période de 01/12/2018 au
+/// 31/12/2018" following an item row with real numeric columns): it has no
+/// aligned cells of its own, so it says nothing about where the table's real
+/// column boundaries are, and letting it veto every candidate — as a naive
+/// straddle check would — silently drops the whole table to plain text even
+/// though every numeric row agrees on the columns.
 pub fn table_rulers(info: &[RowInfo], tol: f64, lo: usize, hi: usize, min_gutter: f64) -> Vec<f64> {
     let num_rows = hi - lo + 1;
     if num_rows < 2 {
@@ -175,15 +186,10 @@ pub fn table_rulers(info: &[RowInfo], tol: f64, lo: usize, hi: usize, min_gutter
     let rulers: Vec<f64> = candidates
         .into_iter()
         // Drop "rulers" that are actually interior word-starts/ends of one
-        // cell: a column boundary is never straddled by text in any row.
-        .filter(|&x| {
-            (lo..=hi).all(|ri| {
-                !info[ri]
-                    .words
-                    .iter()
-                    .any(|w| w.x0 < x - tol && w.x1 > x + tol)
-            })
-        })
+        // cell: a column boundary is never straddled by text in any row that
+        // itself shows genuine column-like spacing (prose-only continuation
+        // rows are exempt — see `row_straddles`).
+        .filter(|&x| (lo..=hi).all(|ri| !row_straddles(&info[ri], x, tol, min_gutter)))
         .collect();
 
     let mut merged: Vec<f64> = Vec::new();
@@ -205,6 +211,30 @@ pub fn table_rulers(info: &[RowInfo], tol: f64, lo: usize, hi: usize, min_gutter
 /// signal is its aligned right edge.
 fn row_matches_ruler(row: &RowInfo, r: f64, tol: f64) -> bool {
     row.starts.iter().any(|&s| (r - s).abs() <= tol) || row.ends.iter().any(|&e| (r - e).abs() <= tol)
+}
+
+/// Whether `words` (in left-to-right order) shows any column-like internal
+/// spacing of its own — i.e. at least one gap between consecutive words is at
+/// least `min_gutter`. A row where every word sits within ordinary
+/// word-spacing of the next reads as one flowing sentence, not separate
+/// cells.
+fn row_has_internal_gutter(words: &[WordTok], min_gutter: f64) -> bool {
+    words.windows(2).any(|p| p[1].x0 - p[0].x1 >= min_gutter)
+}
+
+/// Whether row `row` straddles ruler `x` (a word starts strictly left of it
+/// and ends strictly right of it) in a way that should veto `x` as a column
+/// boundary. A row with no column-like spacing of its own (see
+/// `row_has_internal_gutter`) is exempt: it is typically a wrapped
+/// continuation line of a multi-line description with no aligned cells of
+/// its own, so it cannot testify about where the table's real columns are —
+/// letting it veto rulers that every numeric row agrees on would silently
+/// drop the whole table to plain text.
+fn row_straddles(row: &RowInfo, x: f64, tol: f64, min_gutter: f64) -> bool {
+    if !row_has_internal_gutter(&row.words, min_gutter) {
+        return false;
+    }
+    row.words.iter().any(|w| w.x0 < x - tol && w.x1 > x + tol)
 }
 
 /// Diagnostic tracer: prints when TABLE_TRACE env is set.
@@ -291,31 +321,80 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
                 .collect::<Vec<_>>()
                 .join(" | ")
         ));
+        // A genuine two-row seed doesn't have to be two *adjacent* lines: a
+        // multi-line item description commonly wraps onto its own
+        // continuation row(s) between one numeric data row and the next
+        // (e.g. an invoice line item followed by "Période de 01/12/2018 au
+        // 31/12/2018" before the next item), and that continuation row
+        // shares no column position with either data row at all — it isn't
+        // pruned by `row_straddles`, it simply contributes nothing to
+        // `cluster_positions`. Trying only `hi = lo + 1` therefore never
+        // finds a seed once real data rows are separated by such filler, and
+        // the whole table silently falls back to plain text. Search forward
+        // from `lo` for the nearest row that *does* share >= 2 rulers with
+        // it, skipping over non-participating rows in between (capped, so a
+        // page with no real table nearby doesn't pay for an unbounded scan).
+        const MAX_SEED_LOOKAHEAD: usize = 12;
         let mut lo = 0usize;
         while lo < band.len() {
             if lo + 1 >= band.len() {
                 break;
             }
-            let max_size = band[lo..=lo + 1]
+            let hi_limit = band.len().min(lo + 1 + MAX_SEED_LOOKAHEAD);
+            let mut found: Option<(usize, Vec<f64>, usize, usize)> = None;
+            for hi in (lo + 1)..hi_limit {
+                // Only skip PAST a row that has no column-like spacing of its
+                // own (a filler/continuation line — see `row_has_internal_gutter`).
+                // A row that DOES look like its own data row (multiple
+                // cell-like gaps) but merely missed strict tolerance (e.g. a
+                // few tenths of a point of jitter) must not be leapfrogged:
+                // that's exactly the case the separate, looser stage-3b pass
+                // (`find_gap_tables`) exists to recover on its own tolerance,
+                // and skipping past it here would let the strict pass
+                // absorb jittered grids it is deliberately too tight to see.
+                if hi > lo + 1 {
+                    let mid = hi - 1;
+                    let mid_size = info[band[mid]].size;
+                    let mid_gutter = (1.1 * mid_size).max(6.0);
+                    if row_has_internal_gutter(&info[band[mid]].words, mid_gutter) {
+                        break;
+                    }
+                }
+                let max_size = [band[lo], band[hi]]
+                    .iter()
+                    .map(|&i| info[i].size)
+                    .fold(0.0f64, f64::max);
+                let min_gutter = (1.1 * max_size).max(6.0);
+                let rulers = table_rulers(&info, tol, band[lo], band[hi], min_gutter);
+                let match_lo = rulers.iter().filter(|&&r| row_matches_ruler(&info[band[lo]], r, tol * 1.5)).count();
+                let match_hi = rulers.iter().filter(|&&r| row_matches_ruler(&info[band[hi]], r, tol * 1.5)).count();
+                if rulers.len() >= 2 && match_lo >= 2 && match_hi >= 2 {
+                    found = Some((hi, rulers, match_lo, match_hi));
+                    break;
+                }
+            }
+            let (mut hi, mut rulers, match_lo, match_hi) = match found {
+                Some(f) => f,
+                None => {
+                    t(&format!(
+                        "  REJECT at lo={} (line {} '{}'): no seed hi within lookahead [seed check]",
+                        lo, band[lo], line_text(&lines[band[lo]])
+                    ));
+                    lo += 1;
+                    continue;
+                }
+            };
+            t(&format!(
+                "  SEED lo={} (line {} '{}') hi={} (line {} '{}'): rulers={:?} match_lo={} match_hi={}",
+                lo, band[lo], line_text(&lines[band[lo]]),
+                hi, band[hi], line_text(&lines[band[hi]]),
+                rulers, match_lo, match_hi
+            ));
+            let max_size = [band[lo], band[hi]]
                 .iter()
                 .map(|&i| info[i].size)
                 .fold(0.0f64, f64::max);
             let min_gutter = (1.1 * max_size).max(6.0);
-            let mut hi = lo + 1;
-            let mut rulers = table_rulers(&info, tol, band[lo], band[hi], min_gutter);
-            // Verify that the seed rows (lo and hi) both match at least 2 column rulers
-            let match_lo = rulers.iter().filter(|&&r| row_matches_ruler(&info[band[lo]], r, tol * 1.5)).count();
-            let match_hi = rulers.iter().filter(|&&r| row_matches_ruler(&info[band[hi]], r, tol * 1.5)).count();
-            if rulers.len() < 2 || match_lo < 2 || match_hi < 2 {
-                t(&format!(
-                    "  REJECT at lo={} (line {} '{}') seed hi={} (line {} '{}'): rulers={:?} match_lo={} match_hi={} [seed check]",
-                    lo, band[lo], line_text(&lines[band[lo]]),
-                    hi, band[hi], line_text(&lines[band[hi]]),
-                    rulers, match_lo, match_hi
-                ));
-                lo += 1;
-                continue;
-            }
             while hi + 1 < band.len() && rulers.len() >= 2 {
                 let next_ri = band[hi + 1];
                 let next_r = table_rulers(&info, tol, band[lo], next_ri, min_gutter);
@@ -327,9 +406,24 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
                 }
                 // Single-column continuation row (e.g. wrapped airport name in a multi-line cell)
                 if next_match == 1 {
-                    let straddles = info[next_ri].words.iter().any(|w| {
-                        rulers[1..].iter().any(|&r| w.x0 < r - tol && w.x1 > r + tol)
-                    });
+                    // Deliberately the strict (non-exempted) straddle check
+                    // here, unlike `table_rulers`'s own filter and the final
+                    // window gate below: this decides whether to keep
+                    // GROWING the table past its current end, and the
+                    // prose-only exemption exists to stop a *filler row
+                    // inside an already-bounded window* from vetoing the
+                    // table's rulers — not to let arbitrary trailing prose
+                    // (e.g. a legal disclaimer paragraph after the table)
+                    // get annexed as one more "continuation" row just
+                    // because it has no internal gutter of its own.
+                    let straddles = rulers[1..]
+                        .iter()
+                        .any(|&r| {
+                            info[next_ri]
+                                .words
+                                .iter()
+                                .any(|w| w.x0 < r - tol && w.x1 > r + tol)
+                        });
                     if !straddles {
                         let has_future_match = (hi + 2..band.len().min(hi + 4)).any(|fut_idx| {
                             let fut_ri = band[fut_idx];
@@ -359,11 +453,12 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
                 rulers
             ));
 
-            // No indivisible word can straddle an interior column ruler.
+            // No indivisible word can straddle an interior column ruler,
+            // except in a prose-only continuation row (see `row_straddles`).
             let has_straddling_word = win_rows.iter().any(|&ri| {
-                info[ri].words.iter().any(|w| {
-                    rulers[1..].iter().any(|&r| w.x0 < r - tol && w.x1 > r + tol)
-                })
+                rulers[1..]
+                    .iter()
+                    .any(|&r| row_straddles(&info[ri], r, tol, min_gutter))
             });
             if has_straddling_word {
                 t(&format!(

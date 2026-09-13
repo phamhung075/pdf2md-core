@@ -362,7 +362,346 @@ pub fn page_read_order(lines: &[Vec<Span>]) -> Vec<Vec<Vec<Span>>> {
         }
         return streams;
     }
+    // `page_two_columns` only recognizes a page that is two-column under ONE
+    // consistent gutter for its entire height. Real business documents often
+    // change layout partway down (e.g. a seller/buyer two-column header block,
+    // a full-width item table, then a differently-positioned two-column
+    // footer block with bank details) — no single global gutter fits all of
+    // that, so the whole-page detector bails out and the page fell back to
+    // one linear top-to-bottom stream, weaving unrelated columns together
+    // line-by-line. `detect_column_bands` recovers each such block
+    // independently instead of requiring one page-wide layout.
+    let bands = detect_column_bands(lines);
+    if bands.len() > 1 || matches!(bands.first(), Some(ColumnBand::Columns { .. })) {
+        let mut streams = Vec::new();
+        for band in bands {
+            match band {
+                ColumnBand::Full(rows) => streams.push(rows),
+                ColumnBand::Columns { left, right } => {
+                    streams.push(left);
+                    streams.push(right);
+                }
+            }
+        }
+        return streams;
+    }
     vec![lines.to_vec()]
+}
+
+/// One contiguous block of a page's reading order, as recovered by
+/// `detect_column_bands`.
+pub enum ColumnBand {
+    /// Full-width lines in their natural top-to-bottom order.
+    Full(Vec<Vec<Span>>),
+    /// A genuine two-column block, already resolved into independent
+    /// top-to-bottom streams for the left and right sides.
+    Columns {
+        left: Vec<Vec<Span>>,
+        right: Vec<Vec<Span>>,
+    },
+}
+
+/// Median gutter x (midpoint between left/right content) of the `Split`
+/// rows accumulated so far in an in-progress column run, or `None` before
+/// the run has any confirmed split.
+fn run_median_gutter(gutters: &[f64]) -> Option<f64> {
+    if gutters.is_empty() {
+        return None;
+    }
+    let mut gs = gutters.to_vec();
+    gs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(gs[gs.len() / 2])
+}
+
+/// Segment `lines` into a sequence of column bands. Unlike `page_two_columns`
+/// (which needs ONE gutter consistent across the *entire* page), this walks
+/// the page top-to-bottom and detects each contiguous two-column region on
+/// its own: a run of rows sharing a consistent internal gutter (via
+/// `split_row_columns`) — plus rows that plainly fall entirely to one side of
+/// that gutter (a label with no counterpart on the facing side) — becomes a
+/// `Columns` band once it has at least 3 confirmed splits and passes the same
+/// prose/clean gates `page_two_columns_rows` uses (average >= 2.5 real words
+/// per side, no internal wide gutter inside either half). Any row that
+/// neither extends the current run nor falls unambiguously to one side ends
+/// the run: a confirmed run is emitted as `Columns`, otherwise its rows are
+/// restored to their original single-line form and folded back into the
+/// surrounding `Full` block.
+pub fn detect_column_bands(lines: &[Vec<Span>]) -> Vec<ColumnBand> {
+    enum RunItem {
+        Split {
+            left: Vec<Span>,
+            right: Vec<Span>,
+            gutter: f64,
+        },
+        LeftOnly(Vec<Span>),
+        RightOnly(Vec<Span>),
+    }
+
+    fn wc(rows: &[Vec<Span>]) -> f64 {
+        if rows.is_empty() {
+            return 0.0;
+        }
+        rows.iter()
+            .map(|v| v.iter().filter(|sp| !sp.text.trim().is_empty()).count() as f64)
+            .sum::<f64>()
+            / rows.len() as f64
+    }
+
+    fn clean(rows: &[Vec<Span>]) -> bool {
+        rows.iter().all(|v| {
+            let size = v.iter().map(|x| x.size).fold(0.0f64, f64::max).max(0.1);
+            v.windows(2).all(|p| {
+                let a_end = p[0].x + p[0].advance;
+                let gap = (p[1].x - a_end).max(0.0);
+                gap <= 1.2 * size
+            })
+        })
+    }
+
+    fn flush(run: &mut Vec<RunItem>, pending_full: &mut Vec<Vec<Span>>, bands: &mut Vec<ColumnBand>) {
+        if run.is_empty() {
+            return;
+        }
+        let gutters: Vec<f64> = run
+            .iter()
+            .filter_map(|it| match it {
+                RunItem::Split { gutter, .. } => Some(*gutter),
+                _ => None,
+            })
+            .collect();
+        let left_splits: Vec<Vec<Span>> = run
+            .iter()
+            .filter_map(|it| match it {
+                RunItem::Split { left, .. } => Some(left.clone()),
+                _ => None,
+            })
+            .collect();
+        let right_splits: Vec<Vec<Span>> = run
+            .iter()
+            .filter_map(|it| match it {
+                RunItem::Split { right, .. } => Some(right.clone()),
+                _ => None,
+            })
+            .collect();
+        let ok = gutters.len() >= 3
+            && wc(&left_splits) >= 2.5
+            && wc(&right_splits) >= 2.5
+            && clean(&left_splits)
+            && clean(&right_splits);
+
+        if ok {
+            if !pending_full.is_empty() {
+                bands.push(ColumnBand::Full(std::mem::take(pending_full)));
+            }
+            let mut left = Vec::new();
+            let mut right = Vec::new();
+            for it in run.drain(..) {
+                match it {
+                    RunItem::Split { left: l, right: r, .. } => {
+                        left.push(l);
+                        right.push(r);
+                    }
+                    RunItem::LeftOnly(l) => left.push(l),
+                    RunItem::RightOnly(r) => right.push(r),
+                }
+            }
+            bands.push(ColumnBand::Columns { left, right });
+        } else {
+            for it in run.drain(..) {
+                match it {
+                    RunItem::Split { left: l, right: r, .. } => {
+                        // Not a real column block after all: this was one
+                        // physical row, so restore it whole rather than
+                        // leaking the speculative split into the plain text.
+                        let mut combined = l;
+                        combined.extend(r);
+                        combined.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+                        pending_full.push(combined);
+                    }
+                    RunItem::LeftOnly(l) => pending_full.push(l),
+                    RunItem::RightOnly(r) => pending_full.push(r),
+                }
+            }
+        }
+    }
+
+    let mut bands: Vec<ColumnBand> = Vec::new();
+    let mut pending_full: Vec<Vec<Span>> = Vec::new();
+    let mut run: Vec<RunItem> = Vec::new();
+
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let cur_gutters: Vec<f64> = run
+            .iter()
+            .filter_map(|it| match it {
+                RunItem::Split { gutter, .. } => Some(*gutter),
+                _ => None,
+            })
+            .collect();
+        let med = run_median_gutter(&cur_gutters);
+        let mut absorbed = false;
+
+        if let Some((left, right)) = split_row_columns(line) {
+            let l_end = left.iter().map(|s| s.x + s.advance).fold(f64::NEG_INFINITY, f64::max);
+            let r_start = right.iter().map(|s| s.x).fold(f64::INFINITY, f64::min);
+            let gutter = (l_end + r_start) / 2.0;
+            let consistent = med.map_or(true, |m| (gutter - m).abs() <= (0.15 * m.abs()).max(6.0));
+            if consistent {
+                run.push(RunItem::Split { left, right, gutter });
+                absorbed = true;
+            }
+        }
+
+        if !absorbed {
+            if let Some(m) = med {
+                let x0 = line.iter().map(|s| s.x).fold(f64::INFINITY, f64::min);
+                let x1 = line.iter().map(|s| s.x + s.advance).fold(f64::NEG_INFINITY, f64::max);
+                if x1 <= m {
+                    run.push(RunItem::LeftOnly(line.clone()));
+                    absorbed = true;
+                } else if x0 >= m {
+                    run.push(RunItem::RightOnly(line.clone()));
+                    absorbed = true;
+                }
+            }
+        }
+
+        if !absorbed {
+            flush(&mut run, &mut pending_full, &mut bands);
+            pending_full.push(line.clone());
+        }
+    }
+    flush(&mut run, &mut pending_full, &mut bands);
+    if !pending_full.is_empty() {
+        bands.push(ColumnBand::Full(pending_full));
+    }
+    bands
+}
+
+/// Split `line` at every gap wide enough that `render_spans` would hard-break
+/// it internally (mirrors that function's own `gap > 2.5 * size` check,
+/// evaluated the same way: per non-space span, against *that* span's own
+/// size). Deliberately narrower than the general-purpose `split_line_segments`
+/// (used for column-gutter detection, with its own `> 20pt` floor and
+/// whole-line max size) — using different thresholds here would split lines
+/// `render_spans` was never going to break on its own, feeding
+/// `classify_line`/`detect_list_marker` a fragment whose first token (e.g. a
+/// lone `-`) looks like a fresh line start and gets misread as a list marker.
+/// Matching the threshold exactly means this only pre-splits what would
+/// otherwise have broken *mid-render* anyway.
+fn split_hard_breaks(line: &[Span]) -> Vec<Vec<Span>> {
+    let mut segments = Vec::new();
+    let mut cur: Vec<Span> = Vec::new();
+    let mut prev_x: Option<f64> = None;
+    for s in line {
+        let is_space = s.text.chars().all(|c| c == ' ');
+        if let Some(px) = prev_x {
+            if !is_space {
+                let size = s.size.max(0.1);
+                let gap = s.x - px;
+                if gap > 2.5 * size && !cur.is_empty() {
+                    segments.push(std::mem::take(&mut cur));
+                }
+            }
+        }
+        prev_x = Some(s.x);
+        cur.push(s.clone());
+    }
+    if !cur.is_empty() {
+        segments.push(cur);
+    }
+    segments
+}
+
+/// Render one visual line, appending a blank-line paragraph break when the
+/// vertical gap from `prev_line_y` is large. Shared by every renderer that
+/// walks a flat sequence of lines (`render_with_tables`, `push_band_lines`)
+/// so table splicing and column-band splicing apply the exact same
+/// heading/list/emphasis rules as plain single-column text.
+///
+/// A row that jams two unrelated regions onto the same baseline (a value far
+/// to the right of its label, or two side-by-side boxes that only share a Y
+/// coordinate on this one row) is split first via `split_hard_breaks` and
+/// each piece classified/formatted independently. Previously such a row was
+/// handed whole to `classify_line`/`format_structured_line` — which pick a
+/// single role and a single set of emphasis delimiters for the *entire* row —
+/// while `render_spans` separately inserted a bare `\n` mid-string at the
+/// same oversized gap. That produced heading/emphasis markers balanced
+/// against text that was no longer on the same output line, e.g.
+/// `### FACTURE N° :**` (opening `**` never emitted; the stray closer landed
+/// on the wrong side of the split). Splitting up front keeps each piece's
+/// role and delimiters self-contained.
+pub(crate) fn push_line(
+    out: &mut String,
+    line: &[Span],
+    prev_line_y: &mut Option<f64>,
+    list_state: &mut ListRunState,
+    body_size: f64,
+) {
+    if line.is_empty() {
+        return;
+    }
+    let size = line[0].size.max(0.1);
+    if let Some(py) = *prev_line_y {
+        if py - line[0].y > 2.0 * size {
+            out.push('\n');
+        }
+    }
+    for seg in split_hard_breaks(line) {
+        if seg.is_empty() {
+            continue;
+        }
+        let (role, render_slice) = classify_line(&seg, body_size, list_state);
+        out.push_str(format_structured_line(&role, &render_spans(render_slice)).trim_end());
+        out.push('\n');
+    }
+    *prev_line_y = Some(line[0].y);
+}
+
+/// Render a `detect_column_bands` result into `out`. A single `Full` band
+/// (the common case: no column layout in this stretch of the page) renders
+/// byte-identically to walking the same lines one by one — `prev_line_y` and
+/// `list_state` carry through unchanged. A `Columns` band renders its left
+/// stream fully, then its right stream fully, each starting its own
+/// paragraph/list context (mirroring `render_human_order`'s stream loop) so
+/// column content recovered mid-page doesn't inherit spacing or list state
+/// from the unrelated column next to it.
+pub(crate) fn push_band_lines(
+    out: &mut String,
+    bands: &[ColumnBand],
+    prev_line_y: &mut Option<f64>,
+    list_state: &mut ListRunState,
+    body_size: f64,
+) {
+    for band in bands {
+        match band {
+            ColumnBand::Full(rows) => {
+                for line in rows {
+                    push_line(out, line, prev_line_y, list_state, body_size);
+                }
+            }
+            ColumnBand::Columns { left, right } => {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                *prev_line_y = None;
+                *list_state = ListRunState::default();
+                for line in left {
+                    push_line(out, line, prev_line_y, list_state, body_size);
+                }
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                *prev_line_y = None;
+                *list_state = ListRunState::default();
+                for line in right {
+                    push_line(out, line, prev_line_y, list_state, body_size);
+                }
+            }
+        }
+    }
 }
 
 /// Decide whether a visual line is a page-number footer (numeric-only, in the
@@ -519,21 +858,7 @@ pub fn render_cluster(lines: &[Vec<Span>]) -> String {
     let mut prev_line_y: Option<f64> = None;
 
     for line in lines {
-        let size = line[0].size.max(0.1);
-
-        // A large vertical gap opens a new block (paragraph).
-        if let Some(py) = prev_line_y {
-            if py - line[0].y > 2.0 * size {
-                out.push('\n');
-            }
-        }
-
-        let (role, render_slice) = classify_line(line, body_size, &mut list_state);
-        let line_text = format_structured_line(&role, &render_spans(render_slice));
-
-        out.push_str(line_text.trim_end());
-        out.push('\n');
-        prev_line_y = Some(line[0].y);
+        push_line(&mut out, line, &mut prev_line_y, &mut list_state, body_size);
     }
 
     out.trim_end().to_string()
@@ -568,16 +893,7 @@ pub fn render_human_order(lines: &[Vec<Span>], page_height: f64, drop_furniture:
             if drop_furniture && is_page_number_line(line, page_height) {
                 continue;
             }
-            let size = line[0].size.max(0.1);
-            if let Some(py) = prev_y {
-                if py - line[0].y > 2.0 * size {
-                    out.push('\n');
-                }
-            }
-            let (role, render_slice) = classify_line(line, body_size, &mut list_state);
-            out.push_str(&format_structured_line(&role, &render_line_text(render_slice)));
-            out.push('\n');
-            prev_y = Some(line[0].y);
+            push_line(&mut out, line, &mut prev_y, &mut list_state, body_size);
         }
     }
     out.trim_end().to_string()
@@ -856,15 +1172,33 @@ pub(crate) fn classify_line<'a>(
 fn strip_outer_emphasis(s: &str) -> String {
     let mut t = s.trim();
     loop {
+        // A prefix/suffix pair only represents ONE wrapper spanning the whole
+        // string if the closing marker doesn't recur inside it. Without this
+        // check, two independently-styled runs concatenated with a space —
+        // e.g. `<u>Date</u> <u>:</u>` — look exactly like one outer `<u>...
+        // </u>` wrap (prefix "<u>" + suffix "</u>"), so naively stripping
+        // them removed the FIRST run's own `<u>` and the SECOND run's own
+        // `</u>`, leaving the middle `</u> <u>` pair dangling unmatched
+        // (`Date</u> <u>:` — invalid Markdown/HTML). Bail out instead of
+        // guessing when the marker isn't unique to the true outer edges.
         if let Some(inner) = t.strip_prefix("<u>").and_then(|r| r.strip_suffix("</u>")) {
+            if inner.contains("</u>") {
+                break;
+            }
             t = inner.trim();
             continue;
         }
         if let Some(inner) = t.strip_prefix("**").and_then(|r| r.strip_suffix("**")) {
+            if inner.contains("**") {
+                break;
+            }
             t = inner.trim();
             continue;
         }
         if let Some(inner) = t.strip_prefix('*').and_then(|r| r.strip_suffix('*')) {
+            if inner.contains('*') {
+                break;
+            }
             t = inner.trim();
             continue;
         }

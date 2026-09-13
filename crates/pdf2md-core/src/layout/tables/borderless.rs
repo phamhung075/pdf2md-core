@@ -84,12 +84,28 @@ pub fn recover_borderless_projection_table(slice: &[Vec<(Rect, String)>]) -> Opt
 
     intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    // 2. Merge overlapping / near-touching intervals to detect candidate column bands
-    // Valleys with gap >= 8.0 pt define column gutters
+    // 2. Merge overlapping / near-touching intervals to detect candidate column
+    // bands. The merge tolerance must scale with the text size: a flat 8.0pt
+    // gutter floor is wider than one ordinary word-space at typical body
+    // sizes (a space is roughly 0.25-0.3em, so ~2.5-3pt at 10pt text), so it
+    // was bridging two genuinely distinct columns whenever either cell's text
+    // was merely wide (long words/numbers) rather than actually adjacent -
+    // collapsing a real >=2-column table below the 2-column minimum and
+    // dropping it entirely. Use the same per-row cell-split threshold
+    // (col_split_gap, computed from the median font size by the caller) as
+    // the merge floor instead, so a gap this function's own row-splitting
+    // considered a genuine cell boundary is never re-bridged here.
+    let merge_gap = slice
+        .iter()
+        .flat_map(|row| row.iter())
+        .map(|(rect, _)| rect.max_y - rect.min_y)
+        .fold(0.0f64, f64::max)
+        .max(6.0)
+        * 0.6;
     let mut columns: Vec<(f64, f64)> = Vec::new();
     for (start, end) in intervals {
         if let Some(last) = columns.last_mut() {
-            if start <= last.1 + 8.0 {
+            if start <= last.1 + merge_gap {
                 last.1 = last.1.max(end);
                 continue;
             }
@@ -268,4 +284,62 @@ pub fn line_to_cells(line: &TextLine, col_split_gap: f64) -> Vec<(Rect, String)>
     }
 
     cells
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(x0: f64, x1: f64, y0: f64, y1: f64, text: &str) -> (Rect, String) {
+        (Rect::new(x0, y0, x1, y1), text.to_string())
+    }
+
+    /// A flat 8.0pt merge floor bridges two adjacent columns whenever either
+    /// cell's own text is wide — e.g. a long right-aligned amount like
+    /// "110,00" easily spans more than 8pt beyond its neighbor's edge at
+    /// ordinary body sizes. That collapsed genuine 3-column numeric tables
+    /// (label / label / label, amount / amount / amount) below the 2-column
+    /// minimum and silently dropped them to plain text.
+    #[test]
+    fn wide_numeric_cells_do_not_collapse_distinct_columns() {
+        let rows = vec![
+            vec![
+                cell(50.0, 90.0, 700.0, 710.0, "TOTAL HT"),
+                cell(140.0, 180.0, 700.0, 710.0, "TOTAL TVA"),
+                cell(230.0, 270.0, 700.0, 710.0, "TOTAL TTC"),
+            ],
+            vec![
+                cell(50.0, 90.0, 685.0, 695.0, "100,00"),
+                cell(140.0, 180.0, 685.0, 695.0, "10,00"),
+                cell(230.0, 270.0, 685.0, 695.0, "110,00"),
+            ],
+        ];
+        let table = recover_borderless_projection_table(&rows).expect("wide-cell table must still be recovered");
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0].len(), 3, "must keep 3 distinct columns, not collapse them");
+        assert_eq!(table.rows[1].len(), 3);
+    }
+
+    #[test]
+    fn genuinely_touching_columns_still_merge() {
+        // Column A is split into two near-touching cells (a wrapped word, 1pt
+        // apart); column B sits far to the right. The near-touching pair must
+        // still merge into a single column, leaving exactly 2 columns total —
+        // not 3, which would mean the merge floor stopped bridging genuinely
+        // adjacent cells.
+        let rows = vec![
+            vec![
+                cell(50.0, 90.0, 700.0, 710.0, "AB"),
+                cell(91.0, 130.0, 700.0, 710.0, "CD"),
+                cell(300.0, 340.0, 700.0, 710.0, "EF"),
+            ],
+            vec![
+                cell(50.0, 90.0, 685.0, 695.0, "GH"),
+                cell(91.0, 130.0, 685.0, 695.0, "IJ"),
+                cell(300.0, 340.0, 685.0, 695.0, "KL"),
+            ],
+        ];
+        let table = recover_borderless_projection_table(&rows).expect("must recover a 2-column table");
+        assert_eq!(table.rows[0].len(), 2, "the 1pt-apart pair must still merge into one column");
+    }
 }

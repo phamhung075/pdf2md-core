@@ -15,9 +15,7 @@ pub use borderless::extract_borderless_tables;
 pub use rulers::{find_gap_tables, find_tables, scan_aligned_grids, table_rulers, RowInfo, TableHit, WordTok};
 
 use crate::layout::glyph_stream::Span;
-use crate::layout::reading_order::{
-    body_size_for, classify_line, format_structured_line, render_spans, ListRunState,
-};
+use crate::layout::reading_order::{body_size_for, detect_column_bands, push_band_lines, ListRunState};
 use crate::models::CanvasTable;
 
 /// Collapse duplicate / overlapping table candidates for a page into a
@@ -55,22 +53,6 @@ pub fn render_with_tables(lines: &[Vec<Span>], tables: &[TableHit]) -> String {
     let body_size = body_size_for(lines);
     let mut list_state = ListRunState::default();
 
-    let push_line = |out: &mut String,
-                      line: &[Span],
-                      prev_line_y: &mut Option<f64>,
-                      list_state: &mut ListRunState| {
-        let size = line[0].size.max(0.1);
-        if let Some(py) = *prev_line_y {
-            if py - line[0].y > 2.0 * size {
-                out.push('\n');
-            }
-        }
-        let (role, render_slice) = classify_line(line, body_size, list_state);
-        out.push_str(format_structured_line(&role, &render_spans(render_slice)).trim_end());
-        out.push('\n');
-        *prev_line_y = Some(line[0].y);
-    };
-
     let mut i = 0usize;
     while i < lines.len() {
         // Advance past any table whose region has already been consumed (e.g. a
@@ -107,8 +89,20 @@ pub fn render_with_tables(lines: &[Vec<Span>], tables: &[TableHit]) -> String {
             i = hit.end + 1; // skip the table's own lines
             continue;
         }
-        push_line(&mut out, &lines[i], &mut prev_line_y, &mut list_state);
-        i += 1;
+        // Recover column reading order for the contiguous run of non-table
+        // lines up to the next table start (or end of page) as one unit,
+        // instead of walking it strictly line-by-line: a page can carry a
+        // small table (e.g. a 2-cell reference block) while its surrounding
+        // header/footer still uses a two-column seller/buyer style layout
+        // that a naive top-to-bottom walk would weave together.
+        let seg_end = if t < tables.len() {
+            tables[t].start.min(lines.len())
+        } else {
+            lines.len()
+        };
+        let bands = detect_column_bands(&lines[i..seg_end]);
+        push_band_lines(&mut out, &bands, &mut prev_line_y, &mut list_state, body_size);
+        i = seg_end;
     }
 
     out.trim_end().to_string()
