@@ -737,13 +737,18 @@ pub fn convert_pdf_bytes_to_markdown(
 
     // When nothing was decoded, give an actionable reason instead of a silent
     // empty markdown:
-    //  * text-show operators but no readable text -> glyph-encoded (Type3) doc;
+    //  * text-show operators seen but zero words decoded -> the text layer is
+    //    unusable; glyph-encoded/outlined fonts, a missing or broken ToUnicode
+    //    CMap, and a corrupt font program are all possible. The font subtype is
+    //    not inspected here, so the message must not assert a specific one;
     //  * no fonts and no text-show operators at all -> scanned/image page.
     if total_words == 0 {
         if any_text_ops {
             return Err(
-                "Document text layer is glyph-encoded (e.g. Type3/outlined) with no Unicode mapping; \
-                 no readable text found — route through the OCR/Vision pipeline (vision-LLM rescue)."
+                "Document draws text (text-show operators present) but no readable words were decoded; \
+                 the text layer may be glyph-encoded or outlined (e.g. Type3), may lack a usable Unicode \
+                 mapping (e.g. a missing or broken ToUnicode CMap on a Type0/CID font), or its embedded \
+                 font program may be corrupt — route through the OCR/Vision pipeline (vision-LLM rescue)."
                     .to_string(),
             );
         }
