@@ -67,3 +67,98 @@ pub fn reconstruct_tables(spans_json: &str) -> Result<String, JsValue> {
 pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
+
+// ---------------------------------------------------------------------------
+// Native (host-target) tests.
+//
+// This crate is deliberately thin: it is wasm-bindgen glue whose real work is
+// delegated to `pdf2md-core`. `is_digital_pdf`, `reconstruct_tables` and
+// `version` have pure-Rust success paths and can therefore be exercised on a
+// normal `cargo test` host build. `convert_pdf` cannot: it serialises the
+// result through `serde_wasm_bindgen::to_value`, which needs a live JS runtime
+// and panics on a non-wasm target — testing it belongs to a browser/wasm
+// harness (the web e2e suite), not here. We intentionally add no new test
+// framework dependency (no `wasm-bindgen-test`): the crate's Cargo.lock does
+// not carry one and this environment builds offline.
+// ---------------------------------------------------------------------------
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod native_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A minimal but valid one-page PDF with a real text layer. Mirrors the
+    /// web e2e generator: object ids are fixed up front and bodies emitted in
+    /// id order so the xref offsets and `/F1` reference are consistent.
+    fn synthetic_pdf() -> Vec<u8> {
+        let catalog = 1;
+        let pages = 2;
+        let page = 3;
+        let font = 4;
+        let content = 5;
+        let stream = "BT /F1 11 Tf 56 800 Td 13 TL\n(invoice total 1500,00 EUR) Tj\nET";
+        let bodies: [String; 5] = [
+            format!("<< /Type /Catalog /Pages {pages} 0 R >>"),
+            format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+            format!("<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 {font} 0 R >> >> /Contents {content} 0 R >>"),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+            format!("<< /Length {} >>\nstream\n{stream}\nendstream", stream.len()),
+        ];
+        let mut out = String::from("%PDF-1.4\n");
+        let mut offsets = [0usize; 6];
+        for (i, body) in bodies.iter().enumerate() {
+            let id = i + 1;
+            offsets[id] = out.len();
+            out.push_str(&format!("{id} 0 obj\n{body}\nendobj\n"));
+        }
+        let xref_start = out.len();
+        out.push_str("xref\n0 6\n0000000000 65535 f \n");
+        for id in 1..=5 {
+            out.push_str(&format!("{:010} 00000 n \n", offsets[id]));
+        }
+        out.push_str(&format!(
+            "trailer\n<< /Size 6 /Root {catalog} 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+        ));
+        out.into_bytes()
+    }
+
+    fn span(text: &str, x0: f64, y0: f64) -> serde_json::Value {
+        json!({
+            "text": text,
+            "bbox": { "x0": x0, "y0": y0, "x1": x0 + 40.0, "y1": y0 + 10.0 },
+            "font_size": 11.0,
+            "is_bold": false,
+            "page_number": 1
+        })
+    }
+
+    #[test]
+    fn version_matches_the_crate_package() {
+        assert_eq!(version(), env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn is_digital_pdf_delegates_to_core() {
+        assert!(is_digital_pdf(&synthetic_pdf()));
+        assert!(!is_digital_pdf(b"definitely not a pdf"));
+        assert!(!is_digital_pdf(&[]));
+    }
+
+    #[test]
+    fn reconstruct_tables_builds_a_markdown_grid_from_spans_json() {
+        let spans = json!([
+            span("A", 0.0, 100.0),
+            span("B", 100.0, 100.0),
+            span("C", 0.0, 80.0),
+            span("D", 100.0, 80.0),
+        ]);
+        let out = reconstruct_tables(&spans.to_string()).expect("valid spans JSON");
+        assert!(out.contains("| A | B |"), "missing header row: {out:?}");
+        assert!(out.contains("| C | D |"), "missing data row: {out:?}");
+    }
+
+    #[test]
+    fn reconstruct_tables_empty_input_is_ok_and_empty() {
+        let out = reconstruct_tables("[]").expect("empty span list is valid JSON");
+        assert_eq!(out, "");
+    }
+}
