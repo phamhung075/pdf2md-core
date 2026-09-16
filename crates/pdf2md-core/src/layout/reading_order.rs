@@ -116,6 +116,7 @@ pub fn page_two_columns_rows(lines: &[Vec<Span>]) -> Option<PageColumns> {
         return None;
     }
     let col_top = keep.iter().map(|s| s.y).fold(f64::NEG_INFINITY, f64::max);
+    let col_bottom = keep.iter().map(|s| s.y).fold(f64::INFINITY, f64::min);
     let mut left: Vec<(f64, Vec<Span>)> = Vec::new();
     let mut right: Vec<(f64, Vec<Span>)> = Vec::new();
     let mut top_full: Vec<Vec<Span>> = Vec::new();
@@ -127,6 +128,26 @@ pub fn page_two_columns_rows(lines: &[Vec<Span>]) -> Option<PageColumns> {
             left.push((sp.y, sp.left.clone()));
             right.push((sp.y, sp.right.clone()));
             continue;
+        }
+        // A line that never paired with a facing line, yet sits *inside* the
+        // column block's vertical span and lies entirely on one side of the
+        // common gutter, still belongs to that column — e.g. the short final
+        // line of a taller left column ("… pour les vols" / "intercontinentaux.")
+        // whose baseline coincides with no right-column line. Testing only the
+        // y extent against `col_top` sent every such line to `bottom_full`, so
+        // it was rendered *after* the whole right column, jumping to the end of
+        // the page instead of staying inside its own paragraph.
+        if y <= col_top + y_tol && y >= col_bottom - y_tol {
+            let x0 = l.iter().map(|s| s.x).fold(f64::INFINITY, f64::min);
+            let x1 = l.iter().map(|s| s.x + s.advance).fold(f64::NEG_INFINITY, f64::max);
+            if x1 <= med {
+                left.push((y, l.clone()));
+                continue;
+            }
+            if x0 >= med {
+                right.push((y, l.clone()));
+                continue;
+            }
         }
         if y > col_top + y_tol {
             top_full.push(l.clone());
@@ -2019,5 +2040,76 @@ mod paragraph_merge_tests {
         let mut text = "infor-  ".to_string(); // trailing spaces after the hyphen
         join_paragraph_text(&mut text, "mation");
         assert_eq!(text, "information");
+    }
+
+    // -- page_two_columns_rows: column membership of unpaired lines -----------
+
+    fn col_span(text: &str, x: f64, y: f64) -> Span {
+        Span {
+            text: text.to_string(),
+            x,
+            y,
+            size: 10.0,
+            advance: text.len() as f64 * 6.0,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_vertical: false,
+        }
+    }
+
+    fn two_col_row(y: f64, left: &[(&str, f64)], right: &[(&str, f64)]) -> Vec<Span> {
+        let mut v: Vec<Span> = left.iter().map(|(t, x)| col_span(t, *x, y)).collect();
+        v.extend(right.iter().map(|(t, x)| col_span(t, *x, y)));
+        v
+    }
+
+    #[test]
+    fn unpaired_left_line_inside_column_span_stays_in_left_column() {
+        // A two-column page whose left column is one short line taller than the
+        // right: that line's baseline coincides with no right-column line, so it
+        // can never be paired with a `split_row_columns` row. It must still be
+        // routed to the left column, between the shared rows above it and the
+        // footer rows below — not dumped into `bottom_full`, which renders after
+        // the entire right column (the original bug: "intercontinentaux." jumped
+        // to the end of the page, past the whole English paragraph).
+        let lines = vec![
+            two_col_row(228.0,
+                &[("Le", 50.0), ("tarif", 70.0), ("réservé", 108.0)],
+                &[("The", 300.0), ("fare", 320.0), ("applies", 348.0)]),
+            two_col_row(221.0,
+                &[("les", 50.0), ("dates", 70.0), ("du", 108.0)],
+                &[("the", 300.0), ("dates", 320.0), ("below", 358.0)]),
+            two_col_row(214.0,
+                &[("pour", 50.0), ("les", 82.0), ("vols", 108.0)],
+                &[("for", 300.0), ("the", 326.0), ("flights", 352.0)]),
+            two_col_row(180.0,
+                &[("La", 50.0), ("Première", 70.0), ("cabins", 130.0)],
+                &[("equivalent", 300.0), ("in", 360.0), ("currency", 376.0)]),
+            vec![col_span("intercontinentaux.", 50.0, 174.0)],
+            two_col_row(130.0,
+                &[("Pour", 50.0), ("plus", 70.0), ("d'information,", 100.0)],
+                &[("For", 300.0), ("more", 320.0), ("information,", 348.0)]),
+            two_col_row(123.0,
+                &[("réservations", 50.0), ("en", 128.0), ("cliquant", 148.0)],
+                &[("France", 300.0), ("web", 344.0), ("site", 370.0)]),
+        ];
+        let pc = page_two_columns_rows(&lines).expect("two consistent columns must be detected");
+        let bottom: Vec<String> = pc.bottom_full.iter().map(|l| render_line_text(l)).collect();
+        assert!(bottom.is_empty(), "no unpaired column line may be dumped to the footer: {bottom:?}");
+        assert!(pc.top_full.is_empty(), "nothing sits above the column block");
+        let left: Vec<String> = pc.left.iter().map(|l| render_line_text(l)).collect();
+        let idx = left
+            .iter()
+            .position(|t| t.contains("intercontinentaux."))
+            .expect("the taller left column's tail line must stay in the left stream");
+        assert!(
+            left[..idx].iter().any(|t| t.contains("vols")),
+            "tail line must follow the left column body: {left:?}"
+        );
+        assert!(
+            left[idx + 1..].iter().any(|t| t.contains("réservations")),
+            "tail line must precede the left column footer: {left:?}"
+        );
     }
 }
