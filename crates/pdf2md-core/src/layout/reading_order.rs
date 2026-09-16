@@ -1692,7 +1692,16 @@ pub fn build_doc_blocks(lines: &[Vec<Span>], page_height: f64) -> Vec<DocBlock> 
                     // whitespace (e.g. `* item`); `*italic*` is inline emphasis.
                     let is_star_bullet =
                         t.starts_with('*') && t[1..].chars().next().map_or(false, |c| c.is_whitespace());
-                    let is_bullet = t.starts_with('-')
+                    // A leading `-` is a bullet only when it is followed by
+                    // whitespace (`- item`). `-20,48 €` is a negative amount and
+                    // `-field` is a hyphenated token; classifying them as "list"
+                    // corrupts the structured `blocks` channel (the markdown
+                    // channel goes through `detect_list_marker`, which already
+                    // requires a real gap, so the two disagreed). Mirrors
+                    // `is_star_bullet` above.
+                    let is_dash_bullet =
+                        t.starts_with('-') && t[1..].chars().next().map_or(false, |c| c.is_whitespace());
+                    let is_bullet = is_dash_bullet
                         || t.starts_with('•')
                         || t.starts_with('●')
                         || t.starts_with('◦')
@@ -2516,6 +2525,68 @@ mod paragraph_merge_tests {
         assert_eq!(merged.len(), 3);
         assert_eq!(merged[1].kind, "list");
         assert_eq!(merged[1].text, "A list item");
+    }
+
+    #[test]
+    fn negative_amount_is_not_classified_as_a_list_block() {
+        // Iteration 14 (fnfe_Avoir_FR_type381_BASIC.pdf): a credit-note amount
+        // rendered as the single line `-20,48 €` was classified `kind:"list"`
+        // by the bare `t.starts_with('-')` test in `build_doc_blocks`, even
+        // though the markdown path (`detect_list_marker`) already rejects the
+        // same sign because it has no separating whitespace. The two channels
+        // must agree: a negative amount is a value, not a bullet.
+        fn line(text: &str, x: f64, y: f64) -> Vec<Span> {
+            vec![Span {
+                text: text.to_string(),
+                x,
+                y,
+                size: 10.0,
+                advance: text.len() as f64 * 6.0,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_vertical: false,
+            }]
+        }
+        let lines = vec![line("Description", 100.0, 700.0), line("-20,48 €", 200.0, 660.0)];
+        let blocks = build_doc_blocks(&lines, 842.0);
+        let neg_block = blocks
+            .iter()
+            .find(|b| b.text.contains("20,48"))
+            .expect("negative amount must survive into the blocks channel");
+        assert_eq!(
+            neg_block.kind, "body",
+            "a negative amount is a value, not a bullet list item: {neg_block:?}"
+        );
+    }
+
+    #[test]
+    fn dash_bullet_line_is_still_classified_as_a_list_block() {
+        // The other direction: a real `- item` (dash then whitespace) must
+        // remain a list block after the negative-sign guard.
+        fn line(text: &str, x: f64, y: f64) -> Vec<Span> {
+            vec![Span {
+                text: text.to_string(),
+                x,
+                y,
+                size: 10.0,
+                advance: text.len() as f64 * 6.0,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_vertical: false,
+            }]
+        }
+        let lines = vec![line("Description", 100.0, 700.0), line("- Item text", 100.0, 660.0)];
+        let blocks = build_doc_blocks(&lines, 842.0);
+        let list_block = blocks
+            .iter()
+            .find(|b| b.text.contains("Item text"))
+            .expect("bullet line must survive into the blocks channel");
+        assert_eq!(
+            list_block.kind, "list",
+            "a real dash bullet separated by whitespace must stay a list: {list_block:?}"
+        );
     }
 
     #[test]
