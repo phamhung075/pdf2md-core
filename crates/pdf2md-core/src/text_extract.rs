@@ -505,8 +505,13 @@ pub(crate) fn resolve_codec(doc: &Document, font: &Dictionary) -> Option<Codec> 
         _ => {
             if is_symbolic(doc, font) {
                 // Symbolic fonts (dingbats etc.) carry no recoverable textual
-                // semantics without their font program.
-                return None;
+                // semantics from a standard byte encoding: their codes index
+                // the font's built-in glyph set. An explicit /ToUnicode CMap,
+                // however, *is* authoritative semantics — and TeX's CMR/CMMI
+                // faces are routinely flagged Symbolic with no /Encoding while
+                // shipping a full /ToUnicode. Decode through that rather than
+                // dropping every glyph drawn in the font.
+                return font_to_unicode(doc, font).map(|cm| Codec::CMap(cm, None));
             }
             // Non-symbolic simple fonts with no declared encoding almost
             // universally use WinAnsi byte values for accented Latin text.
@@ -853,6 +858,29 @@ mod tests {
         let mut s = String::new();
         codec.decode(&bytes, &mut s);
         assert_eq!(s, "Aéạ");
+    }
+
+    #[test]
+    fn symbolic_simple_font_with_tounicode_is_not_dropped() {
+        // TeX's CMR/CMMI faces are Type1, `/Flags 4` (Symbolic) and carry no
+        // `/Encoding` — but they *do* ship a full `/ToUnicode`. Before the
+        // fix, `resolve_codec` returned `None` for exactly this shape and
+        // every glyph drawn in the font silently vanished.
+        use lopdf::Stream;
+        let cmap = b"beginbfchar\n<57> <0057>\nendbfchar\n".to_vec();
+        let mut fd = Dictionary::new();
+        fd.set(b"Flags", 4);
+        let mut font = Dictionary::new();
+        font.set(b"Subtype", Object::Name(b"Type1".to_vec()));
+        font.set(b"BaseFont", Object::Name(b"ABCDEF+CMR9".to_vec()));
+        font.set(b"FontDescriptor", Object::Dictionary(fd));
+        font.set(b"ToUnicode", Object::Stream(Stream::new(Dictionary::new(), cmap)));
+        let doc = Document::new();
+        let codec = resolve_codec(&doc, &font)
+            .expect("a symbolic simple font with /ToUnicode must still resolve");
+        let mut s = String::new();
+        codec.decode(&[0x57], &mut s);
+        assert_eq!(s, "W");
     }
 
     #[test]

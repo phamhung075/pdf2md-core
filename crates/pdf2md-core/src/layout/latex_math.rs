@@ -135,7 +135,28 @@ impl LatexExpr {
             LatexExpr::Fraction { .. }
             | LatexExpr::Superscript { .. }
             | LatexExpr::Subscript { .. } => format!("${}$", self.to_latex()),
-            LatexExpr::Sequence(parts) => parts.iter().map(Self::render_inline_mixed).collect(),
+            LatexExpr::Sequence(parts) => {
+                // Parts are word-sized units (`synthesize_line_expr` splits a
+                // prose run into its word tokens before attaching a script to
+                // the last one), so a bare `collect()` glues them together:
+                // `comparestheperformanceof…`. Join with a single space unless
+                // the junction already carries whitespace.
+                let mut out = String::new();
+                for p in parts {
+                    let s = p.render_inline_mixed();
+                    if s.is_empty() {
+                        continue;
+                    }
+                    let needs_space = !out.is_empty()
+                        && !out.chars().last().map_or(true, |c| c.is_whitespace())
+                        && !s.chars().next().map_or(true, |c| c.is_whitespace());
+                    if needs_space {
+                        out.push(' ');
+                    }
+                    out.push_str(&s);
+                }
+                out
+            }
         }
     }
 }
@@ -1170,6 +1191,19 @@ mod tests {
             LatexExpr::text(" meters"),
         ]);
         assert_eq!(expr.render_inline_mixed(), "$mc^{2}$ meters");
+    }
+
+    #[test]
+    fn sequence_text_parts_are_space_joined() {
+        // `synthesize_line_expr` splits a prose run into word tokens around an
+        // attached script; those `Text` parts are separate units and must not
+        // be glued together (`comparestheperformance...`).
+        let expr = LatexExpr::seq(vec![
+            LatexExpr::text("compares"),
+            LatexExpr::superscript(LatexExpr::text("34B"), LatexExpr::text("4")),
+            LatexExpr::text("in different"),
+        ]);
+        assert_eq!(expr.render_inline_mixed(), "compares $34B^{4}$ in different");
     }
 
     #[test]

@@ -137,10 +137,28 @@ impl Widths {
     pub(crate) fn width(&self, bytes: &[u8]) -> Option<f64> {
         match self {
             Widths::Byte(t) => {
-                let code = *bytes.first()? as usize;
-                let w = t[code];
-                if w > 0.0 {
-                    Some(w)
+                if bytes.is_empty() {
+                    return None;
+                }
+                // Sum *every* glyph's advance. A `Tj`/`TJ` operand carries a
+                // whole word or phrase, and every consumer uses
+                // `span.x + span.advance` as the run's right edge. Returning
+                // only the first glyph's width under-measures multi-character
+                // runs, so a run that ends where an absolute `Tm` boundary
+                // begins looks like it stops far short of the next span — a
+                // phantom gap wide enough for the column/reading-order
+                // heuristics to split single-column prose into fake columns.
+                let mut total = 0.0;
+                let mut any = false;
+                for &b in bytes {
+                    let w = t[b as usize];
+                    if w > 0.0 {
+                        any = true;
+                        total += w;
+                    }
+                }
+                if any {
+                    Some(total)
                 } else {
                     None
                 }
@@ -292,7 +310,7 @@ pub struct Span {
     pub y: f64,
     /// Effective device font size (used to scale all gap thresholds).
     pub size: f64,
-    /// Natural advance width of the first glyph, in device points.
+    /// Total natural advance width of the decoded run, in device points.
     pub advance: f64,
     pub is_bold: bool,
     pub is_italic: bool,
@@ -1432,6 +1450,20 @@ mod tests {
         let mut font = Dictionary::new();
         font.set(b"BaseFont", Object::Name(name.to_vec()));
         (Document::new(), font)
+    }
+
+    #[test]
+    fn width_sums_every_glyph_in_a_run() {
+        // A `Tj`/`TJ` operand is a whole word or phrase; `span.x + advance`
+        // is used as the run's right edge. Only the first glyph's width must
+        // not be used, or long runs under-measure and open phantom gaps.
+        let mut t = [0.0f64; 256];
+        t[b'A' as usize] = 600.0;
+        t[b'B' as usize] = 700.0;
+        let w = Widths::Byte(t);
+        assert_eq!(w.width(b"AB"), Some(1300.0));
+        assert_eq!(w.width(b"A"), Some(600.0));
+        assert_eq!(w.width(b""), None);
     }
 
     #[test]

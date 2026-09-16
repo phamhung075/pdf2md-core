@@ -799,6 +799,12 @@ pub(crate) fn render_spans(line: &[Span]) -> String {
 
         if let Some(px) = prev_x {
             let gap = span.x - px;
+            // `gap` is start-to-start; the *whitespace* between the two spans is
+            // what it is after the previous span's own advance. Comparing the
+            // raw start-to-start distance against a size threshold (as the
+            // hard-break branch used to) makes any word run wider than ~2.5 em
+            // look like a new column and emits a spurious newline mid-sentence.
+            let gap = gap - prev_advance;
             if !is_space {
                 if gap > 2.5 * size {
                     // A distinct column / element on the same row: break the
@@ -808,7 +814,7 @@ pub(crate) fn render_spans(line: &[Span]) -> String {
                     if !out.is_empty() && !out.ends_with('\n') {
                         out.push('\n');
                     }
-                } else if gap - prev_advance > 0.65 * space_adv {
+                } else if gap > 0.65 * space_adv {
                     close_style(&mut out, cur);
                     cur = InlineStyle::default();
                     if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
@@ -1470,6 +1476,30 @@ mod tests {
 
     fn text_width(t: &str) -> f64 {
         t.len() as f64 * 6.0
+    }
+
+    #[test]
+    fn long_word_run_is_not_a_line_break() {
+        // "Hello" is 30pt wide; "world" starts 33pt later, i.e. one normal
+        // space after Hello's advance. The raw start-to-start distance is
+        // 33 > 2.5 * size, but the *whitespace* gap is only 3pt, so the two
+        // words belong on one line.
+        let line = vec![
+            span("Hello", 100.0, (false, false, false)),
+            span("world", 133.0, (false, false, false)),
+        ];
+        assert_eq!(render_spans(&line), "Hello world");
+    }
+
+    #[test]
+    fn wide_column_gutter_still_breaks_the_line() {
+        // Second run starts 40pt after the first run's right edge: a genuine
+        // column/element boundary must still become a hard newline.
+        let line = vec![
+            span("Hello", 100.0, (false, false, false)),
+            span("world", 170.0, (false, false, false)),
+        ];
+        assert_eq!(render_spans(&line), "Hello\nworld");
     }
 
     #[test]
