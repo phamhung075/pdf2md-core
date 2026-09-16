@@ -920,7 +920,16 @@ fn detect_stacked_fractions(stream: &[Vec<Span>]) -> Vec<FractionHit> {
         let (dx0, _, dx1, _) = line_bbox(den);
         let n_center = (nx0 + nx1) / 2.0;
         let d_center = (dx0 + dx1) / 2.0;
-        if (n_center - d_center).abs() > 0.5 * max_size {
+        // A real built-up fraction centres its numerator and denominator on a
+        // shared axis, so their box centres essentially coincide. A loose
+        // half-em tolerance also lets two *right-aligned* table/list numbers in
+        // the same column (`61,07` over `8,93`, `3,00` over `-11,21` in the
+        // ZUGFeRD fixture) read as a fraction: both are short, similar-sized and
+        // tightly stacked, but their centres differ by ~0.3-0.5 em because the
+        // column is right-, not centre-, aligned. Require the tight centre
+        // agreement a genuine fraction has (typesetting jitter is a fraction of
+        // a point) and leave right-aligned numeric columns as separate lines.
+        if (n_center - d_center).abs() > 0.25 * max_size {
             continue;
         }
         if overlap(nx0, nx1, dx0, dx1) < 0.4 * (nx1 - nx0).min(dx1 - dx0).max(0.1) {
@@ -1301,6 +1310,22 @@ mod tests {
             vec![span(" ", 150.0, 704.0, 8.0, 10.0)],
         ];
         assert!(detect_stacked_fractions(&stream).is_empty());
+    }
+
+    #[test]
+    fn stacked_fraction_rejects_right_aligned_numeric_column() {
+        // ZUGFeRD fixture page 4: the `USt.-Betrag` column is right-aligned, so
+        // two of its values (`61,07` over `8,93`) are consecutive short,
+        // similar-sized, tightly-stacked numeric lines. They are not a
+        // fraction: right-alignment leaves their box centres ~0.5 em apart.
+        let stream = vec![
+            vec![span("61,07", 528.6, 711.43, 9.75, 9.8)],
+            vec![span("8,93", 533.5, 698.72, 9.75, 9.8)],
+        ];
+        assert!(
+            detect_stacked_fractions(&stream).is_empty(),
+            "right-aligned table numbers must not become a fraction"
+        );
     }
 
     #[test]
