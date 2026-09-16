@@ -60,6 +60,48 @@ pub fn split_row_columns(spans: &[Span]) -> Option<(Vec<Span>, Vec<Span>)> {
     Some((spans[..=at].to_vec(), spans[at + 1..].to_vec()))
 }
 
+/// Split one visual row at an *already-established* column gutter `gx`, even
+/// when the local gap is narrower than `split_row_columns`'s standalone
+/// `1.2em` threshold.
+///
+/// A justified two-column layout can leave barely ~1em of whitespace between
+/// its columns — below the threshold that distinguishes a genuine gutter from
+/// ordinary (possibly stretched) word spacing on a single row, so
+/// `split_row_columns` alone misses those rows. Once `detect_column_bands` has
+/// confirmed a consistent gutter across several rows, the remaining rows of the
+/// same block can be split reliably against it: the gap is taken only when its
+/// midpoint sits at the known gutter, it is at least `0.6em`, and it is wider
+/// than every other inter-word gap in the row, so ordinary prose never splits.
+fn split_row_at_gutter(spans: &[Span], gx: f64) -> Option<(Vec<Span>, Vec<Span>)> {
+    if spans.len() < 5 {
+        return None;
+    }
+    let size = spans.iter().map(|s| s.size).fold(0.0f64, f64::max).max(0.1);
+    let mut at_gutter: Option<(f64, usize)> = None; // (gap, split index)
+    let mut max_other_gap = 0.0f64;
+    for i in 0..spans.len() - 1 {
+        let a_end = spans[i].x + spans[i].advance;
+        let b_start = spans[i + 1].x;
+        let gap = (b_start - a_end).max(0.0);
+        let mid = (a_end + b_start) / 2.0;
+        if (mid - gx).abs() <= 0.5 * size + 6.0 {
+            if at_gutter.map_or(true, |(g, _)| gap > g) {
+                at_gutter = Some((gap, i));
+            }
+        } else if gap > max_other_gap {
+            max_other_gap = gap;
+        }
+    }
+    let (gap, at) = at_gutter?;
+    if at < 2 || at >= spans.len() - 2 {
+        return None;
+    }
+    if gap < 0.6 * size || gap <= max_other_gap {
+        return None;
+    }
+    Some((spans[..=at].to_vec(), spans[at + 1..].to_vec()))
+}
+
 /// Detect a genuine two-column page: >= 3 rows split at a *consistent* gutter
 /// x. Returns the reading-order column streams (left column top-to-bottom,
 /// right column top-to-bottom) when stable, else None (single column).
@@ -431,7 +473,16 @@ fn run_median_gutter(gutters: &[f64]) -> Option<f64> {
     }
     let mut gs = gutters.to_vec();
     gs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    Some(gs[gs.len() / 2])
+    let n = gs.len();
+    // True median: with an even count the two central gutters are averaged.
+    // Picking the upper one skews the estimate high on the first two rows,
+    // which then mis-classifies a short facing line that starts just left of
+    // the inflated midpoint as neither side and breaks the column run.
+    Some(if n % 2 == 1 {
+        gs[n / 2]
+    } else {
+        0.5 * (gs[n / 2 - 1] + gs[n / 2])
+    })
 }
 
 /// Segment `lines` into a sequence of column bands. Unlike `page_two_columns`
@@ -479,6 +530,31 @@ pub fn detect_column_bands(lines: &[Vec<Span>]) -> Vec<ColumnBand> {
         })
     }
 
+    /// Whether `rows` is a *wrapped* text column: some consecutive pair where
+    /// the earlier row neither ends a sentence nor is a closed item and the
+    /// later row plainly continues it (starts lowercase), or the earlier row
+    /// ends in a line-break hyphen. A run of table cells never continues one
+    /// row into the next, so this is what separates real body text sitting
+    /// beside a grid from an ordinary label/value or multi-column table (whose
+    /// "wordy" long cells must keep their row order rather than be transposed
+    /// into two streams).
+    fn wrapped_prose(rows: &[Vec<Span>]) -> bool {
+        let plain: Vec<String> = rows
+            .iter()
+            .map(|r| r.iter().map(|s| s.text.as_str()).collect::<String>())
+            .collect();
+        plain.windows(2).any(|w| {
+            let a = w[0].trim_end();
+            let b = w[1].trim_start();
+            let hyphen_break = a.ends_with('-')
+                && a.chars().rev().nth(1).map_or(false, |c| c.is_alphabetic());
+            let sentence_end =
+                a.ends_with(['.', '!', '?', ':', ';', ')', ']', '€', '%']);
+            let lower_next = b.chars().next().map_or(false, |c| c.is_lowercase());
+            hyphen_break || (!sentence_end && lower_next)
+        })
+    }
+
     fn flush(run: &mut Vec<RunItem>, pending_full: &mut Vec<Vec<Span>>, bands: &mut Vec<ColumnBand>) {
         if run.is_empty() {
             return;
@@ -504,11 +580,32 @@ pub fn detect_column_bands(lines: &[Vec<Span>]) -> Vec<ColumnBand> {
                 _ => None,
             })
             .collect();
+        // A clean half is a single column; an unclean half contains its own
+        // internal gutter — i.e. it is itself a multi-column table grid. When
+        // one half is a flowing, multi-word prose column *and* the facing half
+        // is such a grid, the established gutter still separates two
+        // independent regions (body text beside a data table) and the band must
+        // be kept. Merging those rows back instead weaves the table's cells
+        // into the prose line-by-line, and the smaller table type then reads as
+        // a LaTeX superscript of the prose (`model $properly^{Guardrails...}$`).
+        // Both halves unclean means a single wide grid was cut in two, not a
+        // prose/table split — leave those rows to the table detector.
+        let left_clean = clean(&left_splits);
+        let right_clean = clean(&right_splits);
+        let prose_beside_grid = (left_clean
+            && !right_clean
+            && wc(&left_splits) >= 4.0
+            && wrapped_prose(&left_splits)
+            && wc(&left_splits) > wc(&right_splits))
+            || (right_clean
+                && !left_clean
+                && wc(&right_splits) >= 4.0
+                && wrapped_prose(&right_splits)
+                && wc(&right_splits) > wc(&left_splits));
         let ok = gutters.len() >= 3
             && wc(&left_splits) >= 2.5
             && wc(&right_splits) >= 2.5
-            && clean(&left_splits)
-            && clean(&right_splits);
+            && ((left_clean && right_clean) || prose_beside_grid);
 
         if ok {
             if !pending_full.is_empty() {
@@ -575,16 +672,48 @@ pub fn detect_column_bands(lines: &[Vec<Span>]) -> Vec<ColumnBand> {
             }
         }
 
+        // A justified column block can have a gutter too narrow for
+        // `split_row_columns`'s standalone threshold. Once the run has an
+        // established median gutter, split any remaining crossing row against
+        // it (see `split_row_at_gutter`).
         if !absorbed {
             if let Some(m) = med {
-                let x0 = line.iter().map(|s| s.x).fold(f64::INFINITY, f64::min);
-                let x1 = line.iter().map(|s| s.x + s.advance).fold(f64::NEG_INFINITY, f64::max);
-                if x1 <= m {
-                    run.push(RunItem::LeftOnly(line.clone()));
-                    absorbed = true;
-                } else if x0 >= m {
-                    run.push(RunItem::RightOnly(line.clone()));
-                    absorbed = true;
+                if let Some((left, right)) = split_row_at_gutter(line, m) {
+                    let l_end = left.iter().map(|s| s.x + s.advance).fold(f64::NEG_INFINITY, f64::max);
+                    let r_start = right.iter().map(|s| s.x).fold(f64::INFINITY, f64::min);
+                    let gutter = (l_end + r_start) / 2.0;
+                    if (gutter - m).abs() <= (0.15 * m.abs()).max(6.0) {
+                        run.push(RunItem::Split { left, right, gutter });
+                        absorbed = true;
+                    }
+                }
+            }
+        }
+
+        if !absorbed {
+            if let Some(m) = med {
+                // Only a row vertically adjacent to the run can extend it. A
+                // later full-width heading (or any short line) that happens to
+                // sit entirely on one side of the gutter begins a new block —
+                // absorbing it would render it *before* the facing column.
+                let contiguous = run.last().map_or(true, |it| {
+                    let last_y = match it {
+                        RunItem::Split { left, .. } => left[0].y,
+                        RunItem::LeftOnly(l) | RunItem::RightOnly(l) => l[0].y,
+                    };
+                    let gap = last_y - line[0].y;
+                    gap >= -1.0 && gap <= 2.5 * line[0].size.max(0.1)
+                });
+                if contiguous {
+                    let x0 = line.iter().map(|s| s.x).fold(f64::INFINITY, f64::min);
+                    let x1 = line.iter().map(|s| s.x + s.advance).fold(f64::NEG_INFINITY, f64::max);
+                    if x1 <= m {
+                        run.push(RunItem::LeftOnly(line.clone()));
+                        absorbed = true;
+                    } else if x0 >= m {
+                        run.push(RunItem::RightOnly(line.clone()));
+                        absorbed = true;
+                    }
                 }
             }
         }
@@ -2110,6 +2239,150 @@ mod paragraph_merge_tests {
         assert!(
             left[idx + 1..].iter().any(|t| t.contains("réservations")),
             "tail line must precede the left column footer: {left:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod column_band_tests {
+    use super::*;
+
+    fn sp(text: &str, x: f64, y: f64) -> Span {
+        Span {
+            text: text.to_string(),
+            x,
+            y,
+            size: 10.0,
+            advance: text.len() as f64 * 6.0,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_vertical: false,
+        }
+    }
+
+    /// One row of a mixed prose/table two-column block. The four lower-case
+    /// left-column words end at x=146; the table label starts at 176 (a 30pt
+    /// page gutter) and its value at 215 (a 15pt internal table gutter). The
+    /// page gutter is wider than the table's own gutter, so
+    /// `split_row_columns` cuts at the page gutter; `clean(right)` is false
+    /// because the right half is itself a two-column grid. The all-lowercase
+    /// left rows read as a wrapped prose column (each row continues the next).
+    fn prose_beside_grid_row(y: f64, val: &str) -> Vec<Span> {
+        vec![
+            sp("lora", 50.0, y),
+            sp("ipsu", 74.0, y),
+            sp("dolo", 98.0, y),
+            sp("sita", 122.0, y),
+            sp("Ra", 176.0, y),
+            sp("Rb", 188.0, y),
+            sp(val, 215.0, y),
+        ]
+    }
+
+    #[test]
+    fn prose_beside_a_multicolumn_grid_keeps_the_column_band() {
+        let lines = vec![
+            prose_beside_grid_row(300.0, "V1"),
+            prose_beside_grid_row(290.0, "V2"),
+            prose_beside_grid_row(280.0, "V3"),
+            prose_beside_grid_row(270.0, "V4"),
+            // A caption row whose page gutter is only 10pt (< 1.2em): the
+            // standalone detector misses it and only the established-gutter
+            // fallback (`split_row_at_gutter`) can keep it in the block.
+            vec![
+                sp("lora", 50.0, 260.0),
+                sp("ipsu", 74.0, 260.0),
+                sp("dolo", 98.0, 260.0),
+                sp("sita", 122.0, 260.0),
+                sp("Ca", 156.0, 260.0),
+                sp("Cb", 168.0, 260.0),
+                sp("Cc", 180.0, 260.0),
+            ],
+            // A full-width heading far below must start its own block.
+            vec![sp("Heading", 50.0, 150.0)],
+        ];
+        let bands = detect_column_bands(&lines);
+        assert_eq!(bands.len(), 2, "one Columns band, then the Full heading band");
+        match &bands[0] {
+            ColumnBand::Columns { left, right } => {
+                let lt: Vec<String> = left.iter().map(|l| render_line_text(l)).collect();
+                let rt: Vec<String> = right.iter().map(|l| render_line_text(l)).collect();
+                assert_eq!(lt.len(), 5, "all five prose rows stay in the left stream: {lt:?}");
+                assert_eq!(rt.len(), 5, "all five grid/caption rows stay in the right stream: {rt:?}");
+                assert!(
+                    lt.iter().all(|t| !t.contains("Ra") && !t.contains("V")),
+                    "no table cell may be woven into the prose: {lt:?}"
+                );
+                assert!(
+                    rt.iter().all(|t| !t.contains("lora")
+                        && !t.contains("ipsu")
+                        && !t.contains("dolo")
+                        && !t.contains("sita")),
+                    "no prose may be woven into the grid stream: {rt:?}"
+                );
+                assert!(rt[0].contains("Ra") && rt[0].contains("V1"), "header + row 1: {rt:?}");
+            }
+            ColumnBand::Full(_) => panic!("mixed prose/table block was merged instead of split"),
+        }
+        match &bands[1] {
+            ColumnBand::Full(rows) => assert_eq!(render_line_text(&rows[0]), "Heading"),
+            ColumnBand::Columns { .. } => panic!("a full-width heading must not be a column"),
+        }
+    }
+
+    #[test]
+    fn a_grid_cut_in_two_is_not_a_prose_column_band() {
+        // Three table columns at x=50/120/200. `split_row_columns` cuts at the
+        // widest (rightmost) gap, leaving the left half still holding two
+        // columns and the right half a single short cell. This is one grid, not
+        // a prose/table split, so it must not become a `Columns` band (which
+        // would transpose the table).
+        let row = |y: f64| {
+            vec![
+                sp("aaaa", 50.0, y),
+                sp("bbbb", 120.0, y),
+                sp("cccc", 200.0, y),
+            ]
+        };
+        let lines = vec![row(300.0), row(290.0), row(280.0), row(270.0)];
+        let bands = detect_column_bands(&lines);
+        assert!(
+            bands.iter().all(|b| !matches!(b, ColumnBand::Columns { .. })),
+            "a multi-column grid must not be read as prose columns: {:?} bands",
+            bands.len()
+        );
+    }
+
+    #[test]
+    fn wordy_label_value_grid_is_not_transposed_into_columns() {
+        // A label/value table whose long label cells give the left half a high
+        // word count — a word-count-only test would call it "prose" — but the
+        // cells are independent (each ends with a bracket; none continues into
+        // the next). It must keep its row order rather than be split into a
+        // left label stream and a right value stream.
+        let row = |y: f64, val: &str| {
+            vec![
+                sp("Alpha", 50.0, y),
+                sp("beta", 80.0, y),
+                sp("gamma", 104.0, y),
+                sp("delta)", 134.0, y),
+                sp(val, 200.0, y),
+                sp("5,5%", 240.0, y),
+                sp("zz", 280.0, y),
+            ]
+        };
+        let lines = vec![
+            row(300.0, "1,91"),
+            row(290.0, "2,91"),
+            row(280.0, "3,91"),
+            row(270.0, "4,91"),
+        ];
+        let bands = detect_column_bands(&lines);
+        assert!(
+            bands.iter().all(|b| !matches!(b, ColumnBand::Columns { .. })),
+            "a label/value grid must not be transposed into columns: {:?} bands",
+            bands.len()
         );
     }
 }
