@@ -39,6 +39,7 @@ pub fn merge_complementary_columns(
     win_rows: &[usize],
     info: &[RowInfo],
     rulers: &[f64],
+    tol: f64,
 ) -> (Vec<Vec<String>>, Vec<f64>) {
     if table_rows.is_empty() || table_rows[0].len() < 2 {
         return (table_rows, rulers.to_vec());
@@ -62,13 +63,35 @@ pub fn merge_complementary_columns(
             }
         }
 
-        // Two adjacent columns are complementary if:
-        // 1) Ruler r1 falls within the text extent of column c (centered or indented content),
-        // 2) AND they never co-occur on the same visual line
-        let never_cooccur = table_rows.iter().all(|r| {
-            r[c].trim().is_empty() || r[c + 1].trim().is_empty()
+        // Two adjacent columns are complementary if they never co-occur on the
+        // same visual line AND one of:
+        // 1) the columns' geographic extents say they are really one cell:
+        //    - if r1 is the *right edge* of column c (an end-derived ruler,
+        //      i.e. a word ends exactly there), they merge as soon as the text
+        //      reaches r1;
+        //    - if r1 is the *start* of the next column (a start-derived ruler),
+        //      the text must genuinely extend past r1 by more than `tol`,
+        //      otherwise the word merely touches the next column's start and
+        //      the columns are distinct. This margin is essential once run
+        //      advances are correct, because tightly-packed header cells end
+        //      within a fraction of a point of the next ruler.
+        // 2) the two rulers are a tight pair (much closer to each other than to
+        //    the next ruler) and only one of them has a header cell — absorbs
+        //    a header column whose value is indented into a second ruler.
+        let never_cooccur = table_rows
+            .iter()
+            .all(|r| r[c].trim().is_empty() || r[c + 1].trim().is_empty());
+        let r1_is_start = win_rows.iter().any(|&ri| {
+            info[ri]
+                .starts
+                .iter()
+                .any(|&s| (s - r1).abs() <= tol * 1.5)
         });
-
+        let extends_into = if r1_is_start {
+            max_x1_c - r1 > tol
+        } else {
+            max_x1_c + tol >= r1
+        };
         let next_ruler_gap = if c + 2 < current_rulers.len() {
             current_rulers[c + 2] - r1
         } else {
@@ -77,9 +100,13 @@ pub fn merge_complementary_columns(
         let r_gap = r1 - r0;
         let is_tight_pair = r_gap < next_ruler_gap * 0.75;
         let one_has_no_header = !table_rows.is_empty()
-            && (table_rows[0][c].trim().is_empty() != table_rows[0][c + 1].trim().is_empty());
+            && (table_rows[0][c].trim().is_empty()
+                != table_rows[0][c + 1].trim().is_empty());
 
-        if never_cooccur && (r1 <= max_x1_c || (is_tight_pair && one_has_no_header)) {
+        let should_merge =
+            never_cooccur && (extends_into || (is_tight_pair && one_has_no_header));
+
+        if should_merge {
             for r in table_rows.iter_mut() {
                 if r[c].trim().is_empty() {
                     r[c] = std::mem::take(&mut r[c + 1]);

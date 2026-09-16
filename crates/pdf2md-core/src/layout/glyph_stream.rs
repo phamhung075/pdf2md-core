@@ -168,17 +168,67 @@ impl Widths {
                 default,
                 encoding,
             } => {
-                let cid = match encoding {
-                    Some(cm) => cm.lookup(bytes)?,
-                    None => {
-                        let mut v = 0u32;
-                        for &b in bytes {
-                            v = (v << 8) | b as u32;
+                if bytes.is_empty() {
+                    return None;
+                }
+                // Sum every CID's advance, exactly as the `Widths::Byte` branch
+                // above does. Callers use `span.x + span.advance` as the run's
+                // right edge *and* advance the text matrix by this value, so
+                // folding a multi-glyph run into one merged CID (which misses
+                // /W, falls back to /DW, and mis-measures every multi-glyph
+                // run) drifts all later x positions and destroys residual-gap
+                // space detection — fusing words in Identity-H/CID fonts.
+                let mut total = 0.0;
+                let mut any = false;
+                match encoding {
+                    Some(cm) => {
+                        // Custom code->CID CMap: consume the code lengths the
+                        // CMap knows, exactly as `decode_cmap` does.
+                        let mut i = 0usize;
+                        while i < bytes.len() {
+                            let mut matched = false;
+                            for len in 1u8..=4u8 {
+                                let n = len as usize;
+                                if i + n > bytes.len() {
+                                    continue;
+                                }
+                                if let Some(cid) = cm.lookup(&bytes[i..i + n]) {
+                                    let w = map.get(&cid).copied().unwrap_or(*default);
+                                    if w > 0.0 {
+                                        any = true;
+                                        total += w;
+                                    }
+                                    i += n;
+                                    matched = true;
+                                    break;
+                                }
+                            }
+                            if !matched {
+                                i += 1;
+                            }
                         }
-                        v
                     }
-                };
-                Some(map.get(&cid).copied().unwrap_or(*default))
+                    None => {
+                        // Identity-H/V: the code bytes *are* the CID, two
+                        // bytes each.
+                        for chunk in bytes.chunks(2) {
+                            let mut cid = 0u32;
+                            for &b in chunk {
+                                cid = (cid << 8) | b as u32;
+                            }
+                            let w = map.get(&cid).copied().unwrap_or(*default);
+                            if w > 0.0 {
+                                any = true;
+                                total += w;
+                            }
+                        }
+                    }
+                }
+                if any {
+                    Some(total)
+                } else {
+                    None
+                }
             }
             Widths::None => None,
         }
@@ -1215,6 +1265,51 @@ pub fn extract_page_glyphs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cid_widths(map: HashMap<u32, f64>, encoding: Option<CMapCodec>) -> Widths {
+        Widths::Cid {
+            map,
+            default: 1000.0,
+            encoding,
+        }
+    }
+
+    /// Regression for the Type0/Identity-H run-width bug: a `Tj`/`TJ` operand
+    /// carrying several 2-byte CIDs must sum every CID's `/W` advance. Folding
+    /// the whole run into one bogus CID missed `/W`, fell back to `/DW`
+    /// (1 em), drifted the text matrix, and fused words in the Markdown
+    /// channel (e.g. "HandelsrechnungNr." instead of "Handelsrechnung Nr.").
+    #[test]
+    fn cid_identity_run_sums_each_glyph_width() {
+        let mut map = HashMap::new();
+        map.insert(0x0028u32, 600.0);
+        map.insert(0x0056u32, 500.0);
+        let w = cid_widths(map, None);
+        assert_eq!(w.width(&[0x00, 0x28, 0x00, 0x56]), Some(1100.0));
+        // A single glyph still measures correctly.
+        assert_eq!(w.width(&[0x00, 0x28]), Some(600.0));
+        // A CID missing from /W contributes /DW.
+        assert_eq!(w.width(&[0x00, 0x28, 0x00, 0x99]), Some(1600.0));
+    }
+
+    /// The custom code->CID `/Encoding` CMap path must likewise split a
+    /// multi-code run and sum each code's width.
+    #[test]
+    fn cid_custom_encoding_run_sums_each_code_width() {
+        let cmap = parse_cmap(b"2 beginbfchar\n<01> <0028>\n<02> <0056>\nendbfchar")
+            .expect("parse cmap");
+        let mut map = HashMap::new();
+        map.insert(0x0028u32, 600.0);
+        map.insert(0x0056u32, 500.0);
+        let w = cid_widths(map, Some(cmap));
+        assert_eq!(w.width(&[0x01, 0x02]), Some(1100.0));
+        assert_eq!(w.width(&[0x02]), Some(500.0));
+    }
+
+    #[test]
+    fn cid_empty_run_has_no_width() {
+        assert_eq!(cid_widths(HashMap::new(), None).width(&[]), None);
+    }
 
     #[test]
     fn test_append_table_zones_emits_table_and_suppresses_contained_fragments() {

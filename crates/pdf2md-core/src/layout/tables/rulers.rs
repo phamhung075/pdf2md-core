@@ -182,6 +182,24 @@ fn cluster_positions(mut points: Vec<(f64, usize)>, tol: f64) -> Vec<f64> {
 /// straddle check would — silently drops the whole table to plain text even
 /// though every numeric row agrees on the columns.
 pub fn table_rulers(info: &[RowInfo], tol: f64, lo: usize, hi: usize, min_gutter: f64) -> Vec<f64> {
+    // Preserve the original (strict) public behaviour; callers that want the
+    // relaxed merged-cell veto use `table_rulers_opts`.
+    table_rulers_opts(info, tol, lo, hi, min_gutter, false)
+}
+
+/// [`table_rulers`] with the merged-cell veto optionally disabled. When
+/// `wide_ok` is false, a word crossing a candidate start ruler always vetoes
+/// it (the original, geometrically strict behaviour); when true, a wide
+/// merged/spanning cell that begins at a real column and covers another one is
+/// tolerated (see `row_straddles_wide_ok`).
+fn table_rulers_opts(
+    info: &[RowInfo],
+    tol: f64,
+    lo: usize,
+    hi: usize,
+    min_gutter: f64,
+    wide_ok: bool,
+) -> Vec<f64> {
     let num_rows = hi - lo + 1;
     if num_rows < 2 {
         return Vec::new();
@@ -200,26 +218,66 @@ pub fn table_rulers(info: &[RowInfo], tol: f64, lo: usize, hi: usize, min_gutter
         return Vec::new();
     }
 
-    let mut candidates = cluster_positions(starts_with_row, tol);
-    candidates.extend(cluster_positions(ends_with_row, tol));
-    candidates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let start_candidates = cluster_positions(starts_with_row, tol);
+    let end_candidates = cluster_positions(ends_with_row, tol);
 
-    let rulers: Vec<f64> = candidates
-        .into_iter()
-        // Drop "rulers" that are actually interior word-starts/ends of one
-        // cell: a column boundary is never straddled by text in any row that
-        // itself shows genuine column-like spacing (prose-only continuation
-        // rows are exempt — see `row_straddles`).
-        .filter(|&x| (lo..=hi).all(|ri| !row_straddles(&info[ri], x, tol, min_gutter)))
-        .collect();
+    // Drop "rulers" that are actually interior word-starts/ends of one cell.
+    // Start-derived candidates use the relaxed test (a wide merged cell may
+    // legitimately cover them); end-derived candidates use the strict test.
+    // Collapse near-duplicate positions, keeping the leftmost of each group.
+    let dedup = |mut v: Vec<f64>| -> Vec<f64> {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut out: Vec<f64> = Vec::new();
+        for r in v {
+            match out.last() {
+                Some(prev) if r - *prev < min_gutter => {}
+                _ => out.push(r),
+            }
+        }
+        out
+    };
 
-    let mut merged: Vec<f64> = Vec::new();
-    for r in rulers {
-        match merged.last_mut() {
-            Some(prev) if r - *prev < min_gutter => {}
-            _ => merged.push(r),
+    let window_rows: Vec<usize> = (lo..=hi).collect();
+    let col_starts = start_candidates.clone();
+    let start_rulers = dedup(
+        start_candidates
+            .into_iter()
+            .filter(|&x| {
+                window_rows.iter().all(|&ri| {
+                    if wide_ok {
+                        !row_straddles_wide_ok(&info, &col_starts, ri, x, tol, min_gutter)
+                    } else {
+                        !row_straddles(&info[ri], x, tol, min_gutter)
+                    }
+                })
+            })
+            .collect(),
+    );
+    let end_rulers = dedup(
+        end_candidates
+            .into_iter()
+            .filter(|&x| window_rows.iter().all(|&ri| !row_straddles(&info[ri], x, tol, min_gutter)))
+            .collect(),
+    );
+
+    // Start-aligned boundaries are the primary column signal, so never let an
+    // end-derived ruler displace a start-derived one. An end cluster is only a
+    // word's right edge; if it sits a few points to the left of the next
+    // column's start (a normal narrow gutter), the old x-order dedup dropped
+    // the *start* in favour of the *end* (`|start - end| < min_gutter`), which
+    // silently deleted the whole next column. That only became visible once
+    // `Span.advance` was measured correctly: with the old 1-em advances every
+    // end sat at `start + 10pt`, safely clear of the following start. Keeping
+    // starts first and only *adding* end-derived rulers that are at least
+    // `min_gutter` away preserves the right-aligned-column support that the
+    // end pass exists for.
+    let mut merged = start_rulers;
+    for e in end_rulers {
+        if merged.iter().all(|&r| (e - r).abs() >= min_gutter) {
+            merged.push(e);
         }
     }
+    merged.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     merged
 }
 
@@ -258,6 +316,70 @@ fn row_straddles(row: &RowInfo, x: f64, tol: f64, min_gutter: f64) -> bool {
     row.words.iter().any(|w| w.x0 < x - tol && w.x1 > x + tol)
 }
 
+/// Start positions shared by at least two of `rows` (the column-start
+/// candidates for a window), used to tell a genuine merged cell from a
+/// fragmenting interior word-start.
+fn supported_starts(info: &[RowInfo], rows: &[usize], tol: f64) -> Vec<f64> {
+    let mut pts: Vec<(f64, usize)> = Vec::new();
+    for &ri in rows {
+        for &s in &info[ri].starts {
+            pts.push((s, ri));
+        }
+    }
+    cluster_positions(pts, tol)
+}
+
+/// Like `row_straddles`, but tolerating a *wide merged-cell* word on a
+/// continuation row. A word much wider than a normal column gutter, which
+/// begins at a genuine column position (present in `col_starts`, i.e. shared
+/// by at least two rows) and crosses the ruler comfortably inside its extent,
+/// is a merged/spanning cell whose content legitimately covers several
+/// columns; it must not veto a *start*-derived column boundary, because that
+/// would delete real columns. Every other crossing word — a narrow word, a
+/// word on a full header/data row, or a word that only grazes the ruler near
+/// its start — is still an interior word-start/end and vetoes. This only
+/// matters once run advances are measured correctly: with the old 1-em
+/// advances every word was ~10pt wide, so a wrapped continuation word never
+/// reached the next column and this distinction was invisible.
+fn row_straddles_wide_ok(
+    info: &[RowInfo],
+    col_starts: &[f64],
+    ri: usize,
+    x: f64,
+    tol: f64,
+    min_gutter: f64,
+) -> bool {
+    let row = &info[ri];
+    if !row_has_internal_gutter(&row.words, min_gutter) {
+        return false;
+    }
+    // Only a continuation row — one carrying fewer words than there are
+    // column starts — can plausibly hold a merged cell that overflows several
+    // columns. A full header/data row (as many words as columns) that crosses
+    // a boundary is a genuine fragmentation signal and keeps vetoing.
+    let row_is_continuation = row.words.len() < col_starts.len();
+    row.words.iter().any(|w| {
+        let crosses = w.x0 < x - tol && w.x1 > x + tol;
+        if !crosses {
+            return false;
+        }
+        let wide = (w.x1 - w.x0) > 4.0 * min_gutter;
+        if !wide {
+            return true;
+        }
+        let begins_at_column = col_starts
+            .iter()
+            .any(|&s| (s - w.x0).abs() <= tol * 1.5);
+        // The crossed ruler must sit comfortably *inside* the word, well clear
+        // of both its start and its end. A ruler only a few points from the
+        // word's start is an interior near-start (fragmentation); a merged
+        // cell that continues a neighbouring column has the inner rulers deep
+        // in its extent.
+        let well_inside = (x - w.x0) > 2.0 * min_gutter && (w.x1 - x) > 2.0 * min_gutter;
+        !(row_is_continuation && begins_at_column && well_inside)
+    })
+}
+
 /// Diagnostic tracer: prints when TABLE_TRACE env is set.
 fn t(msg: &str) {
     if std::env::var("TABLE_TRACE").is_ok() {
@@ -272,6 +394,20 @@ fn line_text(line: &[Span]) -> String {
 
 /// Detect grid tables on a page's visual lines.
 pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHit]) -> Vec<TableHit> {
+    // The public/lossy passes (including the stage-3b gap recovery) keep the
+    // original strict merged-cell veto; only `find_tables`'s explicit
+    // refinement pass opts into the relaxed one.
+    scan_aligned_grids_opts(lines, tol_mult, covered, false)
+}
+
+/// [`scan_aligned_grids`] with the merged-cell `wide_ok` veto setting threaded
+/// through to `table_rulers_opts`.
+fn scan_aligned_grids_opts(
+    lines: &[Vec<Span>],
+    tol_mult: f64,
+    covered: &[TableHit],
+    wide_ok: bool,
+) -> Vec<TableHit> {
     // A grid needs at least a header row and one data row (2 lines). A single
     // visual line can never hold a table, so reject below 2.
     if lines.len() < 2 {
@@ -386,7 +522,7 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
                     .map(|&i| info[i].size)
                     .fold(0.0f64, f64::max);
                 let min_gutter = (1.1 * max_size).max(6.0);
-                let rulers = table_rulers(&info, tol, band[lo], band[hi], min_gutter);
+                let rulers = table_rulers_opts(&info, tol, band[lo], band[hi], min_gutter, wide_ok);
                 let match_lo = rulers.iter().filter(|&&r| row_matches_ruler(&info[band[lo]], r, tol * 1.5)).count();
                 let match_hi = rulers.iter().filter(|&&r| row_matches_ruler(&info[band[hi]], r, tol * 1.5)).count();
                 if rulers.len() >= 2 && match_lo >= 2 && match_hi >= 2 {
@@ -418,7 +554,7 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
             let min_gutter = (1.1 * max_size).max(6.0);
             while hi + 1 < band.len() && rulers.len() >= 2 {
                 let next_ri = band[hi + 1];
-                let next_r = table_rulers(&info, tol, band[lo], next_ri, min_gutter);
+                let next_r = table_rulers_opts(&info, tol, band[lo], next_ri, min_gutter, wide_ok);
                 let next_match = next_r.iter().filter(|&&r| row_matches_ruler(&info[next_ri], r, tol * 1.5)).count();
                 if next_r.len() >= 2 && next_match >= 2 {
                     hi += 1;
@@ -475,11 +611,18 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
             ));
 
             // No indivisible word can straddle an interior column ruler,
-            // except in a prose-only continuation row (see `row_straddles`).
+            // except in a prose-only continuation row (see `row_straddles`)
+            // or when the crossing word is a wide merged/spanning cell
+            // (`row_straddles_wide_ok`).
+            let win_starts: Vec<f64> = supported_starts(&info, &win_rows, tol);
             let has_straddling_word = win_rows.iter().any(|&ri| {
-                rulers[1..]
-                    .iter()
-                    .any(|&r| row_straddles(&info[ri], r, tol, min_gutter))
+                rulers[1..].iter().any(|&r| {
+                    if wide_ok {
+                        row_straddles_wide_ok(&info, &win_starts, ri, r, tol, min_gutter)
+                    } else {
+                        row_straddles(&info[ri], r, tol, min_gutter)
+                    }
+                })
             });
             if has_straddling_word {
                 t(&format!(
@@ -573,7 +716,7 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
                             .map(|&i| bucket(&info, i, &rulers))
                             .collect();
                         let (table_rows, rulers) =
-                            merge_complementary_columns(table_rows, &win_rows, &info, &rulers);
+                            merge_complementary_columns(table_rows, &win_rows, &info, &rulers, tol);
                         // Drop fully-empty edge columns.
                         let ncol = rulers.len();
                         let mut c0 = 0usize;
@@ -629,7 +772,34 @@ pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHi
 
 /// Stage-3 table recovery: strict ruler alignment (the default pass).
 pub fn find_tables(lines: &[Vec<Span>]) -> Vec<TableHit> {
-    scan_aligned_grids(lines, 1.0, &[])
+    // The strict geometry is the primary detector. The relaxed pass (which
+    // tolerates a wide merged/spanning cell crossing a genuine column
+    // boundary — needed for dense bilingual grids whose continuation rows
+    // overflow several columns) may only *refine* a table the strict pass
+    // already found: if it overlaps a strict hit and resolves more columns,
+    // its finer segmentation replaces that hit. It never invents a table the
+    // strict geometry does not see, so it cannot turn ordinary address/prose
+    // blocks into spurious grids.
+    let mut hits = scan_aligned_grids_opts(lines, 1.0, &[], false);
+    let wide_hits = scan_aligned_grids_opts(lines, 1.0, &[], true);
+    for wh in wide_hits {
+        let Some(pos) = hits
+            .iter()
+            .position(|h| h.start <= wh.end && wh.start <= h.end)
+        else {
+            continue;
+        };
+        let strict_cols = hits[pos].rows.first().map(|r| r.len()).unwrap_or(0);
+        let wide_cols = wh.rows.first().map(|r| r.len()).unwrap_or(0);
+        // Only refine a table that is already genuinely tabular. A two-column
+        // strict hit is usually a clean label/value block; letting the relaxed
+        // pass absorb surrounding address/prose lines into it produces a worse
+        // grid, so small tables keep their strict segmentation.
+        if wide_cols > strict_cols && strict_cols >= 3 {
+            hits[pos] = wh;
+        }
+    }
+    hits
 }
 
 /// Stage-3b recovery pass: the same grid scan with a wider alignment
