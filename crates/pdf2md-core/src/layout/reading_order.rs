@@ -928,18 +928,28 @@ fn split_hard_breaks(line: &[Span]) -> Vec<Vec<Span>> {
     let mut segments = Vec::new();
     let mut cur: Vec<Span> = Vec::new();
     let mut prev_x: Option<f64> = None;
+    let mut prev_advance = 0.0f64;
     for s in line {
         let is_space = s.text.chars().all(|c| c == ' ');
         if let Some(px) = prev_x {
             if !is_space {
                 let size = s.size.max(0.1);
-                let gap = s.x - px;
+                // Measure the residual *whitespace* between the two spans, the
+                // same way `render_spans` does: subtract the previous span's
+                // own advance from the start-to-start distance. Comparing the
+                // raw start-to-start distance (as this used to) makes any span
+                // run wider than ~2.5em look like a new column, so a
+                // description drawn as several spans ("Nougat de l'" /
+                // "Abbaye" / " 250g") was carved into spurious separate lines
+                // even though `render_spans` would have kept it on one.
+                let gap = (s.x - px) - prev_advance;
                 if gap > 2.5 * size && !cur.is_empty() {
                     segments.push(std::mem::take(&mut cur));
                 }
             }
         }
         prev_x = Some(s.x);
+        prev_advance = s.advance;
         cur.push(s.clone());
     }
     if !cur.is_empty() {
@@ -2503,6 +2513,38 @@ mod paragraph_merge_tests {
             left[idx + 1..].iter().any(|t| t.contains("réservations")),
             "tail line must precede the left column footer: {left:?}"
         );
+    }
+
+    #[test]
+    fn split_hard_breaks_subtracts_previous_span_advance() {
+        // `render_spans` measures inter-span whitespace as
+        // `next.x - prev.x - prev.advance`; `split_hard_breaks` must use the
+        // same residual so the pre-split only cuts where a render would hard
+        // break. Here "Nougat de l'" is one span whose own 78pt advance carries
+        // the next span's start 78pt to the right — far past the 2.5em (25pt)
+        // hard-break threshold if measured start-to-start, but the actual
+        // whitespace between them is nil. Measuring the raw distance split the
+        // product description into separate lines ("Nougat de l'" / "Abbaye" /
+        // " 250g"); the residual gap must keep it one line.
+        let line = vec![
+            col_span("Nougat de l'", 50.0, 300.0),
+            col_span("Abbaye", 128.0, 300.0),
+            col_span("250g", 170.0, 300.0),
+        ];
+        let segs = split_hard_breaks(&line);
+        let rendered: Vec<String> = segs.iter().map(|s| render_spans(s)).collect();
+        assert_eq!(
+            segs.len(),
+            1,
+            "no spurious mid-line break: {rendered:?}"
+        );
+        // The whole-row render agrees: it emits no hard newline, so the
+        // pre-split must not either.
+        assert!(
+            !render_spans(&line).contains('\n'),
+            "render_spans keeps the row on one line"
+        );
+        assert!(render_spans(&line).contains("Abbaye 250g"));
     }
 }
 
