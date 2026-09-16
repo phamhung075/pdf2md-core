@@ -263,9 +263,19 @@ pub(crate) fn resolve_widths(doc: &Document, font: &Dictionary) -> Widths {
             return Widths::None;
         };
         let mut map = HashMap::new();
+        // `/W` elements are routinely *indirect* objects — a single shared
+        // width object referenced by every CID (and arrays referenced by the
+        // `/W` entry itself). Every element must be resolved through `deref`
+        // before it is read as a number or an array: otherwise `num()` sees an
+        // `Object::Reference`, the whole `/W` table is silently dropped, and
+        // every glyph falls back to `/DW` (1 em), inflating run advances and
+        // fusing words (e.g. `| Gesamtbetrag der Zuschläge0,00 |` on the
+        // intarsys EN16931 fixtures, whose `/W` is `[3 3 20 0 R 8 8 20 0 R …]`
+        // with object 20 = 600 while `/DW` defaults to 1000).
+        let numd = |o: &Object| -> Option<f64> { deref(doc, o).and_then(num) };
         let mut i = 0usize;
         while i < arr.len() {
-            let Some(c0) = num(&arr[i]).map(|v| v as u32) else {
+            let Some(c0) = numd(&arr[i]).map(|v| v as u32) else {
                 i += 1;
                 continue;
             };
@@ -273,15 +283,15 @@ pub(crate) fn resolve_widths(doc: &Document, font: &Dictionary) -> Widths {
             if i >= arr.len() {
                 break;
             }
-            if let Ok(vals) = arr[i].as_array() {
+            if let Some(vals) = deref(doc, &arr[i]).and_then(|o| o.as_array().ok()) {
                 for (k, it) in vals.iter().enumerate() {
-                    if let Some(v) = num(it) {
+                    if let Some(v) = numd(it) {
                         map.insert(c0 + k as u32, v);
                     }
                 }
                 i += 1;
             } else if i + 1 < arr.len() {
-                if let (Some(c1), Some(v)) = (num(&arr[i]).map(|x| x as u32), num(&arr[i + 1])) {
+                if let (Some(c1), Some(v)) = (numd(&arr[i]).map(|x| x as u32), numd(&arr[i + 1])) {
                     for c in c0..=c1 {
                         map.insert(c, v);
                     }
@@ -1309,6 +1319,57 @@ mod tests {
     #[test]
     fn cid_empty_run_has_no_width() {
         assert_eq!(cid_widths(HashMap::new(), None).width(&[]), None);
+    }
+
+    /// A Type0 `/W` table whose entries are *indirect* objects (one shared
+    /// width object referenced by many CIDs — the intarsys EN16931 layout)
+    /// must be resolved through `deref`. Before the fix `num()` saw an
+    /// `Object::Reference`, dropped every entry, and let each glyph fall back
+    /// to `/DW` (1000), inflating run advances by 1000/600 = 5/3 and fusing
+    /// neighbouring table cells ("Gesamtbetrag der Zuschläge0,00").
+    #[test]
+    fn resolve_widths_dereferences_indirect_w_values() {
+        let mut doc = Document::new();
+        let w600 = doc.add_object(Object::Integer(600));
+        let w500 = doc.add_object(Object::Integer(500));
+        // Range form `c_first c_last w`, each `w` indirect.
+        let warr_compact = doc.add_object(Object::Array(vec![
+            Object::Integer(3),
+            Object::Integer(3),
+            Object::Reference(w600),
+            Object::Integer(8),
+            Object::Integer(8),
+            Object::Reference(w500),
+        ]));
+        // Array form `c [w1 w2]` with the widths themselves indirect.
+        let warr_list = doc.add_object(Object::Array(vec![
+            Object::Integer(20),
+            Object::Array(vec![Object::Reference(w600), Object::Reference(w500)]),
+        ]));
+
+        for warr in [warr_compact, warr_list] {
+            let mut cid = Dictionary::new();
+            cid.set(b"Subtype", Object::Name(b"CIDFontType2".to_vec()));
+            cid.set(b"W", Object::Reference(warr));
+            let desc = doc.add_object(Object::Dictionary(cid));
+            let mut font = Dictionary::new();
+            font.set(b"Subtype", Object::Name(b"Type0".to_vec()));
+            font.set(
+                b"DescendantFonts",
+                Object::Array(vec![Object::Reference(desc)]),
+            );
+            let widths = resolve_widths(&doc, &font);
+            match &widths {
+                Widths::Cid { map, default, .. } => {
+                    assert_eq!(*default, 1000.0);
+                    let (a, b) = if map.contains_key(&3) { (3u32, 8u32) } else { (20u32, 21u32) };
+                    assert_eq!(map.get(&a), Some(&600.0), "indirect /W width for CID {a} must resolve");
+                    assert_eq!(map.get(&b), Some(&500.0), "indirect /W width for CID {b} must resolve");
+                    assert_eq!(widths.width(&[0x00, a as u8]), Some(600.0));
+                }
+                _ => panic!("expected Widths::Cid for Type0 font"),
+            }
+        }
     }
 
     #[test]
