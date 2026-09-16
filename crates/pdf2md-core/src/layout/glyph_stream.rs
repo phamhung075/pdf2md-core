@@ -632,7 +632,25 @@ fn append_table_zones(blocks: &mut Vec<crate::layout::reading_order::DocBlock>, 
             if contained[i] {
                 continue;
             }
-            let inside = b.x0 >= tx0 && b.x1 <= tx1 && b.y0 >= ty0 && b.y1 <= ty1;
+            // `hit.bbox` is built from span *baselines* (`min_y`/`max_y` of
+            // `sp.y` in `find_tables`), while `build_doc_blocks` pads every
+            // block by half its font size above/below its baseline band. A
+            // strict bbox containment test therefore never matches a fragment
+            // sitting on the table's first or last row — it always overhangs
+            // the bbox by ~0.5em — so those cell fragments (and any
+            // cross-column paragraph merge inside the grid) leak into the zone
+            // list beside the table zone instead of being collapsed into it.
+            // Compare the fragment's centre, which is padding-independent,
+            // against the baseline bbox; the small epsilon absorbs the
+            // half-em overhang on a single-row fragment whose centre lands
+            // exactly on the bbox edge.
+            const EDGE_EPS: f64 = 0.5;
+            let cx = 0.5 * (b.x0 + b.x1);
+            let cy = 0.5 * (b.y0 + b.y1);
+            let inside = cx >= tx0 - EDGE_EPS
+                && cx <= tx1 + EDGE_EPS
+                && cy >= ty0 - EDGE_EPS
+                && cy <= ty1 + EDGE_EPS;
             if inside && matches!(b.kind.as_str(), "body" | "list" | "caption") {
                 contained[i] = true;
             }
@@ -1275,6 +1293,78 @@ mod tests {
         append_table_zones(&mut blocks, &[hit]);
         // A "figure" fragment inside the table bbox is NOT dropped.
         assert!(blocks.iter().any(|b| b.kind == "figure"));
+    }
+
+    #[test]
+    fn test_append_table_zones_suppresses_fragments_on_table_edge_rows() {
+        // Regression for synth_facture_btp_autoliquidation.pdf: `hit.bbox` is
+        // baseline-based (`find_tables` uses the min/max span `y`), but
+        // `build_doc_blocks` pads each fragment by half its font size. A
+        // fragment on the table's first or last row overhangs the bbox by
+        // ~0.5em, so the old strict-containment test never suppressed it: the
+        // header cell `Qté` and the last-row cell `1400,00 €` (both padded to
+        // y 625..635 / 589..599 around a 594..630 bbox) leaked as "body"
+        // fragments next to the table zone, as did the cross-column paragraph
+        // merge `Total HT 1`. A genuine prose line below the table must stay.
+        use crate::layout::reading_order::DocBlock;
+        use crate::layout::tables::TableHit;
+        use crate::models::BoundingBox;
+
+        fn frag(kind: &str, x0: f64, y0: f64, x1: f64, y1: f64, t: &str) -> DocBlock {
+            DocBlock {
+                page: 1,
+                kind: kind.into(),
+                x0,
+                y0,
+                x1,
+                y1,
+                text: t.into(),
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+            }
+        }
+
+        let mut blocks = vec![
+            // Header-row cell: baseline 630, padded to 625..635 (overhangs y1).
+            frag("body", 300.0, 625.0, 316.0, 635.0, "Qté"),
+            // Last-row cell: baseline 594, padded to 589..599 (overhangs y0).
+            frag("body", 350.0, 589.0, 394.5, 599.0, "1400,00 €"),
+            // Cross-column paragraph merge inside the grid.
+            frag("body", 300.0, 607.0, 508.0, 635.0, "Total HT 1"),
+            // Genuine prose just below the table: centre outside the bbox.
+            frag("body", 56.0, 650.0, 300.0, 660.0, "Autoliquidation"),
+        ];
+        let hit = TableHit {
+            start: 0,
+            end: 2,
+            rows: vec![
+                vec!["Désignation".to_string(), "Qté".to_string()],
+                vec!["x".to_string(), "1".to_string()],
+                vec!["y".to_string(), "2".to_string()],
+            ],
+            // Baseline bbox, exactly as find_tables builds it.
+            bbox: BoundingBox::new(56.0, 594.0, 514.5, 630.0),
+        };
+        append_table_zones(&mut blocks, &[hit]);
+
+        assert_eq!(
+            blocks.iter().filter(|b| b.kind == "table").count(),
+            1,
+            "exactly one table zone must be emitted"
+        );
+        for dropped in ["Qté", "1400,00 €", "Total HT 1"] {
+            assert!(
+                !blocks.iter().any(|b| b.text == dropped),
+                "table-edge fragment {dropped:?} must be collapsed into the table zone: {:?}",
+                blocks.iter().map(|b| b.text.clone()).collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            blocks.iter().any(|b| b.text == "Autoliquidation"),
+            "prose outside the table bbox must survive: {:?}",
+            blocks.iter().map(|b| b.text.clone()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
