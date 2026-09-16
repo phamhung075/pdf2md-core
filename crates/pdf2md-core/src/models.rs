@@ -104,6 +104,55 @@ impl CanvasTable {
         s
     }
 
+    /// True when a cell holds a bare value (number, currency amount,
+    /// percentage) rather than a textual label. Used to tell a genuine header
+    /// row from the first row of a *headerless* label/value grid (the totals
+    /// block of an invoice, a key/value summary), whose promotion to the GFM
+    /// header would demote a data row and lose it from the record set.
+    fn is_value_cell(cell: &str) -> bool {
+        let t = cell
+            .trim()
+            .trim_matches(|c: char| matches!(c, '€' | '$' | '£' | ' ' | '\u{00a0}'));
+        if t.is_empty() {
+            return false;
+        }
+        let mut has_digit = false;
+        for ch in t.chars() {
+            if ch.is_ascii_digit() {
+                has_digit = true;
+            } else if !matches!(ch, '.' | ',' | '-' | '+' | '%' | '/' | '\'' | ' ' | '\u{00a0}') {
+                return false;
+            }
+        }
+        has_digit
+    }
+
+    /// Whether `rows[0]` is a real header. It is **not** when the first row
+    /// already looks like its own data: a textual label plus a value column
+    /// (`Total HT | 1250,00 €`) that stays a value column for every other row.
+    /// A conventional header (`Désignation | Qté | PU HT | TVA | Total HT`) has
+    /// no value cell in row 0 and is kept; so is an all-numeric first row, so
+    /// the existing cell-count contract for headerless numeric grids is
+    /// unchanged.
+    fn first_row_is_header(rows: &[Vec<String>]) -> bool {
+        if rows.len() < 2 {
+            return true;
+        }
+        let num_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let has_label = (0..num_cols).any(|c| {
+            let v = rows[0].get(c).map(|s| s.as_str()).unwrap_or("").trim();
+            !v.is_empty() && !Self::is_value_cell(v)
+        });
+        let has_value_column = (0..num_cols).any(|c| {
+            Self::is_value_cell(rows[0].get(c).map(|s| s.as_str()).unwrap_or(""))
+                && rows.iter().all(|r| {
+                    let v = r.get(c).map(|s| s.as_str()).unwrap_or("").trim();
+                    v.is_empty() || Self::is_value_cell(v)
+                })
+        });
+        !(has_label && has_value_column)
+    }
+
     /// Renders the reconstructed table into standard GitHub Flavored Markdown (GFM) pipe table.
     pub fn to_markdown(&self) -> String {
         if self.rows.is_empty() {
@@ -117,11 +166,20 @@ impl CanvasTable {
 
         let mut md = String::new();
 
+        // Row 0 is the header only for a table that actually has one. A
+        // headerless label/value grid (invoice totals: `Total HT | 1250,00 €`)
+        // is emitted with a synthesized empty header so all of its rows stay
+        // data rows, matching what vision/ground truth read.
+        let has_header = Self::first_row_is_header(&self.rows);
+
         // Header row (row 0 or synthesized)
-        let header = &self.rows[0];
         md.push('|');
         for c in 0..num_cols {
-            let val = header.get(c).map(|s| s.as_str()).unwrap_or("");
+            let val = if has_header {
+                self.rows[0].get(c).map(|s| s.as_str()).unwrap_or("")
+            } else {
+                ""
+            };
             md.push_str(&format!(" {} |", Self::md_cell(val)));
         }
         md.push('\n');
@@ -142,8 +200,9 @@ impl CanvasTable {
         }
         md.push('\n');
 
-        // Data rows
-        for row in self.rows.iter().skip(1) {
+        // Data rows. For a headerless grid row 0 is data, so it is emitted too.
+        let data_start = if has_header { 1 } else { 0 };
+        for row in self.rows.iter().skip(data_start) {
             md.push('|');
             for c in 0..num_cols {
                 let val = row.get(c).map(|s| s.as_str()).unwrap_or("");
@@ -234,4 +293,66 @@ pub struct ConversionResult {
     /// layout engine.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<crate::layout::DocBlock>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table(rows: Vec<Vec<&str>>) -> CanvasTable {
+        CanvasTable::new(
+            rows.into_iter()
+                .map(|r| r.into_iter().map(|s| s.to_string()).collect())
+                .collect(),
+            BoundingBox::new(0.0, 0.0, 0.0, 0.0),
+        )
+    }
+
+    /// Invoice totals block: every row is a label/value pair, so row 0 is data,
+    /// not a header. Regression for the `Total HT` row being swallowed by the
+    /// synthesized GFM header.
+    #[test]
+    fn headerless_label_value_grid_keeps_first_row_as_data() {
+        let t = table(vec![
+            vec!["Total HT", "1250,00 €"],
+            vec!["Total TVA", "0,00 €"],
+            vec!["Total TTC", "1250,00 €"],
+        ]);
+        let md = t.to_markdown();
+        let first = md.lines().next().unwrap();
+        assert!(
+            first.chars().all(|c| c == '|' || c == ' '),
+            "expected an empty header, got {first:?} in\n{md}"
+        );
+        assert!(md.contains("| Total HT | 1250,00 € |"), "Totals row lost:\n{md}");
+        assert!(md.contains("| Total TVA | 0,00 € |"), "{md}");
+        assert!(md.contains("| Total TTC | 1250,00 € |"), "{md}");
+    }
+
+    /// A conventional header (no value cell in row 0) is still emitted as the
+    /// header, so ordinary tables are untouched.
+    #[test]
+    fn real_header_row_is_preserved() {
+        let t = table(vec![
+            vec!["Désignation", "Qté", "PU HT", "TVA", "Total HT"],
+            vec!["Prestation de conseil", "1", "800,00 €", "-", "800,00 €"],
+        ]);
+        let md = t.to_markdown();
+        assert!(
+            md.starts_with("| Désignation | Qté | PU HT | TVA | Total HT |\n"),
+            "{md}"
+        );
+    }
+
+    /// All-numeric first rows keep the existing row-0-as-header contract that
+    /// the structural benchmark's `table_borderless_numbers` scores against.
+    #[test]
+    fn all_numeric_first_row_keeps_header_contract() {
+        let t = table(vec![
+            vec!["1200.00", "45.50", "7.20"],
+            vec!["443.10", "12.00", "9.90"],
+        ]);
+        let md = t.to_markdown();
+        assert!(md.starts_with("| 1200.00 | 45.50 | 7.20 |\n"), "{md}");
+    }
 }
