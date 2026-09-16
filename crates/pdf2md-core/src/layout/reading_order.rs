@@ -386,6 +386,24 @@ pub fn detect_projection_two_columns(lines: &[Vec<Span>]) -> Option<PageColumns>
                 top_full.push(b.line);
             } else if b.y <= col_bottom + 5.0 {
                 bottom_full.push(b.line);
+            } else {
+                // A mid-block row that cannot be split into two non-empty
+                // halves — e.g. the whole line is a *single* span (PDF
+                // producers often draw `TVA Intracommunautaire : FR…` as one
+                // TJ run) whose advance crosses the gutter, so the
+                // complement partition puts it entirely on one side and the
+                // other half comes back empty. The top/bottom fallback above
+                // only accepts rows at the block's edge, so without this a
+                // mid-block row vanished from BOTH reading-order streams (and
+                // therefore from the `blocks` channel) even though the
+                // Markdown, rendered through the band path, kept it. Keep it
+                // whole on the side its box centre leans to.
+                let cx = 0.5 * (b.x0 + b.x1);
+                if cx <= gx {
+                    left.push((b.y, b.line.clone()));
+                } else {
+                    right.push((b.y, b.line.clone()));
+                }
             }
             continue;
         }
@@ -2001,6 +2019,63 @@ mod tests {
                 .iter()
                 .map(|r| r.iter().map(|s| s.text.clone()).collect::<Vec<_>>())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn projection_columns_keep_unsplittable_straddling_line() {
+        // A whole line emitted as ONE span (PDF producers commonly draw
+        // `TVA Intracommunautaire : FR23391284650` as a single TJ run)
+        // crosses the column gutter, so the total-complement partition puts
+        // the entire span on one side and leaves the other half empty. The
+        // `both halves non-empty` guard then sends the row to the top/bottom
+        // fallback, which only accepts rows at the block's edge — so a
+        // mid-block row vanished from BOTH reading-order streams (and from
+        // the `blocks` channel) while the Markdown, rendered through the
+        // separate band path, kept it. Unlike the multi-span straddler
+        // covered by `projection_columns_keep_gutter_straddling_span`, no
+        // split of this row can produce two non-empty halves, so it must be
+        // kept whole on the side its box leans to.
+        fn mk(text: &str, x: f64, adv: f64, y: f64) -> Span {
+            Span {
+                text: text.to_string(),
+                x,
+                y,
+                size: 10.0,
+                advance: adv,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_vertical: false,
+            }
+        }
+        // Left column [10,65], right column [100,160] -> gx = 82.5.
+        // The left-only / right-only rows set col_top=690, col_bottom=660 so
+        // the straddler at y=675 is strictly *inside* the column block.
+        let lines: Vec<Vec<Span>> = vec![
+            vec![mk("L", 10.0, 55.0, 700.0), mk("R", 100.0, 60.0, 700.0)],
+            vec![mk("A", 10.0, 55.0, 690.0)],
+            vec![mk("B", 100.0, 60.0, 680.0)],
+            vec![mk("TVA Intracommunautaire : FR23391284650", 10.0, 130.0, 675.0)],
+            vec![mk("C", 10.0, 55.0, 670.0)],
+            vec![mk("D", 100.0, 60.0, 660.0)],
+        ];
+        let pc = detect_projection_two_columns(&lines)
+            .expect("a consistent two-column projection must be detected");
+        let kept: String = pc
+            .left
+            .iter()
+            .chain(pc.right.iter())
+            .flat_map(|row| row.iter())
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(
+            kept.contains("TVA Intracommunautaire"),
+            "a single-span line crossing the gutter must not vanish: left={:?} right={:?} top={:?} bottom={:?}",
+            pc.left.iter().map(|r| r.iter().map(|s| s.text.clone()).collect::<Vec<_>>()).collect::<Vec<_>>(),
+            pc.right.iter().map(|r| r.iter().map(|s| s.text.clone()).collect::<Vec<_>>()).collect::<Vec<_>>(),
+            pc.top_full.iter().map(|r| r.iter().map(|s| s.text.clone()).collect::<Vec<_>>()).collect::<Vec<_>>(),
+            pc.bottom_full.iter().map(|r| r.iter().map(|s| s.text.clone()).collect::<Vec<_>>()).collect::<Vec<_>>(),
         );
     }
 }
