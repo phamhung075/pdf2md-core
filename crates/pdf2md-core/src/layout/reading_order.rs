@@ -363,8 +363,20 @@ pub fn detect_projection_two_columns(lines: &[Vec<Span>]) -> Option<PageColumns>
 
     for b in boxes {
         if b.x0 < gx && b.x1 > gx {
+            // Partition the row's spans completely: `left` takes everything
+            // that ends at or before the gutter and `right` takes the exact
+            // complement. Two independent half-open filters (`x + advance <=
+            // gx` and `x >= gx`) leave any span that *straddles* the gutter —
+            // e.g. a glyph whose advance crosses it — in neither half, so that
+            // span's text is silently deleted from BOTH columns (the row is
+            // still pushed because each half is non-empty). On the FNFE
+            // MINIMUM invoice this dropped the middle `0` of `120 000,00 €`
+            // from the `blocks` channel while the Markdown, rendered through
+            // the band path, kept it. The complement filter is total: every
+            // span lands in exactly one side, and a straddler follows the side
+            // its box leans to (it is kept whole instead of vanishing).
             let left_spans: Vec<Span> = b.line.iter().filter(|s| s.x + s.advance <= gx).cloned().collect();
-            let right_spans: Vec<Span> = b.line.iter().filter(|s| s.x >= gx).cloned().collect();
+            let right_spans: Vec<Span> = b.line.iter().filter(|s| s.x + s.advance > gx).cloned().collect();
             if !left_spans.is_empty() && !right_spans.is_empty() {
                 left.push((b.y, left_spans));
                 right.push((b.y, right_spans));
@@ -1920,6 +1932,64 @@ mod tests {
             span("After", 165.0, (false, false, false)),
         ];
         assert_eq!(render_spans(&line), "**BoldTail** After");
+    }
+
+    #[test]
+    fn projection_columns_keep_gutter_straddling_span() {
+        // Regression for fnfe_Facture_FR_MINIMUM.pdf: `detect_projection_two_columns`
+        // assigned each column half with two independent half-open filters
+        // (`x + advance <= gx` and `x >= gx`). A span whose box *straddles* the
+        // page gutter satisfied neither test, so its text was dropped from BOTH
+        // columns — silently deleting the middle `0` of `120 000,00 €` (and the
+        // `d` of `Fiducial`) from the structured `blocks` channel while the
+        // Markdown, rendered via the band path, kept it. Every span must land in
+        // exactly one side.
+        fn mk(text: &str, x: f64, adv: f64, y: f64) -> Span {
+            Span {
+                text: text.to_string(),
+                x,
+                y,
+                size: 10.0,
+                advance: adv,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_vertical: false,
+            }
+        }
+        let mut lines: Vec<Vec<Span>> = Vec::new();
+        for i in 0..4 {
+            let y = 700.0 - 10.0 * i as f64;
+            // Left column [10,65]; right column [100,160]; the "Z" span
+            // [66,86] straddles the resulting gx = 82.5.
+            lines.push(vec![
+                mk("L", 10.0, 55.0, y),
+                mk("Z", 66.0, 20.0, y),
+                mk("R", 100.0, 60.0, y),
+            ]);
+        }
+        // Left-only and right-only rows give the projection enough support.
+        lines.push(vec![mk("L", 10.0, 55.0, 660.0)]);
+        lines.push(vec![mk("R", 100.0, 60.0, 650.0)]);
+
+        let pc = detect_projection_two_columns(&lines)
+            .expect("a consistent two-column projection must be detected");
+        let kept: String = pc
+            .left
+            .iter()
+            .chain(pc.right.iter())
+            .flat_map(|row| row.iter())
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(
+            kept.matches('Z').count(),
+            4,
+            "a gutter-straddling span must be kept whole in one column: {:?}",
+            pc.left
+                .iter()
+                .map(|r| r.iter().map(|s| s.text.clone()).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
     }
 }
 
