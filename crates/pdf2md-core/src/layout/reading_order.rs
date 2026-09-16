@@ -1482,10 +1482,15 @@ fn detect_list_marker(line: &[Span]) -> Option<(bool, usize)> {
     if skip >= line.len() {
         return None; // marker with no item text
     }
-    if is_ordered && !separated {
+    if !separated {
         // No explicit space span: require a real horizontal gap. Kerning a
         // decimal apart places the two spans flush (~0 pt apart), while a
-        // genuine list space leaves roughly a quarter-em or more.
+        // genuine list space leaves roughly a quarter-em or more. The same
+        // applies to a bullet: a negative amount reaches this layer as glyph
+        // runs, so `-218,48` is the lone marker-shaped span `-` followed
+        // flush by the digits. Without a gap it is a sign, not a Markdown
+        // bullet — treating it as one strips the minus and shifts the value
+        // into a list, which silently turns every credit-note amount positive.
         let gap = line[skip].x - (marker.x + marker.advance);
         if gap <= 0.1 * marker.size.max(1.0) {
             return None;
@@ -2052,6 +2057,36 @@ mod structural_tests {
             detect_list_marker(&line).is_none(),
             "the integer part of a kerned decimal must not become a list marker"
         );
+    }
+
+    #[test]
+    fn negative_amount_minus_is_not_an_unordered_list_marker() {
+        // A credit-note amount reaches this layer as glyph runs: `-218,48`
+        // arrives as the lone span `-` immediately followed (flush, ~0 pt gap)
+        // by the digits. That is a numeric sign, not a Markdown bullet;
+        // treating it as one strips the minus and turns the credit positive.
+        let line = vec![
+            word("-", 100.0, BODY, false),
+            word("218,48", 106.0, BODY, false), // flush against "-"'s advance (100 + 6)
+            word(" ", 142.0, BODY, false),
+            word("€", 148.0, BODY, false),
+        ];
+        assert!(
+            detect_list_marker(&line).is_none(),
+            "a negative amount's sign must not become an unordered-list bullet"
+        );
+    }
+
+    #[test]
+    fn dash_bullet_with_a_real_space_gap_is_still_detected() {
+        // No explicit space span, but a genuine positional gap: a real dash
+        // bullet must survive the negative-sign guard.
+        let line = vec![
+            word("-", 100.0, BODY, false),
+            word("Item text", 112.0, BODY, false),
+        ];
+        let (ordered, _) = detect_list_marker(&line).expect("real bullet with a gap");
+        assert!(!ordered);
     }
 
     #[test]
