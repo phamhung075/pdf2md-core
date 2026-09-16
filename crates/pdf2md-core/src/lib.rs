@@ -37,6 +37,172 @@ pub use models::{
 
 use crate::time::MonoClock;
 
+/// Loads a PDF with lopdf, transparently repairing a classic cross-reference
+/// table whose `startxref` pointer and/or per-object byte offsets are stale.
+///
+/// Some real-world producers emit a file whose `startxref` points a byte or two
+/// past the `xref` keyword and whose trailing object offsets drift, while every
+/// object body is intact. lopdf trusts the declared offsets verbatim and fails
+/// the whole load with `invalid file trailer`, even though MuPDF, browsers and
+/// every other reader open the file. This is a fallback only: a well-formed
+/// document is loaded on the first, unmodified attempt.
+fn load_pdf_document(bytes: &[u8]) -> Result<lopdf::Document, String> {
+    match lopdf::Document::load_mem(bytes) {
+        Ok(doc) => Ok(doc),
+        Err(first_err) => {
+            if let Some(repaired) = repair_classic_xref(bytes) {
+                if let Ok(doc) = lopdf::Document::load_mem(&repaired) {
+                    return Ok(doc);
+                }
+            }
+            Err(format!("lopdf parsing error: {}", first_err))
+        }
+    }
+}
+
+/// Rebuilds a classic cross-reference table from the actual `N G obj` headers
+/// when the declared offsets disagree with them, and corrects the trailing
+/// `startxref` value. Returns `None` for files with no classic table, or whose
+/// entries do not have the fixed 20-byte layout — we only rewrite a table we
+/// fully understand, so a genuine parse failure is still reported unchanged.
+fn repair_classic_xref(bytes: &[u8]) -> Option<Vec<u8>> {
+    let xref_pos = find_last_xref_keyword(bytes)?;
+
+    // Each subsection is "<first> <count>\n" followed by `count` fixed-width
+    // entries; a well-formed file has one, incremental updates may chain more.
+    let mut entries: Vec<(u32, usize)> = Vec::new();
+    let mut p = skip_ws(bytes, xref_pos + 4);
+    while !bytes[p..].starts_with(b"trailer") {
+        let (first, after_first) = parse_uint(bytes, p)?;
+        let (count, after_count) = parse_uint(bytes, skip_ws(bytes, after_first))?;
+        p = skip_ws(bytes, after_count);
+        for i in 0..count {
+            let e = p.checked_add((i as usize).checked_mul(20)?)?;
+            let entry = bytes.get(e..e.checked_add(20)?)?;
+            if entry[10] != b' ' || entry[16] != b' ' || !matches!(entry[17], b'n' | b'f') {
+                return None;
+            }
+            if entry[17] == b'n' {
+                entries.push((first.checked_add(i)?, e));
+            }
+        }
+        p = p.checked_add((count as usize).checked_mul(20)?)?;
+        p = skip_ws(bytes, p);
+    }
+    if entries.is_empty() {
+        return None;
+    }
+
+    let positions = scan_object_offsets(bytes);
+    let mut out = bytes.to_vec();
+    let mut changed = false;
+    for (num, entry_pos) in &entries {
+        let true_off = *positions.get(num)?;
+        let field = format!("{:010}", true_off);
+        if out[*entry_pos..*entry_pos + 10] != *field.as_bytes() {
+            out[*entry_pos..*entry_pos + 10].copy_from_slice(field.as_bytes());
+            changed = true;
+        }
+    }
+
+    // Point the last `startxref` at the keyword we actually found.
+    let sx = find_last(bytes, b"startxref")?;
+    let digits_start = skip_ws(bytes, sx + b"startxref".len());
+    let (_, digits_end) = parse_uint(bytes, digits_start)?;
+    let corrected = xref_pos.to_string();
+    if out[digits_start..digits_end] != *corrected.as_bytes() {
+        out.splice(digits_start..digits_end, corrected.into_bytes());
+        changed = true;
+    }
+
+    changed.then_some(out)
+}
+
+fn find_last(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).rposition(|w| w == needle)
+}
+
+fn find_last_xref_keyword(bytes: &[u8]) -> Option<usize> {
+    let mut before = bytes.len();
+    while before >= 4 {
+        let pos = bytes[..before].windows(4).rposition(|w| w == b"xref")?;
+        let at_line_start = pos == 0 || matches!(bytes[pos - 1], b'\n' | b'\r');
+        let followed_by_ws = bytes.get(pos + 4).map_or(false, |b| b.is_ascii_whitespace());
+        if at_line_start && followed_by_ws {
+            return Some(pos);
+        }
+        before = pos;
+    }
+    None
+}
+
+fn skip_ws(bytes: &[u8], mut p: usize) -> usize {
+    while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+        p += 1;
+    }
+    p
+}
+
+fn parse_uint(bytes: &[u8], start: usize) -> Option<(u32, usize)> {
+    let mut p = start;
+    while p < bytes.len() && bytes[p].is_ascii_digit() {
+        p += 1;
+    }
+    if p == start {
+        return None;
+    }
+    let value = std::str::from_utf8(&bytes[start..p]).ok()?.parse().ok()?;
+    Some((value, p))
+}
+
+/// Maps every object number to the byte offset of its `N G obj` header by
+/// scanning the file body, so a stale xref entry can be pointed at the truth.
+fn scan_object_offsets(bytes: &[u8]) -> std::collections::HashMap<u32, usize> {
+    let mut found = std::collections::HashMap::new();
+    let mut from = 0;
+    while let Some(rel) = find_from(bytes, b" obj", from) {
+        if let Some((num, start)) = parse_object_header(bytes, rel) {
+            found.entry(num).or_insert(start);
+        }
+        from = rel + 4;
+    }
+    found
+}
+
+fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if from >= hay.len() {
+        return None;
+    }
+    hay[from..].windows(needle.len()).position(|w| w == needle).map(|p| from + p)
+}
+
+/// Parses the `<num> <gen>` immediately preceding the ` obj` at `space`, and
+/// returns `(num, offset_of_num)` only when the header starts at a line
+/// boundary (so a byte sequence inside a stream is not mistaken for one).
+fn parse_object_header(bytes: &[u8], space: usize) -> Option<(u32, usize)> {
+    if bytes.get(space + 1..space + 4)? != b"obj" {
+        return None;
+    }
+    let mut k = space;
+    let gen_end = k;
+    while k > 0 && bytes[k - 1].is_ascii_digit() {
+        k -= 1;
+    }
+    if k == gen_end || k == 0 || bytes[k - 1] != b' ' {
+        return None;
+    }
+    k -= 1;
+    let num_end = k;
+    while k > 0 && bytes[k - 1].is_ascii_digit() {
+        k -= 1;
+    }
+    if k == num_end || (k > 0 && !matches!(bytes[k - 1], b'\n' | b'\r')) {
+        return None;
+    }
+    let num = std::str::from_utf8(&bytes[k..num_end]).ok()?.parse().ok()?;
+    Some((num, k))
+}
+
 /// Probes whether raw PDF bytes contain a digital text stream without full rendering.
 pub fn is_digital_pdf_bytes(bytes: &[u8]) -> bool {
     if bytes.len() < 32 || !bytes.starts_with(b"%PDF-") {
@@ -48,7 +214,7 @@ pub fn is_digital_pdf_bytes(bytes: &[u8]) -> bool {
     // (where "BT"/"Tj" never appear in the raw bytes) — e.g. PDFCreator/
     // Ghostscript tickets and most modern PDFs. A page is "digital" if it
     // references any font or issues any text-show operator.
-    if let Ok(doc) = lopdf::Document::load_mem(bytes) {
+    if let Ok(doc) = load_pdf_document(bytes) {
         for (_page_num, page_id) in doc.get_pages() {
             if doc.get_page_fonts(page_id).map_or(false, |f| !f.is_empty()) {
                 return true;
@@ -409,9 +575,9 @@ pub fn convert_pdf_bytes_to_markdown(
 ) -> Result<ConversionResult, String> {
     let t0 = MonoClock::now();
 
-    // Try parsing with lopdf
-    let doc =
-        lopdf::Document::load_mem(bytes).map_err(|e| format!("lopdf parsing error: {}", e))?;
+    // Try parsing with lopdf, falling back to a cross-reference repair for the
+    // real-world producers whose `startxref`/object offsets have drifted.
+    let doc = load_pdf_document(bytes)?;
 
     let mut full_markdown = String::new();
     let total_pages = doc.get_pages().len();
@@ -1170,5 +1336,52 @@ mod regression_tests {
                 "the single page must be counted below a raised 10-word floor"
             );
         }
+    }
+
+    /// Builds a minimal PDF whose classic xref table points every object two
+    /// bytes late and whose `startxref` is likewise stale — the drift the real
+    /// FNFE/Factur-X French invoice fixtures ship. The object bodies are valid.
+    fn drifted_xref_pdf() -> Vec<u8> {
+        let objects: [&[u8]; 4] = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 200 200 ] /Contents 4 0 R /Resources << >> >>",
+            b"<< /Length 0 >>\nstream\n\nendstream",
+        ];
+        let mut body = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, obj) in objects.iter().enumerate() {
+            offsets.push(body.len());
+            body.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            body.extend_from_slice(obj);
+            body.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_pos = body.len();
+        let mut tail = format!("xref\n0 {}\n", objects.len() + 1).into_bytes();
+        tail.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            // Deliberately stale: two bytes past the true object header.
+            tail.extend_from_slice(format!("{:010} 00000 n \n", off + 2).as_bytes());
+        }
+        tail.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+                objects.len() + 1,
+                xref_pos + 2
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&tail);
+        body
+    }
+
+    #[test]
+    fn stale_startxref_and_object_offsets_are_repaired() {
+        let bytes = drifted_xref_pdf();
+        // The raw bytes are genuinely unparseable without the repair: this is
+        // the exact failure that made a whole FNFE FR invoice fail Tier A.
+        assert!(lopdf::Document::load_mem(&bytes).is_err());
+        let doc = load_pdf_document(&bytes).expect("repair must recover a drifted xref");
+        assert_eq!(doc.get_pages().len(), 1);
     }
 }

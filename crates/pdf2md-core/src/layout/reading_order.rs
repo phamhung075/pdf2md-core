@@ -1467,12 +1467,29 @@ fn detect_list_marker(line: &[Span]) -> Option<(bool, usize)> {
         return None;
     }
 
+    let marker = &line[idx];
     let mut skip = idx + 1;
+    // A marker is separated from its item text by whitespace: either the
+    // marker span itself carries a trailing space, or the next span is a
+    // pure-space span. `"20."` immediately followed by `"0"` — the integer and
+    // fractional parts of a decimal number kerned into two spans — has
+    // neither, and is a value, not an ordered-list marker.
+    let mut separated = marker.text.ends_with(|c: char| c.is_whitespace());
     if skip < line.len() && line[skip].text.chars().all(|c| c == ' ') {
+        separated = true;
         skip += 1;
     }
     if skip >= line.len() {
         return None; // marker with no item text
+    }
+    if is_ordered && !separated {
+        // No explicit space span: require a real horizontal gap. Kerning a
+        // decimal apart places the two spans flush (~0 pt apart), while a
+        // genuine list space leaves roughly a quarter-em or more.
+        let gap = line[skip].x - (marker.x + marker.advance);
+        if gap <= 0.1 * marker.size.max(1.0) {
+            return None;
+        }
     }
     Some((is_ordered, skip))
 }
@@ -2018,6 +2035,34 @@ mod structural_tests {
     fn ordered_paren_marker_is_detected() {
         let line = bulleted_line("2)");
         let (ordered, _) = detect_list_marker(&line).expect("must detect ordered marker");
+        assert!(ordered);
+    }
+
+    #[test]
+    fn kerned_decimal_is_not_an_ordered_list_marker() {
+        // A tax rate "20.0" reaches this layer as the marker-shaped span "20."
+        // immediately followed (flush, negative kern) by "0". That is one
+        // decimal number, not an ordered-list item; treating it as one both
+        // corrupts the value and renumbers it to "1.".
+        let line = vec![
+            word("20.", 100.0, BODY, false),
+            word("0", 118.0, BODY, false), // flush against "20."'s advance (100 + 18)
+        ];
+        assert!(
+            detect_list_marker(&line).is_none(),
+            "the integer part of a kerned decimal must not become a list marker"
+        );
+    }
+
+    #[test]
+    fn ordered_marker_with_a_real_space_gap_is_still_detected() {
+        // No explicit space span, but a genuine positional gap: a real ordered
+        // marker must survive the kerned-decimal guard.
+        let line = vec![
+            word("1.", 100.0, BODY, false),
+            word("Item text", 130.0, BODY, false),
+        ];
+        let (ordered, _) = detect_list_marker(&line).expect("real marker with a gap");
         assert!(ordered);
     }
 
