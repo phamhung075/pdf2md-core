@@ -1759,12 +1759,24 @@ fn merge_paragraph_lines(blocks: Vec<DocBlock>) -> Vec<DocBlock> {
         if let Some(p) = &mut cur {
             let gap = p.last_y0 - b.y1;
             let pitch_ok = gap >= 0.0 && gap <= MAX_PITCH_RATIO * p.last_size;
+            // Two visual lines can only belong to one paragraph when they
+            // actually share horizontal extent. Without this, the first-merge
+            // exemption below fused lines from *different columns* into one
+            // block whenever they happened to be vertically adjacent (e.g. a
+            // `DEVISE :` cell in the right column swallowing the
+            // `NOM & DESIGNATION` header starting >100pt to the left); the
+            // markdown channel already keeps them apart. A genuine first-line
+            // indent still overlaps its continuation, so the exemption below
+            // keeps working.
+            let overlap_ok =
+                b.x0 <= p.block.x1 + LEFT_EDGE_TOL && p.block.x0 <= b.x1 + LEFT_EDGE_TOL;
             // The paragraph's first merge (bringing in its 2nd line) is
             // exempt from the left-edge check — the first line may carry a
             // first-line indent that legitimately differs from the body's
             // real left edge, which the 2nd line then establishes for every
             // merge after this one (see the `line_count == 1` branch below).
-            let edge_ok = p.line_count == 1 || (b.x0 - p.body_x0).abs() <= LEFT_EDGE_TOL;
+            let edge_ok =
+                overlap_ok && (p.line_count == 1 || (b.x0 - p.body_x0).abs() <= LEFT_EDGE_TOL);
             if pitch_ok && edge_ok {
                 join_paragraph_text(&mut p.block.text, &b.text);
                 p.block.x0 = p.block.x0.min(b.x0);
@@ -2474,6 +2486,44 @@ mod paragraph_merge_tests {
             merged[0].text,
             "Indented first line of paragraph flush second line flush third line"
         );
+    }
+
+    #[test]
+    fn non_overlapping_adjacent_columns_do_not_merge() {
+        // Regression (iteration 11, akretion_invoice_EN16931.pdf): the
+        // `DEVISE : EURO (EUR)` cell in the page's right column and the
+        // `NOM & DESIGNATION, Période` table header starting ~140pt to its
+        // left are vertically adjacent body lines (pitch gap = 2pt, inside
+        // the 1.8*10 cap) whose horizontal extents share nothing at all. The
+        // first-merge exemption from the left-edge check used to fuse them
+        // into one block `DEVISE : EURO (EUR) NOM & DESIGNATION, Période`,
+        // even though the markdown channel — a separate code path — keeps
+        // them apart. They must remain two blocks.
+        let right_col = body_block(350.0, 700.0, "DEVISE : EURO (EUR)");
+        let left_col = body_block(100.0, 688.0, "NOM & DESIGNATION, Période");
+        let merged = merge_paragraph_lines(vec![right_col, left_col]);
+        assert_eq!(
+            merged.len(),
+            2,
+            "adjacent lines from different columns with no horizontal overlap must not merge: {:?}",
+            merged.iter().map(|b| b.text.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(merged[0].text, "DEVISE : EURO (EUR)");
+        assert_eq!(merged[1].text, "NOM & DESIGNATION, Période");
+    }
+
+    #[test]
+    fn short_first_line_that_overlaps_its_continuation_still_merges() {
+        // The overlap guard must not defeat the first-line-indent exemption:
+        // a short indented first line still overlaps the wider flush
+        // continuation, so the two remain one paragraph.
+        let blocks = vec![
+            body_block(120.0, 700.0, "A short opener"),
+            body_block(100.0, 688.0, "a much wider second line"),
+        ];
+        let merged = merge_paragraph_lines(blocks);
+        assert_eq!(merged.len(), 1, "overlapping lines must still merge");
+        assert_eq!(merged[0].text, "A short opener a much wider second line");
     }
 
     #[test]
