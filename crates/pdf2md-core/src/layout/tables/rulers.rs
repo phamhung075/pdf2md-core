@@ -81,7 +81,15 @@ pub fn line_words(line: &[Span]) -> Vec<WordTok> {
         if x0.is_none() {
             x0 = Some(sp.x);
         }
-        text.push_str(sp.text.trim());
+        // Keep the span's own internal whitespace. PDF producers routinely
+        // split one line into chunks that *carry* the separating space, e.g.
+        // `(Pé)(r)(i)(o)(de)( de)( 0)...` or `(RE )(N° )(:)`; the old
+        // `sp.text.trim()` dropped those spaces and fused whole table cells
+        // into one token ("Périodede01/12/2018au31/12/2018", "FACTUREN°:").
+        // The outer ends are still trimmed by `flush`, so a token never keeps
+        // leading/trailing spaces, and the token count / x positions used for
+        // column detection are unchanged.
+        text.push_str(sp.text.as_str());
         prev_x = Some(sp.x);
         prev_advance = sp.advance;
         last_end = sp.x + sp.advance;
