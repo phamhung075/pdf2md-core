@@ -69,9 +69,22 @@ pub fn line_words(line: &[Span]) -> Vec<WordTok> {
         let space_adv = 0.25 * size;
         let is_space = sp.text.chars().all(|c| c == ' ');
         if let Some(px) = prev_x {
-            let gap = sp.x - px;
-            let word_break = is_space
-                || (sp.text != " " && (gap > 2.5 * size || gap - prev_advance > 0.65 * space_adv));
+            // Measure the *residual* whitespace between the two spans
+            // (start-to-start distance minus the previous span's own advance),
+            // exactly as `reading_order::render_spans` and `split_hard_breaks`
+            // do. Comparing the raw start-to-start distance against the 2.5em
+            // column threshold makes any multi-span word wider than ~2.5em in
+            // total look like a new column: "Customer VAT Number" drawn as
+            // `C`+`us`+`t`+`ome`+`r `+`V`+`A`+`T`+` `+`N`+`umbe`+`r` fragmented
+            // into "Numbe" + "r", and "Huile d'olive à l'ancienne" into
+            // "Huile d'" + "olive à l'" + "ancien" + "ne" — the table bucketer
+            // then dropped each stray fragment into its own column/cell. The
+            // residual here is only the real inter-glyph gap, so a genuine
+            // column gutter (which `render_spans` still breaks on) keeps
+            // splitting while intra-word kerns never do.
+            let gap = (sp.x - px) - prev_advance;
+            let word_break =
+                is_space || (sp.text != " " && (gap > 2.5 * size || gap > 0.65 * space_adv));
             if word_break {
                 flush(&mut out, &mut text, &mut x0, last_end);
             }
@@ -623,4 +636,46 @@ pub fn find_tables(lines: &[Vec<Span>]) -> Vec<TableHit> {
 /// tolerance, over rows the strict pass did not claim (jittered tables).
 pub fn find_gap_tables(lines: &[Vec<Span>], covered: &[TableHit]) -> Vec<TableHit> {
     scan_aligned_grids(lines, 2.0, covered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sp(text: &str, x: f64, advance: f64) -> Span {
+        Span {
+            text: text.to_string(),
+            x,
+            y: 100.0,
+            size: 10.0,
+            advance,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_vertical: false,
+        }
+    }
+
+    /// A single word drawn as several `TJ` runs (kerned glyph chunks) must stay
+    /// one token. `line_words` used to compare the *raw* start-to-start span
+    /// distance against the 2.5em column threshold, so a multi-run word whose
+    /// runs are cumulatively wider than 2.5em fragmented on a phantom gutter:
+    /// the real invoice fixture's "Number" (`N`+`umbe`+`r`) became
+    /// `["Numbe", "r"]` because `umbe` alone is ~4em wide, and the table
+    /// bucketer then dropped the stray `r` into the next column.
+    #[test]
+    fn line_words_keeps_multispan_word_across_wide_runs() {
+        let line = vec![sp("N", 0.0, 7.0), sp("umbe", 7.0, 40.0), sp("r", 47.0, 4.0)];
+        let words: Vec<String> = line_words(&line).into_iter().map(|w| w.text).collect();
+        assert_eq!(words, vec!["Number"], "multi-span word was fragmented: {words:?}");
+    }
+
+    /// A genuine column gutter — real whitespace wider than 2.5em *after* the
+    /// previous run's own advance — must still split into separate tokens.
+    #[test]
+    fn line_words_still_splits_on_real_gutter() {
+        let line = vec![sp("left", 0.0, 18.0), sp("right", 60.0, 25.0)];
+        let words: Vec<String> = line_words(&line).into_iter().map(|w| w.text).collect();
+        assert_eq!(words, vec!["left", "right"], "real gutter was not split: {words:?}");
+    }
 }
