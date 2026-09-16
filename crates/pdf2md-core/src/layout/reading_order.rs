@@ -1257,14 +1257,22 @@ pub fn split_line_segments(line: &[Span]) -> Vec<Vec<Span>> {
     let mut segments: Vec<Vec<Span>> = Vec::new();
     let mut cur: Vec<Span> = Vec::new();
     let mut prev_x: Option<f64> = None;
+    let mut prev_advance = 0.0f64;
     for s in line {
         if let Some(px) = prev_x {
-            let gap = s.x - px;
+            // Residual whitespace, not the raw start-to-start distance: subtract
+            // the previous span's own advance the same way `render_spans` does.
+            // A span run wider than the 2.5em / 20pt threshold otherwise looks
+            // like a column gutter even when the next span is flush against it,
+            // carving one visual line into spurious segments (and feeding
+            // `build_doc_blocks` disconnected fragments).
+            let gap = (s.x - px) - prev_advance;
             if gap > 2.5 * size && gap > 20.0 && !cur.is_empty() {
                 segments.push(std::mem::take(&mut cur));
             }
         }
         prev_x = Some(s.x);
+        prev_advance = s.advance;
         cur.push(s.clone());
     }
     if !cur.is_empty() {
@@ -2545,6 +2553,41 @@ mod paragraph_merge_tests {
             "render_spans keeps the row on one line"
         );
         assert!(render_spans(&line).contains("Abbaye 250g"));
+    }
+
+    #[test]
+    fn split_line_segments_subtracts_previous_span_advance() {
+        // Same residual-gap rule as `render_spans` and `split_hard_breaks`: the
+        // whitespace between two spans is `next.x - prev.x - prev.advance`. A
+        // 78pt span followed flush by the next span therefore has no gap at
+        // all, even though its own advance carries the next start 78pt to the
+        // right — far past the 2.5em (25pt) / 20pt segment threshold if the raw
+        // start-to-start distance is measured. The raw form carved one visual
+        // line into spurious "columns" here.
+        let line = vec![
+            col_span("Nougat de l'", 50.0, 300.0),
+            col_span("Abbaye", 128.0, 300.0),
+            col_span("250g", 170.0, 300.0),
+        ];
+        let segs = split_line_segments(&line);
+        assert_eq!(
+            segs.len(),
+            1,
+            "flush spans must stay one segment: {:?}",
+            segs.iter().map(|s| render_spans(s)).collect::<Vec<_>>()
+        );
+
+        // A genuine 30pt empty gutter (previous span ends 24pt in, next starts
+        // 30pt after that) must still split into two segments.
+        let gutter = vec![
+            col_span("left", 50.0, 300.0),
+            col_span("right", 104.0, 300.0),
+        ];
+        assert_eq!(
+            split_line_segments(&gutter).len(),
+            2,
+            "a real column gutter must still split"
+        );
     }
 }
 
