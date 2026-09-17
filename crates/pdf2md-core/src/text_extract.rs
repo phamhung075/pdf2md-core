@@ -534,7 +534,43 @@ fn ends_with_ws(s: &str) -> bool {
 }
 
 fn push_decoded(out: &mut String, codec: &Codec, bytes: &[u8]) {
-    codec.decode(bytes, out);
+    let mut decoded = String::new();
+    codec.decode(bytes, &mut decoded);
+    // Producers routinely pad every show-string with a leading and trailing
+    // space (`( text )`). Appending that verbatim duplicates the separator at
+    // a run boundary (`ÉLECTRONIQUE  RÉFÉRENCE`) and leaves a stray leading
+    // space at the start of the page. Drop the incoming padding when the
+    // buffer is empty or already ends in whitespace; keep a genuine word gap
+    // (the string's own leading space) when it does not.
+    if ends_with_ws(out) {
+        out.push_str(decoded.trim_start());
+    } else {
+        out.push_str(&decoded);
+    }
+}
+
+/// True when a `Td`/`TD` operand pair moves the text line vertically — the
+/// same break `T*` performs. `tx ty Td` translates the text line matrix; a
+/// nonzero `ty` starts a new line, while a horizontal-only `tx` move stays on
+/// the current line. Threshold matches the `line_eps` used by coordinate mode.
+fn td_advances_line(op: &Operation) -> bool {
+    op.operands
+        .get(1)
+        .and_then(|o| o.as_float().ok())
+        .map_or(false, |ty| ty.abs() > 0.5)
+}
+
+/// Start a new output line, discarding the padding a producer left at the end
+/// of the previous show-string (`( text )` ends in a space). Without the trim
+/// the trailing space keeps `ends_with_ws` true, so the break is skipped and
+/// the next line fuses onto the current one.
+fn break_line(out: &mut String) {
+    while out.ends_with(' ') || out.ends_with('\t') {
+        out.pop();
+    }
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
 }
 
 fn show_text(out: &mut String, codec: &Codec, operands: &[Object]) {
@@ -702,7 +738,24 @@ fn extract_page(
                 cur_pos = pos2(op, 4);
             }
             "TD" => {
+                // `TD` is `Td` plus a leading update. In the string-walker
+                // case a vertical move is a line advance even when the
+                // producer emits no `ET`/`T*` between the lines (see `Td`).
+                if !pos_mode && td_advances_line(op) {
+                    break_line(&mut out);
+                }
                 cur_pos = pos2(op, 0);
+            }
+            "Td" => {
+                // `Td` translates the text line. Producers that draw each line
+                // with `Tj` + `0 -N Td` inside a single `BT`/`ET` (instead of
+                // an `ET`/`T*` per line) previously had every visual line
+                // fused into one run: `synth_ticket_compressed.pdf` emitted a
+                // single paragraph with doubled spaces between the four
+                // source lines.
+                if !pos_mode && td_advances_line(op) {
+                    break_line(&mut out);
+                }
             }
             "Tj" => {
                 text_ops_seen = true;
@@ -896,5 +949,84 @@ mod tests {
         let mut s = String::new();
         codec.decode(&bytes, &mut s);
         assert_eq!(s, "é");
+    }
+
+    /// Minimal single-page PDF whose four `Tj` lines live inside one `BT`/`ET`
+    /// and are advanced by a vertical `Td` (no `ET`/`T*` between lines), with
+    /// each show-string padded by a leading and trailing space — the shape of
+    /// `scratch/samples/synth_ticket_compressed.pdf`.
+    fn td_line_advance_doc() -> Document {
+        use lopdf::{dictionary, Stream};
+
+        let mut doc = Document::with_version("1.4");
+        let font_id = doc.new_object_id();
+        let content_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let pages_id = doc.new_object_id();
+        let catalog_id = doc.new_object_id();
+
+        doc.objects.insert(
+            font_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+                "Encoding" => "WinAnsiEncoding",
+            }),
+        );
+        let content = b"BT /F1 12 Tf 50 800 Td ( BILLET \xc9LECTRONIQUE ) Tj\n\
+0 -20 Td ( R\xc9F\xc9RENCE DE VOTRE R\xc9SERVATION ) Tj\n\
+0 -20 Td ( Obtenez votre carte d'embarquement. ) Tj ET"
+            .to_vec();
+        doc.objects
+            .insert(content_id, Object::Stream(Stream::new(dictionary! {}, content)));
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page", "Parent" => pages_id,
+                "MediaBox" => Object::Array(vec![
+                    Object::Integer(0), Object::Integer(0),
+                    Object::Integer(595), Object::Integer(842),
+                ]),
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+                "Contents" => content_id,
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => Object::Array(vec![Object::Reference(page_id)]),
+                "Count" => 1,
+            }),
+        );
+        doc.objects.insert(
+            catalog_id,
+            Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => pages_id }),
+        );
+        doc.trailer.set("Root", catalog_id);
+        doc
+    }
+
+    #[test]
+    fn td_line_advance_breaks_padded_show_strings() {
+        // Before the fix the string walker ignored the `Td` line advance and
+        // kept each string's padding, emitting one fused run:
+        //   " BILLET ÉLECTRONIQUE  RÉFÉRENCE DE VOTRE RÉSERVATION  Obtenez ..."
+        // instead of one line per visual line.
+        let doc = td_line_advance_doc();
+        let page = extract_page_text_report(&doc, 1, true, true, false).expect("page text");
+        assert_eq!(
+            page.text,
+            "BILLET ÉLECTRONIQUE\nRÉFÉRENCE DE VOTRE RÉSERVATION\n\
+             Obtenez votre carte d'embarquement."
+        );
+    }
+
+    #[test]
+    fn horizontal_td_does_not_start_a_new_line() {
+        // A pure horizontal `Td` is an in-line move, not a line advance.
+        let horizontal = Operation::new("Td", vec![Object::Integer(40), Object::Integer(0)]);
+        assert!(!td_advances_line(&horizontal));
+        let vertical = Operation::new("Td", vec![Object::Integer(0), Object::Integer(-20)]);
+        assert!(td_advances_line(&vertical));
     }
 }
