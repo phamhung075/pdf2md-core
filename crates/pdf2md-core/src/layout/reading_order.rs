@@ -1484,6 +1484,25 @@ impl ListRunState {
         self.counters[d] += 1;
         self.counters[d]
     }
+
+    /// Raise the counter at `depth` to `ordinal` when the source marker runs
+    /// ahead of it, so the next item continues from the author's numbering.
+    ///
+    /// The counter alone restarts at 1 every time a `Body` line ends a list
+    /// run, which silently renumbered an author-numbered document's sections
+    /// (`2.`, `3.`, `4.` …) into a wall of `1.`. Adopting the marker only when
+    /// it is *ahead* keeps the auto-numbered-producer case working: a source
+    /// that repeats the same `1.` on every item never exceeds the counter, so
+    /// it still numbers consecutively.
+    fn adopt_ordinal(&mut self, depth: u8, ordinal: usize) {
+        let d = depth as usize;
+        if self.counters.len() <= d {
+            self.counters.resize(d + 1, 0);
+        }
+        if ordinal > self.counters[d] {
+            self.counters[d] = ordinal;
+        }
+    }
 }
 
 /// Statistical 3-level heading detector — see this section's module-level
@@ -1605,9 +1624,9 @@ fn detect_list_marker(line: &[Span]) -> Option<(bool, usize)> {
 /// wrapped continuation line (a `Body` line) ends the Markdown list run between
 /// two markers, so a reference list `[1] [2] [3] …` collapsed to `1. 1. 1. …`
 /// and the citations lost their identity. `[N]` is unambiguous — the digits
-/// are the index — so prefer them; dot/paren markers (`1.`, `1)`) keep the
-/// counter (some producers emit the same number on every item, where the
-/// counter's renumbering is the desired behaviour).
+/// are the index — so prefer them. Dot/paren markers (`1.`, `1)`) are not
+/// always authoritative (some producers emit the same number on every item),
+/// so `explicit_dot_ordinal` is only adopted when it runs ahead of the counter.
 fn explicit_bracketed_ordinal(line: &[Span]) -> Option<usize> {
     let marker = line.iter().find(|s| !s.text.trim().is_empty())?.text.trim();
     let inner = marker.strip_prefix('[')?.strip_suffix(']')?;
@@ -1615,6 +1634,27 @@ fn explicit_bracketed_ordinal(line: &[Span]) -> Option<usize> {
         return None;
     }
     inner.parse().ok()
+}
+
+/// The numeric value carried by a *dot/paren* ordered marker (`2.`, `2)`,
+/// `(2)`), or `None` for any other marker shape.
+///
+/// Unlike a bracketed citation index this is not always authoritative — some
+/// producers stamp the same `1.` on every item — so the caller only adopts it
+/// when it runs ahead of the synthetic counter (see `ListRunState::adopt_ordinal`).
+fn explicit_dot_ordinal(line: &[Span]) -> Option<usize> {
+    let marker = line.iter().find(|s| !s.text.trim().is_empty())?.text.trim();
+    let digits = if marker.starts_with('(') && marker.ends_with(')') && marker.len() <= 5 {
+        &marker[1..marker.len().saturating_sub(1)]
+    } else if (marker.ends_with('.') || marker.ends_with(')')) && marker.len() <= 5 {
+        &marker[..marker.len() - 1]
+    } else {
+        return None;
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// Classifies one visual line, threading `list_state` across consecutive
@@ -1637,10 +1677,19 @@ pub(crate) fn classify_line<'a>(
     if let Some((ordered, skip)) = detect_list_marker(line) {
         let depth = list_state.depth_for(line[0].x, body_size);
         // Always advance the run counter so a following dot/paren marker keeps
-        // counting on from here, but let an explicit `[N]` citation index win.
+        // counting on from here, but let an explicit `[N]` citation index win,
+        // and let a dot/paren marker's own number win whenever it runs ahead of
+        // the counter (see `adopt_ordinal`).
         let ordinal = list_state.next_ordinal(depth);
         let ordinal = if ordered {
-            explicit_bracketed_ordinal(line).unwrap_or(ordinal)
+            if let Some(n) = explicit_bracketed_ordinal(line) {
+                n
+            } else if let Some(n) = explicit_dot_ordinal(line).filter(|&n| n > ordinal) {
+                list_state.adopt_ordinal(depth, n);
+                n
+            } else {
+                ordinal
+            }
         } else {
             ordinal
         };
@@ -2484,6 +2533,53 @@ mod structural_tests {
         assert!(md.contains("2. Jacob Austin"), "{md}");
         assert!(md.contains("11. Michael Collins"), "{md}");
         assert!(!md.contains("1. Jacob Austin"), "{md}");
+    }
+
+    #[test]
+    fn dot_numbered_sections_keep_their_own_number_across_body_lines() {
+        // A contract's numbered sections each carry their own literal number
+        // (`1.`, `2.`, `3.` …) and are separated by ordinary body lines. Every
+        // body line ends the Markdown list run, so the synthetic counter
+        // restarted at 1 and all the sections rendered as "1." — the real
+        // section numbering the document carries was lost (observed on
+        // scratch/samples/text_style_complex.pdf, where sections 2–5 became
+        // "1."). A dot marker that runs ahead of the counter must win.
+        let lines: Vec<Vec<Span>> = vec![
+            bulleted_line("1."),
+            one_span_line("Body between one and two.", BODY, false),
+            bulleted_line("2."),
+            one_span_line("Body between two and three.", BODY, false),
+            bulleted_line("3."),
+            one_span_line("Body between three and four.", BODY, false),
+            bulleted_line("5."),
+        ];
+        let md = render_cluster(&lines);
+        assert!(md.contains("1. Item text"), "{md}");
+        assert!(md.contains("2. Item text"), "{md}");
+        assert!(md.contains("3. Item text"), "{md}");
+        assert!(md.contains("5. Item text"), "{md}");
+        assert_eq!(md.matches("1. Item text").count(), 1, "later sections must not collapse to 1.:\n{md}");
+    }
+
+    #[test]
+    fn repeated_one_marker_still_numbers_consecutively() {
+        // The complementary case the counter exists for: a producer that stamps
+        // the same "1." on every item must still emit 1, 2, 3 (adopting a
+        // literal number only when it runs *ahead* never fires here).
+        let lines = vec![bulleted_line("1."), bulleted_line("1."), bulleted_line("1.")];
+        let md = render_cluster(&lines);
+        assert!(md.contains("1. Item text"), "{md}");
+        assert!(md.contains("2. Item text"), "{md}");
+        assert!(md.contains("3. Item text"), "{md}");
+    }
+
+    #[test]
+    fn explicit_dot_ordinal_parses_the_three_marker_shapes() {
+        assert_eq!(explicit_dot_ordinal(&bulleted_line("2.")), Some(2));
+        assert_eq!(explicit_dot_ordinal(&bulleted_line("3)")), Some(3));
+        assert_eq!(explicit_dot_ordinal(&bulleted_line("(4)")), Some(4));
+        assert_eq!(explicit_dot_ordinal(&bulleted_line("-")), None);
+        assert_eq!(explicit_dot_ordinal(&bulleted_line("[7]")), None);
     }
 
     #[test]
