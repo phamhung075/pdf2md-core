@@ -1252,6 +1252,18 @@ fn close_style(out: &mut String, st: InlineStyle) {
     out.push_str(&trailing_space);
 }
 
+/// Style of the next span after `after` that carries visible text, skipping
+/// empty and whitespace-only spans; `None` once the line ends. Used to keep one
+/// emphasis run open across an ordinary inter-word space: `**Mistral 7B**` is
+/// valid CommonMark, so the delimiters must not be closed and reopened at every
+/// word.
+fn next_visible_style(line: &[Span], after: usize) -> Option<InlineStyle> {
+    line.get(after + 1..)?
+        .iter()
+        .find(|s| !s.text.is_empty() && !s.text.chars().all(|c| c == ' '))
+        .map(InlineStyle::of)
+}
+
 /// Render one visual line's spans to text with inline `**bold**` / `*italic*` /
 /// `<u>underline</u>` emphasis. The spatial spacing rules are identical to the
 /// legacy plain-text renderer (`render_cluster`), so a line of unstyled spans
@@ -1263,7 +1275,7 @@ pub(crate) fn render_spans(line: &[Span]) -> String {
     let mut prev_advance = 0.0f64;
     let mut cur = InlineStyle::default();
 
-    for span in line {
+    for (i, span) in line.iter().enumerate() {
         if span.text.is_empty() {
             continue;
         }
@@ -1289,8 +1301,15 @@ pub(crate) fn render_spans(line: &[Span]) -> String {
                         out.push('\n');
                     }
                 } else if gap > 0.65 * space_adv {
-                    close_style(&mut out, cur);
-                    cur = InlineStyle::default();
+                    // Ordinary inter-word space. A space *inside* emphasis is
+                    // valid CommonMark (`**Mistral 7B**`), so if the styled run
+                    // simply continues with the same non-plain style, keep `cur`
+                    // open and emit the space inside the delimiters. Only close
+                    // (and emit the space outside) when the run ends or changes.
+                    if cur == InlineStyle::default() || InlineStyle::of(span) != cur {
+                        close_style(&mut out, cur);
+                        cur = InlineStyle::default();
+                    }
                     if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
                         out.push(' ');
                     }
@@ -1299,12 +1318,18 @@ pub(crate) fn render_spans(line: &[Span]) -> String {
         }
 
         if is_space {
-            // A space glyph is never emphasized; close any open emphasis so the
-            // delimiter sits flush against the word (Markdown rejects emphasis
-            // with leading/trailing spaces inside the delimiters).
+            // A space glyph is never emphasized on its own, but it may sit in
+            // the *interior* of an emphasis run when the next visible span keeps
+            // the same non-plain style (`**Mistral 7B**` is valid CommonMark).
+            // Only close the style when the run ends or changes; otherwise keep
+            // it open and emit the space inside the delimiters.
             if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
-                close_style(&mut out, cur);
-                cur = InlineStyle::default();
+                let continues =
+                    cur != InlineStyle::default() && next_visible_style(line, i) == Some(cur);
+                if !continues {
+                    close_style(&mut out, cur);
+                    cur = InlineStyle::default();
+                }
                 out.push(' ');
             }
         } else {
@@ -2150,12 +2175,67 @@ mod tests {
     }
 
     #[test]
-    fn bold_run_is_wrapped_in_asterisks_per_word() {
+    fn bold_run_stays_open_across_words() {
+        // A style run spanning several words must render as ONE emphasis span:
+        // `**Bold text**`, not `**Bold** **text**`. (This test previously
+        // asserted the fragmented form; that was the bug this change fixes.)
         let line = words_spaced(&[
             ("Bold", (true, false, false)),
             ("text", (true, false, false)),
         ]);
-        assert_eq!(render_spans(&line), "**Bold** **text**");
+        assert_eq!(render_spans(&line), "**Bold text**");
+    }
+
+    #[test]
+    fn adjacent_bold_spans_across_a_gap_merge() {
+        // No explicit space span: the words are separated only by their x-gap.
+        // "Word1" is 5*6=30pt wide and starts at 100; "Word2" starts at 133, so
+        // the whitespace gap is 3pt (> 0.65 * space_adv, < 2.5 * size).
+        let line = vec![
+            span("Word1", 100.0, (true, false, false)),
+            span("Word2", 133.0, (true, false, false)),
+        ];
+        assert_eq!(render_spans(&line), "**Word1 Word2**");
+    }
+
+    #[test]
+    fn adjacent_bold_spans_across_a_space_span_merge() {
+        // Same run, but the space arrives as its own whitespace-only span.
+        let line = words_spaced(&[
+            ("Word1", (true, false, false)),
+            ("Word2", (true, false, false)),
+        ]);
+        assert_eq!(render_spans(&line), "**Word1 Word2**");
+    }
+
+    #[test]
+    fn bold_then_unstyled_separates_cleanly() {
+        let line = words_spaced(&[
+            ("Bold", (true, false, false)),
+            ("normal", (false, false, false)),
+        ]);
+        assert_eq!(render_spans(&line), "**Bold** normal");
+    }
+
+    #[test]
+    fn bold_then_italic_separates_cleanly() {
+        let line = words_spaced(&[
+            ("Bold", (true, false, false)),
+            ("Italic", (false, true, false)),
+        ]);
+        assert_eq!(render_spans(&line), "**Bold** *Italic*");
+    }
+
+    #[test]
+    fn column_break_closes_style_and_breaks_line() {
+        // Second run starts 40pt after the first run's right edge: a genuine
+        // column/element boundary must still become a hard newline and close
+        // the open emphasis before it.
+        let line = vec![
+            span("Hello", 100.0, (true, false, false)),
+            span("world", 170.0, (true, false, false)),
+        ];
+        assert_eq!(render_spans(&line), "**Hello**\n**world**");
     }
 
     #[test]

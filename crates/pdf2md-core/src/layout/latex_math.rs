@@ -147,9 +147,20 @@ impl LatexExpr {
                     if s.is_empty() {
                         continue;
                     }
+                    // A script with an empty base (`$^{1}$` / `$_{i}$`) attaches
+                    // to the preceding word with no intervening space, and a
+                    // closing punctuation run (`.`, `,`, …) never gets a space
+                    // pushed in front of it.
+                    let attached_script = s.starts_with("$^") || s.starts_with("$_");
+                    let leading_punct = s
+                        .chars()
+                        .next()
+                        .map_or(false, |c| matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']'));
                     let needs_space = !out.is_empty()
                         && !out.chars().last().map_or(true, |c| c.is_whitespace())
-                        && !s.chars().next().map_or(true, |c| c.is_whitespace());
+                        && !s.chars().next().map_or(true, |c| c.is_whitespace())
+                        && !attached_script
+                        && !leading_punct;
                     if needs_space {
                         out.push(' ');
                     }
@@ -334,6 +345,25 @@ pub enum ScriptKind {
     Subscript,
 }
 
+/// Whether a script's base run is genuine math rather than an English prose
+/// word. A single glyph (`x`, `n`), a pure number (`10`, `1,200`), or a
+/// symbol-only run is math. A multi-character run containing alphabetic
+/// characters (`note`, `implementation`, `SkyPilot`, `Face`) is prose: wrapping
+/// it in `$...$` renders it in math italics, breaks kerning/ligatures, and
+/// defeats text search, so its script is emitted with an empty base instead.
+fn is_math_base(base: &str) -> bool {
+    let trimmed = base.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // A single glyph is a variable/symbol (`x`, `n`) and stays math.
+    if trimmed.chars().count() == 1 {
+        return true;
+    }
+    // No alphabetic characters: numeric or symbolic (`10`, `1,200`, `++`).
+    !trimmed.chars().any(|c| c.is_alphabetic())
+}
+
 /// Rebuild a single visual line's spans into a [`LatexExpr`], recognising simple
 /// super/subscripts. When nothing looks like a script the result is a plain
 /// `Text` node whose string is byte-identical to the legacy line renderer.
@@ -381,15 +411,34 @@ pub fn synthesize_line_expr(line: &[Span]) -> LatexExpr {
                     } else {
                         ScriptKind::Subscript
                     };
-                    let base_expr = LatexExpr::text(render_cell_plain(base_spans));
+                    let base_text = render_cell_plain(base_spans);
                     let script_expr = LatexExpr::text(cell.text());
-                    let combined = match kind {
-                        ScriptKind::Superscript => {
-                            LatexExpr::superscript(base_expr, script_expr)
-                        }
-                        ScriptKind::Subscript => LatexExpr::subscript(base_expr, script_expr),
-                    };
-                    parts.push(combined);
+                    if is_math_base(&base_text) {
+                        let base_expr = LatexExpr::text(base_text);
+                        let combined = match kind {
+                            ScriptKind::Superscript => {
+                                LatexExpr::superscript(base_expr, script_expr)
+                            }
+                            ScriptKind::Subscript => {
+                                LatexExpr::subscript(base_expr, script_expr)
+                            }
+                        };
+                        parts.push(combined);
+                    } else {
+                        // Prose word / footnote reference: keep the word as
+                        // plain text and give the script an empty base so it
+                        // serializes as `word$^{1}$`, not `$word^{1}$`.
+                        parts.push(LatexExpr::text(base_text));
+                        let combined = match kind {
+                            ScriptKind::Superscript => {
+                                LatexExpr::superscript(LatexExpr::text(""), script_expr)
+                            }
+                            ScriptKind::Subscript => {
+                                LatexExpr::subscript(LatexExpr::text(""), script_expr)
+                            }
+                        };
+                        parts.push(combined);
+                    }
                     consumed = true;
                     continue;
                 }
@@ -1212,10 +1261,66 @@ mod tests {
             "leading prose must stay plain, got {rendered}"
         );
         assert!(
-            rendered.contains("$note^{1}$"),
-            "only the base word is math-wrapped, got {rendered}"
+            rendered.contains("note$^{1}$"),
+            "only the base word is followed by the footnote marker, got {rendered}"
         );
         assert!(rendered.starts_with("See"), "got {rendered}");
+    }
+
+    /// A prose word carrying a footnote-style marker must keep the word as plain
+    /// text and attach the marker as `word$^{1}$`; wrapping the word in math mode
+    /// (`$implementation^{1}$`) renders it italic and breaks text search.
+    #[test]
+    fn prose_word_footnote_keeps_word_plain() {
+        let line = vec![
+            span("implementation", 100.0, 700.0, 12.0, 90.0),
+            span("1", 192.0, 712.0, 8.0, 5.0),
+        ];
+        let rendered = render_math_line(&line);
+        assert!(
+            rendered.contains("implementation$^{1}$"),
+            "prose word must stay plain, got {rendered}"
+        );
+        assert!(
+            !rendered.contains("$implementation"),
+            "prose word must not be wrapped in math, got {rendered}"
+        );
+    }
+
+    /// A prose word + attached marker immediately followed by a period must not
+    /// grow a space before the punctuation: `SkyPilot$^{2}.`, never
+    /// `$SkyPilot^{2}$ .`.
+    #[test]
+    fn prose_word_footnote_followed_by_period_has_no_space() {
+        let line = vec![
+            span("SkyPilot", 100.0, 700.0, 12.0, 50.0),
+            span("2", 152.0, 712.0, 8.0, 5.0),
+            span(".", 160.0, 700.0, 12.0, 4.0),
+        ];
+        let rendered = render_math_line(&line);
+        assert_eq!(rendered, "SkyPilot$^{2}$.", "got {rendered}");
+    }
+
+    /// A single-letter variable is genuine math, so the base stays inside the
+    /// inline math delimiters.
+    #[test]
+    fn single_letter_math_superscript_preserved() {
+        let line = vec![
+            span("x", 100.0, 700.0, 12.0, 8.0),
+            span("2", 110.0, 712.0, 8.0, 5.0),
+        ];
+        assert_eq!(render_math_line(&line), r"$x^{2}$");
+    }
+
+    /// A numeric base is genuine math, so it stays inside the inline math
+    /// delimiters.
+    #[test]
+    fn numeric_base_math_superscript_preserved() {
+        let line = vec![
+            span("10", 100.0, 700.0, 12.0, 14.0),
+            span("5", 116.0, 712.0, 8.0, 5.0),
+        ];
+        assert_eq!(render_math_line(&line), r"$10^{5}$");
     }
 
     #[test]

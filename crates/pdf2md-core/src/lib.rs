@@ -377,6 +377,21 @@ fn embed_width_frac(
     Some((w / pw).clamp(MIN_EMBED_WIDTH_FRAC, 1.0))
 }
 
+/// Whether a block adjacent to a content image is that image's caption.
+///
+/// A short line close to the image is the classic caption. Academic papers,
+/// however, use descriptive multi-line captions that easily exceed nine words,
+/// so a `Figure`/`Fig.` prefixed paragraph within a looser gap is also a
+/// caption (`**Figure 1: ...** The number of operations ...`).
+fn is_caption_block(text: &str, gap: f64, size_hint: f64) -> bool {
+    let caption_prefix = text.starts_with("Figure ")
+        || text.starts_with("**Figure ")
+        || text.starts_with("Fig. ")
+        || text.starts_with("**Fig. ");
+    (gap <= 2.5 * size_hint && text.split_whitespace().count() <= 9)
+        || (caption_prefix && gap <= 4.0 * size_hint)
+}
+
 /// Tag blocks whose text repeats near the top/bottom of >= 3 pages as running
 /// headers/footers. Operates purely on the structured block list.
 fn tag_running_furniture(blocks: &mut [layout::DocBlock]) {
@@ -714,7 +729,7 @@ pub fn convert_pdf_bytes_to_markdown(
                     if let Some(b) = best {
                         let gap = (my - (b.y0 + b.y1) / 2.0).abs();
                         let size_hint = (b.y1 - b.y0).abs().max(8.0);
-                        if gap <= 2.5 * size_hint && b.text.split_whitespace().count() <= 9 {
+                        if is_caption_block(&b.text, gap, size_hint) {
                             b.kind = "caption".to_string();
                         }
                     }
@@ -859,10 +874,49 @@ pub fn convert_pdf_bytes_to_markdown(
                     ),
                 };
 
-                // Find the first block strictly below the image
-                let next_block = page_blocks
+                // Prefer the figure's caption as the anchor when one sits
+                // below/near the image and horizontally overlaps it (or spans
+                // the page): a descriptive caption is the true reading-order
+                // neighbour, and inserting before it keeps the figure next to
+                // its caption. Otherwise pick the nearest block immediately
+                // below (max mid-y) that horizontally overlaps the image, so a
+                // footnote or a different-column block is not used and the
+                // figure is not displaced far from its caption.
+                let mw = (m.x1 - m.x0).abs();
+                let page_w = page_bbox.map_or(0.0, |(px0, _, px1, _)| (px1 - px0).abs());
+                let caption_block = page_blocks
                     .iter()
-                    .find(|b| b.kind != "figure" && (b.y0 + b.y1) / 2.0 <= my);
+                    .filter(|b| b.kind == "caption")
+                    .filter(|b| {
+                        let overlap = b.x1.min(m.x1) - b.x0.max(m.x0);
+                        let full_width = page_w > 0.0 && (b.x1 - b.x0).abs() >= 0.9 * page_w;
+                        overlap > 0.0 || full_width
+                    })
+                    .filter(|b| {
+                        let size_hint = (b.y1 - b.y0).abs().max(8.0);
+                        (b.y0 + b.y1) / 2.0 <= my + 4.0 * size_hint
+                    })
+                    .max_by(|a, b| {
+                        let ay = (a.y0 + a.y1) / 2.0;
+                        let by = (b.y0 + b.y1) / 2.0;
+                        ay.partial_cmp(&by).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                let next_block = caption_block.or_else(|| {
+                    page_blocks
+                        .iter()
+                        .filter(|b| b.kind != "figure")
+                        .filter(|b| (b.y0 + b.y1) / 2.0 <= my)
+                        .filter(|b| {
+                            let bw = (b.x1 - b.x0).abs();
+                            let overlap = b.x1.min(m.x1) - b.x0.max(m.x0);
+                            overlap > 0.2 * mw.min(bw) || mw > 300.0
+                        })
+                        .max_by(|a, b| {
+                            let ay = (a.y0 + a.y1) / 2.0;
+                            let by = (b.y0 + b.y1) / 2.0;
+                            ay.partial_cmp(&by).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                });
 
                 let mut inserted = false;
                 if let Some(b) = next_block {
@@ -1607,5 +1661,30 @@ mod regression_tests {
         assert!(lopdf::Document::load_mem(&bytes).is_err());
         let doc = load_pdf_document(&bytes).expect("repair must recover a drifted xref");
         assert_eq!(doc.get_pages().len(), 1);
+    }
+
+    /// Bug 4 regression: an academic caption is often a descriptive paragraph
+    /// well over nine words. A `**Figure 1:` / `Figure` / `Fig.` prefixed block
+    /// within a slightly looser gap must still be a caption, while an unrelated
+    /// long paragraph whose first word merely starts with "Figure" must not.
+    #[test]
+    fn descriptive_figure_caption_with_many_words_is_recognized() {
+        let text = "**Figure 1: Sliding Window Attention.** The number of \
+                    operations in vanilla attention is quadratic in the sequence \
+                    length, so the attention diagram spans the full page width.";
+        assert!(
+            text.split_whitespace().count() > 9,
+            "test premise: the caption paragraph must exceed nine words"
+        );
+        // 3.0 * size_hint sits inside the extended 4.0 * size_hint caption gap.
+        assert!(
+            is_caption_block(text, 3.0 * 12.0, 12.0),
+            "a long Figure-prefixed paragraph must be recognized as a caption"
+        );
+        // Beyond even the extended gap it is no longer treated as a caption.
+        assert!(!is_caption_block(text, 4.5 * 12.0, 12.0));
+
+        // A short line far away is not a caption either.
+        assert!(!is_caption_block("unrelated body text", 3.0 * 12.0, 12.0));
     }
 }

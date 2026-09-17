@@ -1272,8 +1272,15 @@ pub fn classify_geometry(
         ((y0.min(y1)) - low) / (high - low).max(1.0)
     });
 
-    if aspect > 5.0 || aspect < 0.2 {
+    // A barcode is a small, narrow scan. A wide, full-width raster (an attention
+    // diagram spanning the text column) is not a barcode regardless of aspect.
+    if (aspect > 5.0 || aspect < 0.2) && area < 30_000.0 && frac_w < 0.4 {
         return (MediaKind::Barcode, false);
+    }
+    // A raster much wider (or taller) than it is deep that occupies a
+    // substantial share of the page width is a diagram, not a photo/chart.
+    if (aspect > 2.6 || aspect < 0.6) && frac_w >= 0.35 {
+        return (MediaKind::Diagram, false);
     }
     if bottom_frac < 0.22 && area < 25_000.0 && aspect >= 0.3 && aspect <= 4.0 && frac_w < 0.35 {
         return (MediaKind::Signature, false);
@@ -1349,5 +1356,35 @@ mod downscale_tests {
         let (out, w, h) = downscale_rgba(&buf, 4, 2, 1);
         assert_eq!((w, h), (1, 1));
         assert_eq!(out, vec![127, 127, 127, 255]);
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::*;
+
+    /// Bug 4 regression: an attention-map figure (1536x242 px, aspect ~6.34)
+    /// spanning the page width is a diagram, not a barcode.
+    #[test]
+    fn wide_page_spanning_raster_is_diagram_not_barcode() {
+        let page = Some((0.0, 0.0, 612.0, 792.0));
+        // 507 x 80 pt -> aspect 6.34, 82.8% of the page width, area 40_560.
+        let (kind, decorative) = classify_geometry(50.0, 400.0, 557.0, 480.0, page);
+        assert_eq!(
+            kind,
+            MediaKind::Diagram,
+            "wide page-spanning figure must classify as Diagram, got {:?}",
+            kind
+        );
+        assert!(!decorative, "a content figure must not be decorative");
+    }
+
+    /// A genuinely small, narrow barcode scan is still a barcode.
+    #[test]
+    fn small_narrow_scan_is_still_barcode() {
+        let page = Some((0.0, 0.0, 612.0, 792.0));
+        // 120 x 20 pt -> aspect 6.0, 19.6% of the page width, area 2_400.
+        let (kind, _) = classify_geometry(40.0, 700.0, 160.0, 720.0, page);
+        assert_eq!(kind, MediaKind::Barcode);
     }
 }

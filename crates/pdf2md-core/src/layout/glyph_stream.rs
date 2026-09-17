@@ -940,6 +940,27 @@ fn mark_underlines(
     }
 }
 
+/// Append extracted vertical margin text to the page body text.
+///
+/// Vertical runs are side furniture (arXiv side stamps, running headers): when
+/// layout analysis / human reading order is enabled they must stay out of the
+/// body prose, or the stamp is injected mid-paragraph. The caller still emits
+/// the margin blocks for zone inspectors either way. Without layout analysis
+/// the legacy append behavior is kept.
+fn append_vertical_text(text: &mut String, vertical_text: &str, detect_layout: bool) {
+    if vertical_text.is_empty() || detect_layout {
+        return;
+    }
+    if !text.is_empty() {
+        if text.ends_with('\n') {
+            text.push('\n');
+        } else {
+            text.push_str("\n\n");
+        }
+    }
+    text.push_str(vertical_text);
+}
+
 /// Extract text for a glyph-positioned page using geometry reconstruction.
 /// When `detect_tables` is false, returns the plain reading-order text with
 /// no table recovery (byte-identical to the table-less renderer).
@@ -1382,14 +1403,10 @@ pub fn extract_page_glyphs(
     }
 
     if !vertical_text.is_empty() {
-        if !text.is_empty() {
-            if text.ends_with('\n') {
-                text.push('\n');
-            } else {
-                text.push_str("\n\n");
-            }
-        }
-        text.push_str(&vertical_text);
+        // Side furniture/margin stamps stay out of the reading-order body text
+        // when layout analysis is on (their blocks are still emitted below for
+        // zone inspectors). Without layout analysis, preserve legacy behavior.
+        append_vertical_text(&mut text, &vertical_text, detect_layout);
         blocks.extend(vertical_blocks);
     }
 
@@ -1953,6 +1970,29 @@ mod tests {
         assert!(
             resolve_font_style(&doc, &bold).0,
             "OS/2 usWeightClass=700 must still resolve as bold"
+        );
+    }
+
+    /// Bug 6 regression: `arXiv:2310.06825v1 [cs.CL] 10 Oct 2023` sits in the
+    /// left margin as vertical text. With `detect_layout: true` it must not be
+    /// appended to the page body prose; with layout analysis off the legacy
+    /// append behavior must remain (the text channel is the only consumer).
+    #[test]
+    fn vertical_margin_text_is_not_appended_to_body_when_detect_layout() {
+        let margin = "arXiv:2310.06825v1 [cs.CL] 10 Oct 2023";
+
+        let mut body = String::from("Introduction paragraph.");
+        append_vertical_text(&mut body, margin, true);
+        assert_eq!(
+            body, "Introduction paragraph.",
+            "layout analysis must keep margin stamps out of PageText.text"
+        );
+        assert!(!body.contains("arXiv"), "margin stamp leaked into body flow: {body:?}");
+
+        append_vertical_text(&mut body, margin, false);
+        assert!(
+            body.ends_with(margin),
+            "without layout analysis the legacy append must be preserved: {body:?}"
         );
     }
 }
