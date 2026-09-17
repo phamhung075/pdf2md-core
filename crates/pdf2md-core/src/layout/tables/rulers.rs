@@ -633,7 +633,33 @@ fn scan_aligned_grids_opts(
                             let fut_ri = band[fut_idx];
                             rulers.iter().filter(|&&r| row_matches_ruler(&info[fut_ri], r, tol * 1.5)).count() >= 2
                         });
-                        if has_future_match {
+                        // A wrapped continuation of the *final* data row's
+                        // cell has no future row to vouch for it — the table
+                        // simply ends below. `has_future_match` alone therefore
+                        // always drops it, splitting the cell value in two: the
+                        // tail is emitted as a stray paragraph after the table.
+                        // Annex it when it is a short, single-cell line that
+                        // continues a *non-first* column the previous row
+                        // actually populated, within the table's own line
+                        // pitch. The first column is the row anchor (a lone
+                        // first-column line below the table is new content, not
+                        // an overflow of the cell above), and a trailing
+                        // paragraph sits further down and/or spans a column
+                        // gutter, so it is still left out.
+                        let continues_populated_value_cell = {
+                            let single_cell =
+                                !row_has_internal_gutter(&info[next_ri].words, min_gutter);
+                            let gap = lines[band[hi]][0].y - lines[next_ri][0].y;
+                            let pitch = 2.2 * info[band[hi]].size.max(info[next_ri].size).max(1.0);
+                            let within_pitch = gap > 0.0 && gap <= pitch;
+                            let continues_nonfirst = rulers.iter().enumerate().any(|(i, &r)| {
+                                i > 0
+                                    && row_matches_ruler(&info[next_ri], r, tol * 1.5)
+                                    && row_matches_ruler(&info[band[hi]], r, tol * 1.5)
+                            });
+                            single_cell && within_pitch && continues_nonfirst
+                        };
+                        if has_future_match || continues_populated_value_cell {
                             hi += 1;
                             continue;
                         }
@@ -953,6 +979,43 @@ mod tests {
         assert!(
             hit.rows.iter().all(|r| !r.iter().any(|c| c.contains("<br>"))),
             "rows were folded together: {:?}",
+            hit.rows
+        );
+    }
+
+    /// A 2-column label/value grid whose *last* value wraps onto one more
+    /// visual line ("RENDU DROITS NON" then "ACQUITTÉS" below it). Because the
+    /// wrapped tail is the final line of the table, there is no future row for
+    /// the single-match continuation branch to point at, so `has_future_match`
+    /// was always false and the growth loop broke before the tail: the cell
+    /// value was split in two and the tail was emitted as a stray paragraph
+    /// after the table (vision against the FNFE "Facture DOM" invoice renders
+    /// the cell as "RENDU DROITS NON ACQUITTÉS"). The tail must be annexed
+    /// into the same row's value cell.
+    #[test]
+    fn wrapped_final_value_cell_is_annexed_into_its_last_row() {
+        let cell = |t: &str, x: f64, y: f64, adv: f64| sp_at(t, x, y, adv);
+        let lines: Vec<Vec<Span>> = vec![
+            vec![cell("Votre référence", 34.1, 560.0, 70.0), cell("BC543", 154.6, 560.0, 28.0)],
+            vec![cell("Réf. marché", 34.1, 543.0, 55.0), cell("WELCOME_PACK_2017", 154.6, 543.0, 105.0)],
+            vec![cell("N° TVA client", 34.1, 526.0, 60.0), cell("FR90343434346", 154.6, 526.0, 78.0)],
+            vec![cell("Incoterms", 34.1, 509.0, 45.0), cell("RENDU DROITS NON", 154.6, 509.0, 92.0)],
+            // Wrapped tail of the Incoterms value: single cell, one row pitch down.
+            vec![cell("ACQUITTÉS", 154.6, 497.0, 44.0)],
+        ];
+        let hits = find_tables(&lines);
+        let hit = hits
+            .iter()
+            .find(|h| h.rows.iter().any(|r| r.iter().any(|c| c.contains("Incoterms"))))
+            .expect("label/value grid was not detected");
+        let incoterms = hit
+            .rows
+            .iter()
+            .find(|r| r.iter().any(|c| c.contains("Incoterms")))
+            .expect("Incoterms row missing");
+        assert!(
+            incoterms.iter().any(|c| c.contains("ACQUITTÉS")),
+            "wrapped tail of the final value cell was dropped from the table: {:?}",
             hit.rows
         );
     }
