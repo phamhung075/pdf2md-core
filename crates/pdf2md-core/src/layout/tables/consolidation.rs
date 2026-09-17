@@ -326,7 +326,13 @@ pub fn consolidate_table_rows(
                     } else if first_col_curr == first_col_row && filled_count >= 2 && filled_count >= curr_filled {
                         false
                     } else {
-                        filled_count < curr_filled
+                        // A continuation row carries no fresh first-column value
+                        // of its own; a row that starts its own first cell is a
+                        // new logical row even when it fills fewer columns than
+                        // the row above — a sparse value column (e.g. the
+                        // "± 0.07" of only one benchmark row) must not fold the
+                        // whole grid into a single `<br>`-joined row.
+                        !row_has_col0 && filled_count < curr_filled
                     }
                 }
             }

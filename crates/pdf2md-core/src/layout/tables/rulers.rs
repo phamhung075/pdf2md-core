@@ -5,6 +5,7 @@
 //! Stage 3 & Stage 3b ruler scanning, grid alignment, and column corridor analysis.
 
 use crate::layout::glyph_stream::Span;
+use crate::layout::reading_order::{detect_column_bands, ColumnBand};
 use crate::layout::tables::consolidation::{bucket, bucket_rows_content_aware, bucket_words, consolidate_table_rows, merge_complementary_columns};
 use crate::layout::tables::validation::is_tabular_rows;
 use crate::models::BoundingBox;
@@ -534,11 +535,15 @@ fn line_text(line: &[Span]) -> String {
 }
 
 /// Detect grid tables on a page's visual lines.
+///
+/// The page is split into column bands first (see `scan_aligned_grids_banded`):
+/// a side table sharing baselines with a neighboring column's prose is scanned
+/// in isolation instead of against that prose.
 pub fn scan_aligned_grids(lines: &[Vec<Span>], tol_mult: f64, covered: &[TableHit]) -> Vec<TableHit> {
     // The public/lossy passes (including the stage-3b gap recovery) keep the
     // original strict merged-cell veto; only `find_tables`'s explicit
     // refinement pass opts into the relaxed one.
-    scan_aligned_grids_opts(lines, tol_mult, covered, false)
+    scan_aligned_grids_banded(lines, tol_mult, covered, false)
 }
 
 /// [`scan_aligned_grids`] with the merged-cell `wide_ok` veto setting threaded
@@ -973,6 +978,124 @@ fn scan_aligned_grids_opts(
     hits
 }
 
+/// Map each line of an isolated column stream back to its index in the page's
+/// own `lines`, by baseline-y containment. A merged visual line holds spans
+/// from both columns whose baselines can differ by a few points, so the stream
+/// line's y is matched against the *range* of y values an original line spans
+/// rather than an exact y key.
+fn stream_index_map(stream: &[Vec<Span>], ranges: &[(f64, f64, usize)]) -> Vec<usize> {
+    stream
+        .iter()
+        .map(|l| {
+            let q = l.iter().map(|s| s.y).fold(f64::INFINITY, f64::min);
+            ranges
+                .iter()
+                .filter(|&&(lo, hi, _)| q >= lo - 0.75 && q <= hi + 0.75)
+                .min_by(|a, b| {
+                    let da = (q - 0.5 * (a.0 + a.1)).abs();
+                    let db = (q - 0.5 * (b.0 + b.1)).abs();
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|&(_, _, i)| i)
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+/// [`scan_aligned_grids_opts`] with the page split into column bands first, so a
+/// side table's rows are never compared against a neighboring column's prose.
+///
+/// A page can interleave two independent regions on one visual line: a narrow
+/// parameter/score table set in the right margin at the same baseline as the
+/// main column's prose. Scanning the merged lines lets the seed-and-grow window
+/// annex prose rows, which then trips the `flowing` veto and drops the whole
+/// table to plain text. `detect_column_bands` already separates those regions,
+/// so each column stream is scanned in isolation and every hit is mapped back to
+/// the page's own line indices (the ones `render_with_tables` splices against).
+///
+/// A page with no genuine column band keeps the original whole-page scan, so
+/// single-column table detection stays byte-identical.
+fn scan_aligned_grids_banded(
+    lines: &[Vec<Span>],
+    tol_mult: f64,
+    covered: &[TableHit],
+    wide_ok: bool,
+) -> Vec<TableHit> {
+    if lines.len() < 2 {
+        return Vec::new();
+    }
+    let bands = detect_column_bands(lines);
+    if bands.iter().all(|b| matches!(b, ColumnBand::Full(_))) {
+        return scan_aligned_grids_opts(lines, tol_mult, covered, wide_ok);
+    }
+
+    // Baseline-y ranges of each page line, for mapping a cloned stream line
+    // back to the page line it came from.
+    let mut ranges: Vec<(f64, f64, usize)> = Vec::with_capacity(lines.len());
+    for (i, l) in lines.iter().enumerate() {
+        if l.is_empty() {
+            continue;
+        }
+        let lo = l.iter().map(|s| s.y).fold(f64::INFINITY, f64::min);
+        let hi = l.iter().map(|s| s.y).fold(f64::NEG_INFINITY, f64::max);
+        ranges.push((lo, hi, i));
+    }
+
+    // `scan_aligned_grids_opts` only reads `start`/`end` from `covered`; empty
+    // rows and a zero bbox are enough to translate the page-level covered
+    // ranges into a stream's local indices.
+    let dummy = |start: usize, end: usize| TableHit {
+        start,
+        end,
+        rows: Vec::new(),
+        bbox: BoundingBox::new(0.0, 0.0, 0.0, 0.0),
+    };
+
+    let mut hits: Vec<TableHit> = Vec::new();
+    for band in bands {
+        let streams: Vec<Vec<Vec<Span>>> = match band {
+            ColumnBand::Full(rows) => vec![rows],
+            ColumnBand::Columns { left, right } => vec![left, right],
+        };
+        for stream in streams {
+            if stream.len() < 2 {
+                continue;
+            }
+            let index_map = stream_index_map(&stream, &ranges);
+            let mut local_covered: Vec<TableHit> = Vec::new();
+            let mut run: Option<usize> = None;
+            for (local, &orig) in index_map.iter().enumerate() {
+                let cov = covered.iter().any(|h| h.start <= orig && orig <= h.end);
+                match (run, cov) {
+                    (None, true) => run = Some(local),
+                    (Some(s), false) => {
+                        local_covered.push(dummy(s, local - 1));
+                        run = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(s) = run {
+                local_covered.push(dummy(s, index_map.len() - 1));
+            }
+
+            for sh in scan_aligned_grids_opts(&stream, tol_mult, &local_covered, wide_ok) {
+                let start = index_map[sh.start];
+                let end = index_map[sh.end];
+                if start <= end {
+                    hits.push(TableHit {
+                        start,
+                        end,
+                        rows: sh.rows,
+                        bbox: sh.bbox,
+                    });
+                }
+            }
+        }
+    }
+    hits
+}
+
 /// Stage-3 table recovery: strict ruler alignment (the default pass).
 pub fn find_tables(lines: &[Vec<Span>]) -> Vec<TableHit> {
     // The strict geometry is the primary detector. The relaxed pass (which
@@ -983,8 +1106,8 @@ pub fn find_tables(lines: &[Vec<Span>]) -> Vec<TableHit> {
     // its finer segmentation replaces that hit. It never invents a table the
     // strict geometry does not see, so it cannot turn ordinary address/prose
     // blocks into spurious grids.
-    let mut hits = scan_aligned_grids_opts(lines, 1.0, &[], false);
-    let wide_hits = scan_aligned_grids_opts(lines, 1.0, &[], true);
+    let mut hits = scan_aligned_grids_banded(lines, 1.0, &[], false);
+    let wide_hits = scan_aligned_grids_banded(lines, 1.0, &[], true);
     for wh in wide_hits {
         let Some(pos) = hits
             .iter()
@@ -1008,7 +1131,7 @@ pub fn find_tables(lines: &[Vec<Span>]) -> Vec<TableHit> {
 /// Stage-3b recovery pass: the same grid scan with a wider alignment
 /// tolerance, over rows the strict pass did not claim (jittered tables).
 pub fn find_gap_tables(lines: &[Vec<Span>], covered: &[TableHit]) -> Vec<TableHit> {
-    scan_aligned_grids(lines, 2.0, covered)
+    scan_aligned_grids_banded(lines, 2.0, covered, false)
 }
 
 #[cfg(test)]
@@ -1418,5 +1541,97 @@ mod tests {
             );
         }
         assert_eq!(item_hit.rows.len(), 2, "totals rows merged into the grid: {:?}", item_hit.rows);
+    }
+
+    /// A narrow two-column table set in the page margin, sharing every visual
+    /// line with the main column's prose. `find_tables` used to scan the merged
+    /// lines, so the seed-and-grow window compared the table's rows against the
+    /// prose and the `flowing` veto dropped the whole table to plain text. The
+    /// detector must now isolate the right-hand column band and recover the
+    /// table without annexing the prose.
+    #[test]
+    fn side_table_beside_prose_is_detected_without_the_prose() {
+        let prose = |x: f64, y: f64, t: &str, adv: f64| sp_at(t, x, y, adv);
+        let mut lines: Vec<Vec<Span>> = Vec::new();
+        let params = [
+            ("Parameter", "Value", "Unit"),
+            ("dim", "4096", "params"),
+            ("n_layers", "32", "layers"),
+            ("head_dim", "128", "dim"),
+            ("hidden_dim", "14336", "dim"),
+            ("n_heads", "32", "heads"),
+            ("vocab_size", "32000", "tokens"),
+        ];
+        for (i, (name, value, unit)) in params.iter().enumerate() {
+            let y = 700.0 - 12.0 * i as f64;
+            lines.push(vec![
+                prose(40.0, y, "alpha", 28.0),
+                prose(74.0, y, "beta", 24.0),
+                prose(104.0, y, "gamma", 32.0),
+                prose(142.0, y, "delta", 28.0),
+                prose(300.0, y, name, 30.0),
+                prose(360.0, y, value, 26.0),
+                prose(410.0, y, unit, 30.0),
+            ]);
+        }
+        let hits = find_tables(&lines);
+        let hit = hits
+            .iter()
+            .find(|h| h.rows.iter().any(|r| r.iter().any(|c| c.contains("n_layers"))))
+            .unwrap_or_else(|| panic!("side table was not detected, hits={hits:?}"));
+        let joined = hit.rows.iter().flatten().cloned().collect::<Vec<_>>().join(" | ");
+        assert!(
+            joined.contains("4096") && joined.contains("32000"),
+            "table cells missing: {joined}"
+        );
+        assert!(
+            !joined.contains("alpha") && !joined.contains("delta"),
+            "neighboring prose was annexed into the side table: {joined}"
+        );
+        assert!(
+            hit.bbox.x0 >= 290.0,
+            "hit must be confined to the right-hand column band: {:?}",
+            hit.bbox
+        );
+    }
+
+    /// A sparse value column (only one data row fills the last cell — the
+    /// "± 0.07" of the Mistral benchmark grid) must not make the consolidator
+    /// treat every following row as a wrapped continuation and fold the whole
+    /// grid into one `<br>`-joined row.
+    #[test]
+    fn sparse_value_column_does_not_fold_rows_into_one() {
+        let lines: Vec<Vec<Span>> = (0..5)
+            .map(|i| vec![sp_at("x", 40.0, 700.0 - 12.0 * i as f64, 8.0)])
+            .collect();
+        let info: Vec<RowInfo> = lines
+            .iter()
+            .map(|l| RowInfo {
+                words: line_words(l),
+                starts: vec![40.0],
+                ends: vec![48.0],
+                size: 10.0,
+            })
+            .collect();
+        let win_rows: Vec<usize> = (0..5).collect();
+        let rows = vec![
+            vec!["Model".into(), "MT".into(), "ELO".into()],
+            vec!["A".into(), "1".into(), "2".into(), "+/- 0.07".into()],
+            vec!["B".into(), "3".into(), "4".into(), "".into()],
+            vec!["C".into(), "5".into(), "6".into(), "".into()],
+            vec!["D".into(), "7".into(), "8".into(), "".into()],
+        ];
+        let out = consolidate_table_rows(rows, &win_rows, &lines, &info);
+        assert_eq!(
+            out.len(),
+            5,
+            "data rows were folded together: {out:?}"
+        );
+        for row in &out[1..] {
+            assert!(
+                !row.iter().any(|c| c.contains("<br>")),
+                "distinct data rows were joined with <br>: {out:?}"
+            );
+        }
     }
 }

@@ -43,6 +43,23 @@ fn de_overlap_tables(tables: &[TableHit]) -> Vec<TableHit> {
     out
 }
 
+/// Spans of `line` that lie outside the horizontal band `[x0, x1]` a table
+/// occupies. Used to recover a neighboring column's content when it shares
+/// visual lines with a side table (a narrow parameter/score table in the page
+/// margin beside the main text column): the table's lines are skipped when it
+/// is spliced, so everything outside its own x-band must still be rendered.
+fn spans_outside(line: &[Span], x0: f64, x1: f64) -> Vec<Span> {
+    line.iter()
+        .filter(|s| {
+            let end = s.x + s.advance;
+            // A span overlapping the table's x-band is table content; a span
+            // ending before x0 or starting after x1 belongs to the neighbor.
+            !(s.x < x1 - 0.5 && end > x0 + 0.5)
+        })
+        .cloned()
+        .collect()
+}
+
 /// Render a page's visual lines to text, replacing detected table blocks with
 /// GFM pipe tables. Non-table lines use the exact same rules as `render_cluster`.
 pub fn render_with_tables(lines: &[Vec<Span>], tables: &[TableHit]) -> String {
@@ -69,6 +86,19 @@ pub fn render_with_tables(lines: &[Vec<Span>], tables: &[TableHit]) -> String {
                 // Defensive: never index past the last line.
                 t += 1;
                 continue;
+            }
+            // A side table shares its visual lines with a neighboring column's
+            // prose. Those lines are skipped below when the table is spliced, so
+            // render whatever lies outside the table's own x-band first
+            // (continuing the surrounding prose); for a full-width table this is
+            // empty and nothing changes.
+            let side_content: Vec<Vec<Span>> = lines[i..=hit.end]
+                .iter()
+                .map(|l| spans_outside(l, hit.bbox.x0, hit.bbox.x1))
+                .collect();
+            if side_content.iter().any(|l| !l.is_empty()) {
+                let bands = detect_column_bands(&side_content);
+                push_band_lines(&mut out, &bands, &mut prev_line_y, &mut list_state, body_size);
             }
             // Blank line before the table (markdown block separation).
             if !out.is_empty() && !out.ends_with("\n\n") {
@@ -221,5 +251,39 @@ mod tests {
             2,
             "[0..=2] and [2..=4] share a line and must collapse; [5..=5] survives"
         );
+    }
+
+    /// A side table shares its visual lines with the main column's prose. When
+    /// the table is spliced, everything outside its own x-band must still be
+    /// rendered, or the neighboring column's text vanishes from the page.
+    #[test]
+    fn render_with_tables_preserves_prose_beside_side_table() {
+        let lines = vec![
+            vec![
+                span("left prose one", 40.0, 700.0, 10.0, 100.0),
+                span("dim", 300.0, 700.0, 10.0, 20.0),
+                span("4096", 360.0, 700.0, 10.0, 25.0),
+            ],
+            vec![
+                span("left prose two", 40.0, 688.0, 10.0, 100.0),
+                span("n_layers", 300.0, 688.0, 10.0, 45.0),
+                span("32", 360.0, 688.0, 10.0, 12.0),
+            ],
+        ];
+        let hit = TableHit {
+            start: 0,
+            end: 1,
+            rows: vec![
+                vec!["dim".to_string(), "4096".to_string()],
+                vec!["n_layers".to_string(), "32".to_string()],
+            ],
+            bbox: BoundingBox::new(300.0, 680.0, 400.0, 710.0),
+        };
+        let md = render_with_tables(&lines, &[hit]);
+        assert!(
+            md.contains("left prose one") && md.contains("left prose two"),
+            "prose beside the side table was dropped:\n{md}"
+        );
+        assert_eq!(table_blocks(&md), 1, "side table was not rendered:\n{md}");
     }
 }
