@@ -1571,6 +1571,27 @@ fn detect_list_marker(line: &[Span]) -> Option<(bool, usize)> {
     Some((is_ordered, skip))
 }
 
+/// The explicit index carried by a *bracketed* ordered marker (`[3]`), or
+/// `None` for any other marker shape.
+///
+/// A bracketed numeric marker is an author-supplied citation index, not an
+/// auto-numbered list bullet. Its number must be rendered verbatim rather than
+/// re-derived from `ListRunState`: the run counter restarts at 1 every time a
+/// wrapped continuation line (a `Body` line) ends the Markdown list run between
+/// two markers, so a reference list `[1] [2] [3] …` collapsed to `1. 1. 1. …`
+/// and the citations lost their identity. `[N]` is unambiguous — the digits
+/// are the index — so prefer them; dot/paren markers (`1.`, `1)`) keep the
+/// counter (some producers emit the same number on every item, where the
+/// counter's renumbering is the desired behaviour).
+fn explicit_bracketed_ordinal(line: &[Span]) -> Option<usize> {
+    let marker = line.iter().find(|s| !s.text.trim().is_empty())?.text.trim();
+    let inner = marker.strip_prefix('[')?.strip_suffix(']')?;
+    if inner.is_empty() || !inner.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    inner.parse().ok()
+}
+
 /// Classifies one visual line, threading `list_state` across consecutive
 /// calls in one render pass. Returns the role plus the span slice the caller
 /// should actually render as the line's text — the marker sliced off for a
@@ -1590,7 +1611,14 @@ pub(crate) fn classify_line<'a>(
     }
     if let Some((ordered, skip)) = detect_list_marker(line) {
         let depth = list_state.depth_for(line[0].x, body_size);
+        // Always advance the run counter so a following dot/paren marker keeps
+        // counting on from here, but let an explicit `[N]` citation index win.
         let ordinal = list_state.next_ordinal(depth);
+        let ordinal = if ordered {
+            explicit_bracketed_ordinal(line).unwrap_or(ordinal)
+        } else {
+            ordinal
+        };
         return (LineRole::List { depth, ordered, ordinal }, &line[skip..]);
     }
     list_state.end_run();
@@ -2370,6 +2398,35 @@ mod structural_tests {
             }
         }
         assert_eq!(ordinals, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn bracketed_citation_markers_keep_their_own_number_across_continuation_lines() {
+        // A paper's reference list reaches this layer as "[1] Ainslie …",
+        // "… continuation body line", "[2] Austin …". The continuation `Body`
+        // line ends the Markdown list run, so the synthetic run counter
+        // restarted at 1 for every item and the whole bibliography rendered as
+        // "1. 1. 1. …". The explicit bracket index must survive.
+        let bracketed = |n: usize, text: &str| -> Vec<Span> {
+            let marker = format!("[{n}]");
+            vec![
+                word(&marker, 100.0, BODY, false),
+                word(" ", 100.0 + marker.len() as f64 * BODY * 0.6, BODY, false),
+                word(text, 120.0, BODY, false),
+            ]
+        };
+        let lines: Vec<Vec<Span>> = vec![
+            bracketed(1, "Joshua Ainslie, James Lee-Thorp"),
+            one_span_line("Sumit Sanghai. Gqa: Training generalized multi-query", BODY, false),
+            bracketed(2, "Jacob Austin, Augustus Odena"),
+            one_span_line("language models. arXiv preprint arXiv:2108.07732, 2021.", BODY, false),
+            bracketed(11, "Michael Collins"),
+        ];
+        let md = render_cluster(&lines);
+        assert!(md.contains("1. Joshua Ainslie"), "{md}");
+        assert!(md.contains("2. Jacob Austin"), "{md}");
+        assert!(md.contains("11. Michael Collins"), "{md}");
+        assert!(!md.contains("1. Jacob Austin"), "{md}");
     }
 
     #[test]
