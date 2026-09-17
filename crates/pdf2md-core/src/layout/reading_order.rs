@@ -323,7 +323,34 @@ pub fn detect_projection_two_columns(lines: &[Vec<Span>]) -> Option<PageColumns>
                 if !left_spans.is_empty() && !right_spans.is_empty() {
                     let l_end = left_spans.iter().map(|s| s.x + s.advance).fold(f64::NEG_INFINITY, f64::max);
                     let r_start = right_spans.iter().map(|s| s.x).fold(f64::INFINITY, f64::min);
-                    if r_start - l_end >= 1.2 * b.size {
+                    // A non-whitespace span that *straddles* the candidate
+                    // gutter (`s.x < gx < s.x + advance`) satisfies neither the
+                    // left (`end <= gx`) nor the right (`x >= gx`) filter, so it
+                    // is absent from both and `r_start - l_end` reports a wide
+                    // apparent white corridor that the straddling run actually
+                    // fills. Producers routinely split one word across several
+                    // `Tj` runs (`L|e statut et le r|égim|e`, `c|our|s`), so on a
+                    // centered single-column line this manufactures a phantom
+                    // page gutter: `detect_projection_two_columns` then reads
+                    // the page as two columns and emits each line's tail after
+                    // every line's head. Subtract the straddlers' ink and accept
+                    // the gutter only when real whitespace of gutter width is
+                    // left over. A short straddler genuinely sitting between two
+                    // columns (the invoice `Z` regression) leaves enough gap to
+                    // still count as a split.
+                    let covered: f64 = b
+                        .line
+                        .iter()
+                        .filter(|s| {
+                            !s.text.trim().is_empty() && s.x < gx && s.x + s.advance > gx
+                        })
+                        .map(|s| {
+                            let lo = s.x.max(l_end);
+                            let hi = (s.x + s.advance).min(r_start);
+                            (hi - lo).max(0.0)
+                        })
+                        .sum();
+                    if r_start - l_end - covered >= 1.2 * b.size {
                         left_count += 1;
                         right_count += 1;
                         max_l_x = max_l_x.max(l_end);
@@ -2211,6 +2238,59 @@ mod tests {
             pc.right.iter().map(|r| r.iter().map(|s| s.text.clone()).collect::<Vec<_>>()).collect::<Vec<_>>(),
             pc.top_full.iter().map(|r| r.iter().map(|s| s.text.clone()).collect::<Vec<_>>()).collect::<Vec<_>>(),
             pc.bottom_full.iter().map(|r| r.iter().map(|s| s.text.clone()).collect::<Vec<_>>()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn projection_columns_reject_centered_words_split_across_runs() {
+        // Regression for the FR "Statut EI et régime micro entreprise" slide
+        // deck: every visual line is a centered single-column sentence, but the
+        // producer emits each word as several `Tj` runs (`Le statut et le
+        // r|égim|e`). `detect_projection_two_columns` dropped the straddling run
+        // from *both* halves, measured that run's own width as a white gutter,
+        // and read the whole slide as two columns — emitting every line's tail
+        // after every line's head (`# Le statut et le r` … `# égime`). A
+        // straddler that bridges `l_end`..`r_start` is filler, not a gutter.
+        fn mk(text: &str, x: f64, adv: f64, y: f64) -> Span {
+            Span {
+                text: text.to_string(),
+                x,
+                y,
+                size: 10.0,
+                advance: adv,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_vertical: false,
+            }
+        }
+        let mut lines: Vec<Vec<Span>> = Vec::new();
+        for i in 0..4 {
+            let y = 700.0 - 10.0 * i as f64;
+            lines.push(vec![
+                mk("Le statut et le r", 10.0, 55.0, y),
+                mk("égim", 65.0, 30.0, y),
+                mk("e ", 95.0, 65.0, y),
+            ]);
+        }
+        // A head-only and a tail-only row give the projection its usual support.
+        lines.push(vec![mk("Le statut et le r", 10.0, 55.0, 660.0)]);
+        lines.push(vec![mk("e ", 95.0, 65.0, 650.0)]);
+
+        assert!(
+            detect_projection_two_columns(&lines).is_none(),
+            "a straddling run that bridges the gap must not be read as a column gutter"
+        );
+        let streams = page_read_order(&lines);
+        assert_eq!(streams.len(), 1, "centered prose must stay one column");
+        let joined: String = streams[0]
+            .iter()
+            .flat_map(|l| l.iter())
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(
+            joined.contains("Le statut et le régime"),
+            "the words must stay intact in reading order, got {joined:?}"
         );
     }
 }
