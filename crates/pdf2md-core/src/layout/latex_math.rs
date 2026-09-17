@@ -282,7 +282,12 @@ fn render_cell_plain(spans: &[Span]) -> String {
 fn group_cells(line: &[Span]) -> Vec<Cell> {
     let mut cells: Vec<Cell> = Vec::new();
     for span in line {
-        if span.text.is_empty() {
+        // A whitespace-only run carries no visible glyph, so it can be neither
+        // a base nor a super/subscript. Keeping it let a decorative spacer span
+        // (smaller size, slightly different baseline) masquerade as a script,
+        // emitting `$prose_{}$` / `$prose^{}$` with an empty script. Mirror
+        // `line_profile`, which already ignores whitespace-only spans.
+        if span.text.trim().is_empty() {
             continue;
         }
         let can_join = cells.last_mut().map_or(false, |c| {
@@ -1149,6 +1154,28 @@ mod tests {
             span("i", 108.0, 694.0, 8.0, 5.0),
         ];
         assert_eq!(synthesize_line_expr(&line).to_latex(), r"a_{i}");
+    }
+
+    /// A decorative whitespace-only spacer must never be treated as a
+    /// super/subscript. Producers pad text with spacer runs drawn at a slightly
+    /// smaller size and a shifted baseline; keeping such a run in the cell
+    /// grouping let it masquerade as an *empty* script and wrapped ordinary
+    /// prose in `$..._{}$` / `$...^{}$` (exactly the corruption observed on the
+    /// CAF `SeConnecterAMonComptePartenaire.pdf` fixture, where five plain
+    /// prose lines were synthesized as LaTeX math).
+    #[test]
+    fn whitespace_only_spacer_is_not_a_script() {
+        let line = vec![
+            span("Vous avez reçu un identifiant", 100.0, 700.0, 10.56, 200.0),
+            // Trailing spacer: smaller size, ~4pt above the text baseline.
+            span(" ", 302.0, 704.0, 9.96, 3.0),
+        ];
+        let rendered = render_math_line(&line);
+        assert!(
+            !rendered.contains('$'),
+            "a whitespace spacer must not synthesize math, got {rendered}"
+        );
+        assert!(rendered.contains("identifiant"), "got {rendered}");
     }
 
     /// Plain body text must remain byte-identical (no false positives).
