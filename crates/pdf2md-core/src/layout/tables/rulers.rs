@@ -108,6 +108,53 @@ pub fn line_words(line: &[Span]) -> Vec<WordTok> {
         last_end = sp.x + sp.advance;
     }
     flush(&mut out, &mut text, &mut x0, last_end);
+    merge_value_symbol_tokens(out)
+}
+
+/// A lone currency/percent symbol that a PDF producer emitted as its own glyph
+/// run. These are units, never standalone table columns.
+fn is_value_symbol(text: &str) -> bool {
+    matches!(text, "€" | "$" | "£" | "¥" | "%" | "₽" | "¢")
+}
+
+/// Fold a bare trailing currency/percent symbol back into the numeric token it
+/// immediately follows. Producers routinely draw "81,90 €" as two runs, the
+/// amount and then the symbol starting exactly at the amount's right edge (the
+/// intervening space span is consumed by `line_words`). Left alone, that symbol
+/// becomes a word whose start x is zero-distance from the number's end, which
+/// the ruler scanner promotes to a *phantom last column*: every data row then
+/// splits into a number cell plus an adjacent symbol cell, and the window-level
+/// `flowing` veto reads the near-zero gap as prose and rejects the whole table.
+///
+/// The merge is deliberately narrow: the symbol must be exactly one of the
+/// known unit symbols, the previous token must end in a digit, and the symbol
+/// must abut that token (no intervening whitespace). It can never fuse two
+/// genuine columns, because a real column boundary is separated by a column
+/// gutter, far wider than the zero/single-point gap tested here.
+fn merge_value_symbol_tokens(words: Vec<WordTok>) -> Vec<WordTok> {
+    let mut out: Vec<WordTok> = Vec::with_capacity(words.len());
+    for w in words {
+        if let Some(prev) = out.last_mut() {
+            let prev_ends_digit = prev
+                .text
+                .chars()
+                .last()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false);
+            let abuts = (w.x0 - prev.x1).abs() <= 1.0;
+            if prev_ends_digit && is_value_symbol(&w.text) && abuts {
+                // French/typographic convention: a space before a currency
+                // symbol ("81,90 €") but none before a percent ("10%").
+                if w.text != "%" {
+                    prev.text.push(' ');
+                }
+                prev.text.push_str(&w.text);
+                prev.x1 = prev.x1.max(w.x1);
+                continue;
+            }
+        }
+        out.push(w);
+    }
     out
 }
 
@@ -646,11 +693,49 @@ fn scan_aligned_grids_opts(
                 .map(|&i| info[i].size)
                 .fold(0.0f64, f64::max);
             let min_gutter = (1.1 * max_size).max(6.0);
+            // Whether this seed is a genuinely multi-column grid (3+ rulers).
+            // A 2-column label/value block has no separate right-aligned
+            // amount column for a totals block to share, so it keeps the
+            // original (more permissive) growth rule.
+            let seed_is_multi_col = rulers.len() >= 3;
             while hi + 1 < band.len() && rulers.len() >= 2 {
                 let next_ri = band[hi + 1];
+                // Grow only when the candidate row populates at least two
+                // columns the table has *already* established. Judging the row
+                // against the ruler set recomputed after adding it (the old
+                // `next_match`) is circular: the row contributes its own new
+                // rulers and then trivially "matches" them. An adjacent
+                // totals/VAT/Règlement block under a multi-column line-item
+                // grid shares only the right-aligned amount edge and would
+                // otherwise be annexed wholesale. The membership test uses the
+                // table's own font scale, not the pass-wide `tol` (inflated by
+                // the largest title on the page). A genuine two-column
+                // label/value grid has no amount column to be shared with a
+                // totals block, so it keeps the original growth rule.
+                let member_size = info[band[lo]].size.max(info[next_ri].size).max(0.1);
+                let member_tol =
+                    (1.5 * tol_mult * (0.06 * member_size).clamp(0.5, 1.2)).min(tol * 1.5);
+                let established_match = rulers
+                    .iter()
+                    .filter(|&&r| row_matches_ruler(&info[next_ri], r, member_tol))
+                    .count();
                 let next_r = table_rulers_opts(&info, tol, band[lo], next_ri, min_gutter, wide_ok);
                 let next_match = next_r.iter().filter(|&&r| row_matches_ruler(&info[next_ri], r, tol * 1.5)).count();
-                if next_r.len() >= 2 && next_match >= 2 {
+                // The membership rule only kicks in for a genuinely
+                // multi-column seed AND a candidate set in a *smaller* font
+                // than the table's own anchor row: the signature of a
+                // totals/VAT summary appended below a product grid. A table
+                // whose rows keep the same size (or grow into a larger
+                // header) grows exactly as before, so header/invoice blocks
+                // and ordinary continuations are untouched.
+                let candidate_smaller_font = info[next_ri].size < info[band[lo]].size;
+                let grows = next_r.len() >= 2
+                    && if seed_is_multi_col && candidate_smaller_font {
+                        established_match >= 2
+                    } else {
+                        next_match >= 2
+                    };
+                if grows {
                     hi += 1;
                     rulers = next_r;
                     continue;
@@ -1162,5 +1247,176 @@ mod tests {
             "wrapped tail of the final value cell was dropped from the table: {:?}",
             hit.rows
         );
+    }
+
+    fn sz(text: &str, x: f64, y: f64, adv: f64, size: f64) -> Span {
+        Span {
+            text: text.to_string(),
+            x,
+            y,
+            size,
+            advance: adv,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_vertical: false,
+        }
+    }
+
+    /// A value drawn as two runs — the number, an explicit space span, then the
+    /// currency symbol — exactly as the FNFE invoice generators emit it. Before
+    /// `merge_value_symbol_tokens` this became two tokens: the number, and a
+    /// `"€"` whose x0 sits exactly on the number's right edge.
+    fn split_amount(num: &str, x: f64, num_adv: f64, y: f64, size: f64) -> Vec<Span> {
+        vec![
+            sz(num, x, y, num_adv, size),
+            sz(" ", x + num_adv, y, 1.0, size),
+            sz("€", x + num_adv + 1.0, y, 6.5, size),
+        ]
+    }
+
+    /// The exact regression shape from the prior attempt: a line
+    /// `["81,90" @ x, " " @ x+advance, "€" @ x+advance+space]` must tokenize to
+    /// the single word `"81,90 €"`. Left split, the symbol becomes a phantom
+    /// last column whose near-zero gap to the number reads as prose and makes
+    /// the window-level `flowing` veto reject the whole table.
+    #[test]
+    fn trailing_currency_symbol_is_folded_into_its_number() {
+        let line = vec![sp("81,90", 100.0, 28.0), sp(" ", 128.0, 2.5), sp("€", 130.5, 9.0)];
+        let words = line_words(&line);
+        assert_eq!(
+            words.len(),
+            1,
+            "a trailing currency symbol must not become its own token: {words:?}"
+        );
+        assert_eq!(words[0].text, "81,90 €");
+        assert!((words[0].x0 - 100.0).abs() < 1e-6, "x0 moved: {}", words[0].x0);
+        assert!((words[0].x1 - 139.5).abs() < 1e-6, "x1 wrong: {}", words[0].x1);
+    }
+
+    /// A bare percent unit is folded the same way ("10" + "%" → "10%").
+    #[test]
+    fn trailing_percent_symbol_is_folded_into_its_number() {
+        let line = vec![sp("10", 200.0, 11.0), sp(" ", 211.0, 2.0), sp("%", 213.0, 8.0)];
+        let words = line_words(&line);
+        assert_eq!(words.len(), 1, "percent unit split off: {words:?}");
+        assert_eq!(words[0].text, "10%");
+    }
+
+    /// A currency symbol separated from the preceding token by a real column
+    /// gutter is a genuinely different cell and must NOT be folded in.
+    #[test]
+    fn currency_symbol_after_a_gutter_is_not_folded() {
+        let line = vec![sp("Total", 100.0, 30.0), sp("€", 200.0, 9.0)];
+        let words: Vec<String> = line_words(&line).into_iter().map(|w| w.text).collect();
+        assert_eq!(words, vec!["Total", "€"], "a separate symbol cell was fused: {words:?}");
+    }
+
+    /// Regression for the four fixtures the previous growth-boundary relaxation
+    /// corrupted (`fnfe_Avoir_FR_type381_BASIC`, `fnfe_Facture_UE_*`,
+    /// `mustang_validAvoir_FR_type380_BASICWL`): a two-row line-item grid whose
+    /// totals/VAT block reuses the right-aligned amount edge, followed by a
+    /// multi-line anchor-column label ("Taxe Base Montant Total HT" / "TVA
+    /// collectée (vente)" / "Total taxes" / "Total TTC"). Once the currency
+    /// symbols are folded the line-item grid is clean, so the only thing that
+    /// used to stop the growth loop was the `flowing` veto — a totals row that
+    /// shares the amount column's right edge could then be annexed, fabricating
+    /// a single garbled product/totals row. An oversized title (20pt vs the
+    /// table's 9pt) inflates the page-wide tolerance, which is exactly what let
+    /// the totals row "match" the amount column in the 2×-tolerance gap pass.
+    /// The totals block must never enter the line-item hit.
+    #[test]
+    fn totals_block_is_never_annexed_into_the_line_item_grid() {
+        let mut lines: Vec<Vec<Span>> = Vec::new();
+        // A 16pt title elsewhere on the page inflates the pass-wide tolerance
+        // past the table's own 9pt scale — enough that a totals row 2.5pt off
+        // the amount edge looks aligned in the 2×-tolerance gap pass.
+        lines.push(vec![sz("AVOIR AV-2017-0005", 100.0, 700.0, 160.0, 16.0)]);
+
+        // Two line items (9pt), each amount drawn as number + space + "€".
+        let mut item_a = vec![
+            sz("Nougat de l'Abbaye 250g", 34.1, 452.6, 100.8, 9.0),
+            sz("5", 362.5, 452.6, 5.0, 9.0),
+            sz("Unit(s)", 370.2, 452.6, 20.6, 9.0),
+        ];
+        item_a.extend(split_amount("4,55", 431.8, 17.5, 452.6, 9.0));
+        item_a.push(sz("10%", 475.6, 452.6, 18.0, 9.0));
+        item_a.extend(split_amount("-20,48", 528.8, 25.5, 452.6, 9.0));
+        lines.push(item_a);
+
+        let mut item_b = vec![
+            sz("Huile d'olive à l'ancienne", 34.1, 434.4, 98.5, 9.0),
+            sz("10", 357.5, 434.4, 10.0, 9.0),
+            sz("Liter(s)", 370.2, 434.4, 21.8, 9.0),
+        ];
+        item_b.extend(split_amount("19,80", 426.8, 22.5, 434.4, 9.0));
+        item_b.extend(split_amount("-198,00", 523.8, 30.5, 434.4, 9.0));
+        lines.push(item_b);
+
+        // Totals/VAT/Règlement block (7-10pt) reusing the amount right edge
+        // (x≈561.8) and a multi-line anchor label.
+        lines.push(vec![
+            sz("Taxe", 88.8, 415.6, 15.4, 7.0),
+            sz("Base", 188.3, 415.6, 16.8, 7.0),
+            sz("Montant", 254.1, 415.6, 27.2, 7.0),
+            sz("Total", 454.3, 415.6, 23.1, 7.0),
+            sz("HT", 477.4, 415.6, 16.1, 7.0),
+            sz("-218,48 €", 519.6, 415.6, 42.3, 7.0),
+        ]);
+        lines.push(vec![
+            sz("TVA", 34.1, 402.0, 13.4, 7.0),
+            sz("collectée", 47.0, 402.0, 29.3, 7.0),
+            sz("(vente)", 76.4, 402.0, 23.6, 7.0),
+            sz("20,0%", 100.0, 402.0, 21.7, 7.0),
+            sz("-20,48 €", 203.2, 402.0, 25.7, 7.0),
+            sz("-4,10 €", 279.3, 402.0, 21.8, 7.0),
+        ]);
+        lines.push(vec![
+            sz("Total", 442.0, 395.5, 23.2, 10.0),
+            sz("taxes", 465.2, 395.5, 28.2, 10.0),
+            sz("-14,99 €", 525.1, 395.5, 36.8, 10.0),
+        ]);
+        lines.push(vec![
+            sz("TVA", 34.1, 388.4, 13.4, 7.0),
+            sz("collectée", 47.0, 388.4, 29.3, 7.0),
+            sz("(vente)", 76.4, 388.4, 23.6, 7.0),
+            sz("5,5%", 100.0, 388.4, 17.8, 7.0),
+            sz("-198,00 €", 199.3, 388.4, 29.6, 7.0),
+            sz("-10,89 €", 275.4, 388.4, 25.7, 7.0),
+        ]);
+        lines.push(vec![
+            sz("Total TTC", 448.2, 378.2, 45.3, 10.0),
+            sz("-233,47 €", 519.6, 378.2, 42.3, 10.0),
+        ]);
+
+        // The full detector: strict pass plus the 2×-tolerance stage-3b pass.
+        let mut hits = find_tables(&lines);
+        hits.extend(find_gap_tables(&lines, &hits));
+
+        let item_hit = hits
+            .iter()
+            .find(|h| h.rows.iter().any(|r| r.iter().any(|c| c.contains("Nougat"))))
+            .unwrap_or_else(|| panic!("line-item grid was not detected, hits={hits:?}"));
+        let joined = item_hit
+            .rows
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            item_hit.rows.iter().any(|r| r.iter().any(|c| c.contains("Huile"))),
+            "both line items must be in the grid: {joined}"
+        );
+        for forbidden in [
+            "Taxe", "Base", "Montant", "Total", "taxes", "TTC", "TVA", "-218,48", "-14,99",
+            "-233,47",
+        ] {
+            assert!(
+                !joined.contains(forbidden),
+                "totals/VAT label {forbidden:?} was annexed into the line-item hit: {joined}"
+            );
+        }
+        assert_eq!(item_hit.rows.len(), 2, "totals rows merged into the grid: {:?}", item_hit.rows);
     }
 }
