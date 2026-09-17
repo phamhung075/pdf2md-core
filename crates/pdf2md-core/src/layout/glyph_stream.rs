@@ -863,13 +863,36 @@ fn flush_path_segs(
     out: &mut Vec<(f64, f64, f64)>,
     close: bool,
 ) {
-    for w in path.windows(2) {
-        record_horiz_seg(out, w[0], w[1]);
+    // A genuine underline is a *thin* horizontal rule. A taller path is a
+    // rectangle border — e.g. the hyperlink annotation box a producer draws with
+    // `m`/`l` around a link — whose top and bottom edges would otherwise each be
+    // recorded as an "underline". On the FR "Statut EI" ACRE slide the URL link
+    // box's top edge sat a couple of points below the *previous* text line's
+    // baseline, so it underlined " au plus tard dans les 45 jours suiv" even
+    // though only `l'URSSAF` and the URL are underlined on the page. Reject a
+    // path whose overall vertical extent is not that of a rule, using the same
+    // < 2pt threshold the thin-filled-`re` branch already applies.
+    let mut ymin = f64::INFINITY;
+    let mut ymax = f64::NEG_INFINITY;
+    for &(_, y) in path.iter() {
+        ymin = ymin.min(y);
+        ymax = ymax.max(y);
     }
     if close {
-        if let Some(s) = start {
-            if let Some(&last) = path.last() {
-                record_horiz_seg(out, last, s);
+        if let Some((_, y)) = start {
+            ymin = ymin.min(y);
+            ymax = ymax.max(y);
+        }
+    }
+    if !path.is_empty() && ymax - ymin < 2.0 {
+        for w in path.windows(2) {
+            record_horiz_seg(out, w[0], w[1]);
+        }
+        if close {
+            if let Some(s) = start {
+                if let Some(&last) = path.last() {
+                    record_horiz_seg(out, last, s);
+                }
             }
         }
     }
@@ -1733,10 +1756,27 @@ mod tests {
 
     #[test]
     fn flush_path_segs_keeps_only_horizontal_thin_rules() {
-        let mut path = vec![(100.0, 200.0), (300.0, 200.0), (300.0, 300.0)];
+        let mut path = vec![(100.0, 200.0), (300.0, 200.0), (300.0, 201.0)];
         let mut segs: Vec<(f64, f64, f64)> = Vec::new();
-        flush_path_segs(&mut path, Some((100.0, 200.0)), &mut segs, true);
+        flush_path_segs(&mut path, Some((100.0, 200.0)), &mut segs, false);
         assert_eq!(segs, vec![(200.0, 100.0, 300.0)], "only the horizontal rule survives");
+    }
+
+    #[test]
+    fn flush_path_segs_ignores_a_box_border_edge() {
+        // A hyperlink annotation box drawn as `m`/`l`/`h` is ~13pt tall; its top
+        // and bottom edges must NOT become "underline" rules, or the top edge
+        // underlines the text line just above the box (the FR ACRE slide's URL
+        // box underlined " au plus tard dans les 45 jours suiv").
+        let mut path = vec![
+            (198.1, 257.5),
+            (260.4, 257.5),
+            (260.4, 244.1),
+            (198.1, 244.1),
+        ];
+        let mut segs: Vec<(f64, f64, f64)> = Vec::new();
+        flush_path_segs(&mut path, Some((198.1, 257.5)), &mut segs, true);
+        assert!(segs.is_empty(), "a box border must not yield underline rules, got {segs:?}");
     }
 
     #[test]
