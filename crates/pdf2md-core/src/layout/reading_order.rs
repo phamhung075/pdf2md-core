@@ -439,11 +439,35 @@ pub fn page_two_columns(lines: &[Vec<Span>]) -> Option<PageColumns> {
     detect_projection_two_columns(lines)
 }
 
+/// Whether `pc` is safe to read as two independent prose columns.
+///
+/// `page_two_columns_rows` already requires both halves to be a single clean
+/// column; the vertical-projection fallback has no such gate, because it must
+/// also serve pages whose whole line is a single `Tj` run (one span per visual
+/// line, so an average-word gate would reject every genuine column). That
+/// leaves it free to mistake the gap in front of an invoice's right-aligned
+/// value column for the page gutter: the "left half" of its split then still
+/// holds several table cells (label, description, quantity...) separated by
+/// column-wide internal gutters, and the "right half" holds the amounts.
+/// Reading the page in two streams emits every amount after the entire left
+/// stream, so the `blocks` channel jumps a row's total to the end of the page
+/// instead of keeping it beside its label (the target fixture's `275,00` and
+/// `Teilzahlung`). A half that is itself a grid of cells is not a prose column;
+/// apply the very rule `page_two_columns_rows` uses.
+///
+/// This decision is deliberately kept out of `page_two_columns` itself: the
+/// glyph-stream table filter uses a detected two-column *prose block* to drop
+/// 2-column table hits that are really prose noise, and must keep doing so even
+/// when the same page is read linearly here.
+fn columns_are_viable_prose(pc: &PageColumns) -> bool {
+    rows_are_clean(&pc.left) && rows_are_clean(&pc.right)
+}
+
 /// Human reading order for the page as streams of visual lines: single-column
 /// pages produce one stream (top-down); two-column pages produce full-width
 /// header rows, left column, right column, footer rows.
 pub fn page_read_order(lines: &[Vec<Span>]) -> Vec<Vec<Vec<Span>>> {
-    if let Some(pc) = page_two_columns(lines) {
+    if let Some(pc) = page_two_columns(lines).filter(columns_are_viable_prose) {
         let mut streams = Vec::new();
         if !pc.top_full.is_empty() {
             streams.push(pc.top_full);
@@ -3089,6 +3113,68 @@ mod column_band_tests {
             bands.iter().all(|b| !matches!(b, ColumnBand::Columns { .. })),
             "single-column prose must not be split into columns: {:?} bands",
             bands.len()
+        );
+    }
+
+    /// Regression for `mustang_attributeBasedXMP_EN16931.pdf`: a single-column
+    /// invoice page with a right-aligned amount column made the vertical-
+    /// projection fallback read the page as two columns, so every amount was
+    /// emitted after the whole left stream and the `blocks` channel moved a
+    /// row's total (`275,00`) and a table header's last cell (`Teilzahlung`) to
+    /// the end of the page. The projection's "left half" is not one prose
+    /// column but a grid of table cells (label + description + quantity…), so
+    /// the reading-order gate must reject it; the low-level projection detector
+    /// itself stays ungated.
+    #[test]
+    fn cell_grid_half_is_not_a_page_column() {
+        // One physical row: a label at x=50, a middle cell at x=150 (an
+        // internal grid gutter), and an amount pinned to right edge 400 whose
+        // left edge moves with its own length.
+        let row = |y: f64, a: &str, b: &str, amount: &str| {
+            vec![
+                sp(a, 50.0, y),
+                sp(b, 150.0, y),
+                sp(amount, 400.0 - amount.len() as f64 * 6.0, y),
+            ]
+        };
+        let lines = vec![
+            row(300.0, "Positionssumme", "Basis", "473,00"),
+            row(290.0, "Gesamtbetrag", "zu", "0,00"),
+            row(280.0, "Abschlag", "netto", "-0,00"),
+            row(270.0, "Rechnungssumme", "ohne", "473,00"),
+            row(260.0, "Zahlbetrag", "frei", "529,87"),
+        ];
+        assert!(
+            detect_projection_two_columns(&lines).is_some(),
+            "the projection corridor is real; the missing reading-order gate is the bug"
+        );
+        let pc = page_two_columns(&lines).expect("projection fallback still detects it");
+        assert!(
+            !columns_are_viable_prose(&pc),
+            "a half that is a grid of cells must not read as one prose column"
+        );
+    }
+
+    /// The shape gate must not reject a genuine two-column page whose lines are
+    /// each a single `Tj` run (one span per visual line) — the case the
+    /// projection fallback exists for, and the shape the structural benchmark's
+    /// `twocol_*` documents use.
+    #[test]
+    fn single_span_prose_columns_are_still_detected() {
+        let row = |y: f64, l: &str, r: &str| vec![sp(l, 50.0, y), sp(r, 350.0, y)];
+        let lines = vec![
+            row(300.0, "Left line A.", "Right line A."),
+            row(290.0, "Left line B.", "Right line B."),
+            row(280.0, "Left line C.", "Right line C."),
+            row(270.0, "Left line D.", "Right line D."),
+        ];
+        let pc = page_two_columns(&lines)
+            .expect("a genuine two-column page must still be detected");
+        assert_eq!(pc.left.len(), 4, "{:?}", pc.left);
+        assert_eq!(pc.right.len(), 4, "{:?}", pc.right);
+        assert!(
+            columns_are_viable_prose(&pc),
+            "a genuine two-column page must survive the reading-order gate"
         );
     }
 }
