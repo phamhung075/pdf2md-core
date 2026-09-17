@@ -378,6 +378,98 @@ pub struct Span {
     pub is_vertical: bool,
 }
 
+/// Reads a TrueType/OpenType `sfnt` font program and reports whether its real
+/// weight is bold, or `None` when the program is missing or not a parseable
+/// sfnt (e.g. a bare-CFF `/FontFile3` or a Type1 `/FontFile`).
+///
+/// The PDF `/StemV` hint is producer-controlled and is routinely wrong: the
+/// ZUGFeRD/intarsys stylesheet writes the *same* `/StemV 600` (and `777`) on
+/// both its Regular and Bold subsets, so a stem-width threshold alone marks
+/// every run bold. The embedded `OS/2`/`head` tables carry the face's actual
+/// weight and are authoritative when they are present.
+fn font_program_is_bold(data: &[u8]) -> Option<bool> {
+    // sfnt header: version(4) numTables(2) searchRange(2) entrySelector(2)
+    // rangeShift(2), followed by 16-byte table records. Reject anything that
+    // is not a plain sfnt (e.g. bare-CFF `/FontFile3`) instead of reading
+    // table tags out of unrelated bytes.
+    if data.len() < 12 || !matches!(&data[0..4], [0x00, 0x01, 0x00, 0x00] | b"true" | b"OTTO") {
+        return None;
+    }
+    let num_tables = u16::from_be_bytes([data[4], data[5]]) as usize;
+    let mut dir = 12usize;
+    let mut head: Option<(usize, usize)> = None;
+    let mut os2: Option<(usize, usize)> = None;
+    for _ in 0..num_tables {
+        if dir + 16 > data.len() {
+            break;
+        }
+        let tag = &data[dir..dir + 4];
+        let offset = u32::from_be_bytes([
+            data[dir + 8],
+            data[dir + 9],
+            data[dir + 10],
+            data[dir + 11],
+        ]) as usize;
+        let length = u32::from_be_bytes([
+            data[dir + 12],
+            data[dir + 13],
+            data[dir + 14],
+            data[dir + 15],
+        ]) as usize;
+        match tag {
+            b"OS/2" => os2 = Some((offset, length)),
+            b"head" => head = Some((offset, length)),
+            _ => {}
+        }
+        dir += 16;
+    }
+
+    // OS/2: usWeightClass (u16 @4) and fsSelection (u16 @62, BOLD bit 0x20).
+    // Either a >=600 weight or the BOLD selection bit is definitive; a
+    // non-zero weight below 600 is a definitive regular face.
+    if let Some((o, len)) = os2 {
+        if len >= 6 && o + 6 <= data.len() {
+            let weight = u16::from_be_bytes([data[o + 4], data[o + 5]]);
+            if weight >= 600 {
+                return Some(true);
+            }
+            if len >= 64 && o + 64 <= data.len() {
+                let fs_selection = u16::from_be_bytes([data[o + 62], data[o + 63]]);
+                if fs_selection & 0x20 != 0 {
+                    return Some(true);
+                }
+            }
+            if weight != 0 {
+                return Some(false);
+            }
+        }
+    }
+
+    // head.macStyle (u16 @44), bit 0 = Bold.
+    if let Some((o, len)) = head {
+        if len >= 46 && o + 46 <= data.len() {
+            let mac_style = u16::from_be_bytes([data[o + 44], data[o + 45]]);
+            return Some(mac_style & 1 != 0);
+        }
+    }
+
+    None
+}
+
+/// Resolves a FontDescriptor's embedded font program to its real bold flag, if
+/// the descriptor carries a parseable TrueType/OpenType program.
+fn embedded_font_bold(doc: &Document, fd: &Dictionary) -> Option<bool> {
+    let data = fd
+        .get(b"FontFile2")
+        .or_else(|_| fd.get(b"FontFile3"))
+        .or_else(|_| fd.get(b"FontFile"))
+        .ok()
+        .and_then(|o| deref(doc, o))
+        .and_then(|o| o.as_stream().ok())
+        .and_then(|s| s.get_plain_content_with_limit(32 << 20).ok())?;
+    font_program_is_bold(&data)
+}
+
 /// Resolves whether a font dictionary represents a bold or italic typeface.
 pub(crate) fn resolve_font_style(doc: &Document, font: &Dictionary) -> (bool, bool) {
     let mut is_bold = false;
@@ -433,7 +525,12 @@ pub(crate) fn resolve_font_style(doc: &Document, font: &Dictionary) -> (bool, bo
                 .and_then(|o| o.as_dict().ok())
         });
 
+    let mut embedded_bold: Option<bool> = None;
+
     if let Some(fd) = desc {
+        // The embedded font program is the most reliable weight signal; the
+        // `/StemV` fallback below is skipped whenever it gives an answer.
+        embedded_bold = embedded_font_bold(doc, fd);
         if let Some(flags) = fd
             .get(b"Flags")
             .ok()
@@ -458,18 +555,28 @@ pub(crate) fn resolve_font_style(doc: &Document, font: &Dictionary) -> (bool, bo
             }
         }
         // `/FontWeight` is rarely present in embedded subsets. `/StemV` (the
-        // vertical stem width in 1/1000 em) is the practical bold signal in the
-        // wild: roman faces sit near 70–90, bold faces ~120+.
-        if let Some(stemv) = fd
-            .get(b"StemV")
-            .ok()
-            .and_then(|o| deref(doc, o))
-            .and_then(num)
-        {
-            if stemv >= 120.0 {
-                is_bold = true;
+        // vertical stem width in 1/1000 em) is a practical bold signal in the
+        // wild — roman faces sit near 70–90, bold faces ~120+ — but it is only
+        // a fallback: a producer that writes one out-of-range StemV on every
+        // subset (intarsys/ZUGFeRD emits 600 and 777 on its Regular face too)
+        // would otherwise mark all text bold. When the embedded program gave a
+        // definitive weight, that answer wins.
+        if embedded_bold.is_none() {
+            if let Some(stemv) = fd
+                .get(b"StemV")
+                .ok()
+                .and_then(|o| deref(doc, o))
+                .and_then(num)
+            {
+                if stemv >= 120.0 {
+                    is_bold = true;
+                }
             }
         }
+    }
+
+    if embedded_bold == Some(true) {
+        is_bold = true;
     }
 
     (is_bold, is_italic)
@@ -1754,5 +1861,58 @@ mod tests {
         let mut light_font = Dictionary::new();
         light_font.set(b"FontDescriptor", Object::Dictionary(light_fd));
         assert!(!resolve_font_style(&doc, &light_font).0, "low StemV must not be bold");
+    }
+
+    /// Builds the smallest parseable sfnt program carrying one `OS/2` table
+    /// whose `usWeightClass` is `weight`.
+    fn sfnt_with_os2_weight(weight: u16) -> Vec<u8> {
+        let mut os2 = vec![0u8; 64];
+        os2[4..6].copy_from_slice(&weight.to_be_bytes());
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // sfnt version
+        out.extend_from_slice(&1u16.to_be_bytes()); // numTables
+        out.extend_from_slice(&[0u8; 6]); // searchRange/entrySelector/rangeShift
+        out.extend_from_slice(b"OS/2");
+        out.extend_from_slice(&0u32.to_be_bytes()); // checksum (unused here)
+        let offset = 12 + 16;
+        out.extend_from_slice(&(offset as u32).to_be_bytes());
+        out.extend_from_slice(&(os2.len() as u32).to_be_bytes());
+        out.extend_from_slice(&os2);
+        out
+    }
+
+    fn font_with_embedded_weight(weight: u16, stemv: i64) -> (Document, Dictionary) {
+        let mut doc = Document::new();
+        let file_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            Dictionary::new(),
+            sfnt_with_os2_weight(weight),
+        )));
+        let mut fd = Dictionary::new();
+        fd.set(b"Flags", 6);
+        fd.set(b"StemV", stemv);
+        fd.set(b"FontFile2", Object::Reference(file_id));
+        let mut font = Dictionary::new();
+        font.set(b"BaseFont", Object::Name(b"CIDFont+F1".to_vec()));
+        font.set(b"FontDescriptor", Object::Dictionary(fd));
+        (doc, font)
+    }
+
+    /// Regression for the intarsys/ZUGFeRD all-bold bug: that stylesheet writes
+    /// the same out-of-range `/StemV 600` on both its Regular and Bold subsets,
+    /// so the stem-width threshold alone bolds every run. The embedded `OS/2`
+    /// table is the authoritative weight signal.
+    #[test]
+    fn resolve_font_style_prefers_embedded_weight_over_bogus_stemv() {
+        let (doc, regular) = font_with_embedded_weight(400, 600);
+        assert!(
+            !resolve_font_style(&doc, &regular).0,
+            "OS/2 usWeightClass=400 must beat /StemV 600 (the every-run-bold bug)"
+        );
+
+        let (doc, bold) = font_with_embedded_weight(700, 600);
+        assert!(
+            resolve_font_style(&doc, &bold).0,
+            "OS/2 usWeightClass=700 must still resolve as bold"
+        );
     }
 }
