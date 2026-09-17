@@ -251,6 +251,15 @@ fn table_rulers_opts(
                     }
                 })
             })
+            // A column start must be a separate cell in at least one row; a
+            // position that only ever falls between the second and later words
+            // of a tight cell (an ordinary word space) is an interior
+            // word-start, not a boundary. See `start_ruler_is_separate_cell`.
+            .filter(|&x| {
+                window_rows
+                    .iter()
+                    .any(|&ri| start_ruler_is_separate_cell(&info[ri], x, tol, min_gutter))
+            })
             .collect(),
     );
     let end_rulers = dedup(
@@ -342,7 +351,45 @@ fn end_ruler_is_separate_cell(row: &RowInfo, x: f64, tol: f64, min_gutter: f64) 
     }
     for (i, w) in row.words.iter().enumerate() {
         if (w.x1 - x).abs() <= tol {
-            return i >= first_gutter;
+            if i < first_gutter {
+                return false;
+            }
+            // The word must also *end* its cell: either it is the row's last
+            // word, or the next word is separated by a column-like gutter.
+            // Otherwise this right edge sits between two words of one cell
+            // ("20 Unit(s)": the edge of "20" a word space before "Unit(s)"),
+            // which must not become a column boundary.
+            if i + 1 < row.words.len() && row.words[i + 1].x0 - w.x1 < min_gutter {
+                return false;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the word of `row` starting on `x` is a *separate cell* rather than
+/// an interior word of a multi-word cell. Only a word at the row's own start
+/// (index 0) or one separated from the preceding word by a column-like gutter
+/// can testify that `x` is a real column boundary; a word that is merely the
+/// second token of one cell ("20 Unit(s)") must not become one.
+fn start_ruler_is_separate_cell(row: &RowInfo, x: f64, tol: f64, min_gutter: f64) -> bool {
+    for (i, w) in row.words.iter().enumerate() {
+        if (w.x0 - x).abs() <= tol {
+            if i == 0 {
+                return true;
+            }
+            let prev = &row.words[i - 1];
+            if w.x0 - prev.x1 >= min_gutter {
+                return true;
+            }
+            // The token starts only an ordinary word space after the previous
+            // one. Treat it as an interior word of the same cell (not a column
+            // boundary) only when the two tokens form a *tight* pair — a
+            // number+unit cell like "20 Unit(s)" (both tokens start within
+            // ~2em). A distant label whose last word merely abuts the next
+            // column is left as its own start.
+            return w.x0 - prev.x0 >= 2.0 * row.size.max(0.1);
         }
     }
     false
@@ -1025,6 +1072,58 @@ mod tests {
             row[1], "56,87",
             "amount cell absorbed the label's unit: {:?}",
             hit.rows
+        );
+    }
+
+    /// The line-item grid of `fnfe_Facture_FR_BASIC.pdf`: the quantity is drawn
+    /// as "20 Unit(s)" with only an ordinary word space between the number and
+    /// the unit. The unit's word start (and the number's right edge) used to be
+    /// promoted to a column boundary, splitting one quantity cell into two
+    /// adjacent cells separated by a word space. The window-level `flowing`
+    /// veto then read that split as prose and dropped the *entire* invoice
+    /// table to plain text. Neither the number/unit start nor the number's end
+    /// may become a boundary. Fails before the tight-pair ruler fix, passes
+    /// after.
+    #[test]
+    fn quantity_number_and_unit_are_one_cell() {
+        let cell = |t: &str, x: f64, y: f64, adv: f64| sp_at(t, x, y, adv);
+        let lines: Vec<Vec<Span>> = vec![
+            vec![
+                cell("Nougat de l'Abbaye 250g", 34.0, 486.0, 100.0),
+                cell("20", 358.0, 486.0, 8.0),
+                cell("Unit(s)", 370.0, 486.0, 22.0),
+                cell("4,55 €", 432.0, 486.0, 25.0),
+                cell("10%", 476.0, 486.0, 18.0),
+                cell("81,90 €", 532.0, 486.0, 25.0),
+            ],
+            vec![
+                cell("Biscuits aux raisins 300g", 34.0, 468.0, 100.0),
+                cell("15", 358.0, 468.0, 8.0),
+                cell("Unit(s)", 370.0, 468.0, 22.0),
+                cell("3,20 €", 432.0, 468.0, 25.0),
+                cell("48,00 €", 532.0, 468.0, 25.0),
+            ],
+            vec![
+                cell("Huile d'olive à l'ancienne", 34.0, 450.0, 100.0),
+                cell("25", 358.0, 450.0, 8.0),
+                cell("Liter(s)", 370.0, 450.0, 22.0),
+                cell("19,80 €", 427.0, 450.0, 30.0),
+                cell("495,00 €", 527.0, 450.0, 30.0),
+            ],
+        ];
+        let hits = find_tables(&lines);
+        let cells: Vec<&str> = hits
+            .iter()
+            .flat_map(|h| h.rows.iter().flatten())
+            .map(|c| c.as_str())
+            .collect();
+        assert!(
+            cells.iter().any(|c| c.contains("20 Unit(s)")),
+            "quantity number and unit must stay in one cell, got {cells:?}"
+        );
+        assert!(
+            !cells.iter().any(|c| c.trim() == "20"),
+            "the number must not become its own phantom column, got {cells:?}"
         );
     }
 
