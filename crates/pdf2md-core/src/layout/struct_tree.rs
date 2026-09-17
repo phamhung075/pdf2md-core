@@ -270,8 +270,24 @@ fn page_elements(doc: &Document, root: &Dictionary, page_id: ObjectId) -> Vec<Ob
             if let Some(v) = number_tree_value(doc, pt, pi) {
                 let mut els = Vec::new();
                 if let Some(arr) = v.as_array().ok() {
+                    // Some producers repeat the same StructElem reference in a
+                    // page's ParentTree array (observed with GnuAccounting:
+                    // `33 0 R 33 0 R 33 0 R`, `64 0 R` nine times). The tree
+                    // is malformed but still resolves, and walking an element
+                    // once per duplicate reference re-emits the same
+                    // marked-content text — a multi-line table cell or a
+                    // letterhead ends up duplicated in the markdown. Dedupe by
+                    // object identity (references) / structural form (inline
+                    // dictionaries) while preserving the original order.
+                    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                     for it in arr {
-                        els.push(it.clone());
+                        let key = match it {
+                            Object::Reference(id) => format!("R{}:{}", id.0, id.1),
+                            _ => format!("{:?}", it),
+                        };
+                        if seen.insert(key) {
+                            els.push(it.clone());
+                        }
                     }
                 } else {
                     els.push(v);
@@ -1160,6 +1176,50 @@ BT\n/F1 12 Tf\n72 720 Td\nBDC /Span << /MCID 1 >>\n(First paragraph sentence one
             tagged.text
         );
         assert!(!tagged.text.contains('$'), "plain tagged text must not gain math: {}", tagged.text);
+    }
+
+    #[test]
+    fn duplicate_parent_tree_entries_do_not_duplicate_text() {
+        // Some producers (observed with GnuAccounting invoices) list the same
+        // StructElem reference several times in one page's `/ParentTree` array,
+        // e.g. `33 0 R 33 0 R 33 0 R`. The tree is malformed but still
+        // resolves; before the fix `extract_tagged_page` walked the element
+        // once per reference and re-emitted its marked-content text, so a
+        // multi-line table cell / letterhead appeared two, three, or nine
+        // times in the markdown.
+        let (mut doc, page_id) = build_tagged_doc();
+
+        // Duplicate every page element reference three times.
+        let root_id = struct_root_id(&doc).expect("struct root");
+        let root = doc.get_object(root_id).unwrap().as_dict().unwrap().clone();
+        let pt_ref = root.get(b"ParentTree").unwrap().as_reference().unwrap();
+        let pt = doc.get_object(pt_ref).unwrap().as_dict().unwrap().clone();
+        let nums = pt.get(b"Nums").unwrap().as_array().unwrap().clone();
+        let arr = nums[1].as_array().unwrap();
+        let mut dup: Vec<Object> = Vec::new();
+        for it in arr {
+            for _ in 0..3 {
+                dup.push(it.clone());
+            }
+        }
+        let mut new_pt = pt.clone();
+        new_pt.set(b"Nums", Object::Array(vec![nums[0].clone(), Object::Array(dup)]));
+        doc.objects.insert(pt_ref, Object::Dictionary(new_pt));
+
+        let tagged = extract_tagged_page(&doc, page_id, false).expect("tagged extraction must succeed");
+        let needle = "First paragraph sentence one and it flows on.";
+        assert_eq!(
+            tagged.text.matches(needle).count(),
+            1,
+            "duplicate ParentTree references must not duplicate emitted text: {}",
+            tagged.text
+        );
+        assert_eq!(
+            tagged.text.matches("# Document Title").count(),
+            1,
+            "heading must appear once, not once per duplicate: {}",
+            tagged.text
+        );
     }
 
     #[test]
