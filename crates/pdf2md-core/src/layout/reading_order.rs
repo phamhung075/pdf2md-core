@@ -845,7 +845,43 @@ pub fn detect_column_bands(lines: &[Vec<Span>]) -> Vec<ColumnBand> {
         // prose/table split — leave those rows to the table detector.
         let left_clean = rows_are_clean(&left_splits);
         let right_clean = rows_are_clean(&right_splits);
-        let ok = gutters.len() >= 3
+        // A column block normally needs three crossing rows to confirm its
+        // gutter. Two crossing rows can still describe a real corridor when
+        // they are *consecutive* and each is a genuine *fusion* of two regions
+        // that do not share a baseline:
+        //
+        //  * the target's numbered list has items 4 and 5 on the same visual
+        //    line as the adjacent callout-box title ("Accès" / "bailleur") only
+        //    because the line builder tolerates a half-em baseline difference
+        //    (measured here: 2.28pt and 1.44pt), so emitting the list items
+        //    first and the title after them is the true reading order;
+        //  * a form label with its right-aligned value, or a table's
+        //    model/score row, has both halves on *exactly* the same baseline
+        //    (measured: 0.00pt) — it is one physical line whose row order must
+        //    be preserved.
+        //
+        // Requiring a measured baseline gap on both crossing rows keeps the
+        // latter row-wise, and requiring the crossings to be adjacent rejects a
+        // single-column form whose wide gaps merely happen to align with a
+        // one-sided row between them. Three crossings remain the default.
+        let split_indices: Vec<usize> = run
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| matches!(it, RunItem::Split { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        let fused_corridor = split_indices.len() == 2
+            && split_indices[1] == split_indices[0] + 1
+            && split_indices.iter().all(|&i| match &run[i] {
+                RunItem::Split { left, right, .. } => {
+                    let ly = left.first().map(|s| s.y).unwrap_or(0.0);
+                    let ry = right.first().map(|s| s.y).unwrap_or(0.0);
+                    (ly - ry).abs() >= 1.0
+                }
+                _ => false,
+            });
+        let corridor_confirmed = gutters.len() >= 3 || fused_corridor;
+        let ok = corridor_confirmed
             && avg_words_per_row(&left_splits) >= 2.5
             && avg_words_per_row(&right_splits) >= 2.5
             && ((left_clean && right_clean)
@@ -3465,6 +3501,142 @@ mod column_band_tests {
         assert!(
             columns_are_viable_prose(&pc),
             "a genuine two-column page must survive the reading-order gate"
+        );
+    }
+
+    /// A visual line the glyph/line builder produced by fusing a left list item
+    /// with a right callout-box heading that sits on a *different* baseline.
+    /// This mirrors the target's real geometry (the marker line and the box
+    /// line are 1.44pt/2.28pt apart, close enough for `build_lines`'s half-em
+    /// tolerance to fuse them into one `lines` entry).
+    fn fused_list_row(
+        left_y: f64,
+        marker: &str,
+        left_words: [&str; 3],
+        right_y: f64,
+        right_words: [&str; 3],
+    ) -> Vec<Span> {
+        let mut v = vec![sp(marker, 50.0, left_y)];
+        let mut x = 70.0;
+        for w in left_words {
+            v.push(sp(w, x, left_y));
+            x += w.len() as f64 * 6.0 + 8.0;
+        }
+        let mut xr = 250.0;
+        for w in right_words {
+            v.push(sp(w, xr, right_y));
+            xr += w.len() as f64 * 6.0 + 6.0;
+        }
+        v
+    }
+
+    /// Regression for the target `SeConnecterAMonComptePartenaire.pdf`. The
+    /// numbered list's items 4 and 5 are each fused onto one visual line with
+    /// the adjacent callout-box heading "Accès à l'Espace / bailleur", whose two
+    /// lines sit a couple of points off the list baseline. The reading-order
+    /// pass split the fused rows at the gutter but then *rejected* the block
+    /// (only two crossing rows) and restored each fused row whole, so the single
+    /// linear stream wove item 4 → "Accès" → item 5 → "bailleur" together. With
+    /// the fix the list stays contiguous and the box heading is emitted as its
+    /// own block after item 5.
+    #[test]
+    fn fused_list_item_and_callout_heading_keep_the_list_contiguous() {
+        let lines = vec![
+            vec![sp("1. Renseignez vos identifiants", 50.0, 300.0)],
+            vec![sp("2. Renseignez les informations", 50.0, 290.0)],
+            vec![sp("3. Personnalisez votre mot de passe", 50.0, 280.0)],
+            fused_list_row(270.0, "4.", ["Acceptez", "les", "règles"], 268.0, ["Accès", "à", "l’Espace"]),
+            fused_list_row(260.0, "5.", ["Acceptez", "les", "conditions"], 258.0, ["bailleur", "du", "compte"]),
+            vec![sp(" ", 50.0, 250.0)],
+            vec![sp("Vous êtes un bailleur physique et vous gérez", 50.0, 240.0)],
+        ];
+        let bands = detect_column_bands(&lines);
+        assert_eq!(bands.len(), 3, "Full list preamble, Columns block, Full heading");
+        match &bands[1] {
+            ColumnBand::Columns { left, right } => {
+                let lt: Vec<String> = left.iter().map(|l| render_line_text(l)).collect();
+                let rt: Vec<String> = right.iter().map(|l| render_line_text(l)).collect();
+                assert!(lt[0].contains("4."), "list item 4 stays left: {lt:?}");
+                assert!(lt[1].contains("5."), "list item 5 stays left: {lt:?}");
+                assert!(
+                    lt.iter().all(|t| !t.contains("Accès") && !t.contains("bailleur")),
+                    "no box heading may be woven into the list: {lt:?}"
+                );
+                assert_eq!(rt.len(), 2, "the two box lines stay together right: {rt:?}");
+                assert!(rt[0].contains("Accès") && rt[1].contains("bailleur"), "{rt:?}");
+            }
+            ColumnBand::Full(_) => panic!("the fused list/box block was merged instead of split"),
+        }
+        // And the flattened page order must read 1..5 before the box heading.
+        let streams = page_read_order(&lines);
+        let seq: Vec<String> = streams.iter().flatten().map(|l| render_line_text(l)).collect();
+        let pos = |needle: &str| {
+            seq.iter()
+                .position(|t| t.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle:?} in {seq:?}"))
+        };
+        assert!(
+            pos("1.") < pos("2.") && pos("2.") < pos("3.") && pos("3.") < pos("4.") && pos("4.") < pos("5."),
+            "the numbered list must stay contiguous: {seq:?}"
+        );
+        assert!(
+            pos("5.") < pos("Accès") && pos("Accès") < pos("bailleur"),
+            "the box heading must follow the list as one block: {seq:?}"
+        );
+    }
+
+    /// Counter-case for the fix: a form/table row is one physical line, so its
+    /// label and right-aligned value share a baseline *exactly* (measured
+    /// 0.00pt on the `mustang_zugferd_2p1_EXTENDED` and `mistral_7b`
+    /// fixtures). Two adjacent such rows must keep their row-wise order, not be
+    /// transposed into "all labels, then all values".
+    fn same_baseline_pair(y: f64, label: &str, value: [&str; 3]) -> Vec<Span> {
+        let mut v = vec![
+            sp(label, 50.0, y),
+            sp("Referenz", 130.0, y),
+            sp("Nr", 180.0, y),
+        ];
+        let mut x = 250.0;
+        for w in value {
+            v.push(sp(w, x, y));
+            x += w.len() as f64 * 6.0 + 6.0;
+        }
+        v
+    }
+
+    #[test]
+    fn same_baseline_label_value_rows_are_not_transposed_into_columns() {
+        let lines = vec![
+            same_baseline_pair(300.0, "Bestellung", [":", "B123456789", "vom"]),
+            same_baseline_pair(290.0, "Weitere", [":", "A456123", "Art"]),
+            vec![sp("Ende", 50.0, 280.0)],
+        ];
+        let bands = detect_column_bands(&lines);
+        assert!(
+            bands.iter().all(|b| !matches!(b, ColumnBand::Columns { .. })),
+            "same-baseline label/value rows must keep their row order: {} bands",
+            bands.len()
+        );
+    }
+
+    /// Counter-case for the fix: when one-sided rows separate the two crossing
+    /// rows (the `text_style_complex` single-column training form), the wide
+    /// gaps merely happen to align. The corridor must not be trusted even
+    /// though each crossing row is itself a fused pair on different baselines.
+    #[test]
+    fn non_adjacent_crossings_are_not_a_column_band() {
+        let lines = vec![
+            fused_list_row(300.0, "1.", ["A", "B", "C"], 298.0, ["D", "E", "F"]),
+            vec![sp("intervening line one", 50.0, 290.0)],
+            vec![sp("intervening line two", 50.0, 280.0)],
+            fused_list_row(270.0, "2.", ["G", "H", "I"], 268.0, ["J", "K", "L"]),
+            vec![sp("Ende", 50.0, 260.0)],
+        ];
+        let bands = detect_column_bands(&lines);
+        assert!(
+            bands.iter().all(|b| !matches!(b, ColumnBand::Columns { .. })),
+            "crossings separated by one-sided rows must not form a column band: {} bands",
+            bands.len()
         );
     }
 }
