@@ -1340,35 +1340,60 @@ pub fn split_line_segments(line: &[Span]) -> Vec<Vec<Span>> {
 /// The median is a poor anchor for heading detection: when a page carries many
 /// mid-size headings (outlines, structured reports), the heading sizes pull the
 /// median up to the heading size, so `size >= body * 1.25` no longer fires and
-/// the headings hide themselves. Instead use the most frequent size class — the
-/// mode — and, when several classes tie for frequency, take the *smallest* of
+/// the headings hide themselves. Instead take the most frequent size class —
+/// the mode — and, when several classes tie for frequency, the *smallest* of
 /// them. Body text is the smallest regular size class and headings are larger,
 /// so this keeps the heading threshold anchored on the body and never lets the
 /// headings inflate it.
+///
+/// A nominal size never arrives as one exact number: glyph advances and the
+/// producer's own text-matrix rounding make a single 10pt body emit as
+/// 9.8/9.9/10.0/10.1/10.2. Quantizing to a tenth of a point (the previous
+/// approach) left those in separate bins, so on a page whose small
+/// table/caption text is perfectly uniform (every 7pt cell line identical) that
+/// one bin could out-vote the spread-out prose and drag `body_size` down to the
+/// small text's size. Every real body line then measured `>= 1.3x body` and was
+/// mistaken for a heading. Cluster near-identical sizes first, then vote, so the
+/// body and the genuinely smaller table text stay separate classes but the
+/// body's own metric jitter does not split its vote.
 fn estimate_body_size(sizes: &[f64]) -> f64 {
-    use std::collections::HashMap;
     if sizes.is_empty() {
         return 10.0;
     }
-    let mut freq: HashMap<String, usize> = HashMap::new();
-    for s in sizes {
-        // Quantize to a tenth of a point so metric rounding doesn't split a
-        // single nominal size into many near-identical keys.
-        let key = format!("{:.1}", (s * 10.0).round() / 10.0);
-        *freq.entry(key).or_insert(0) += 1;
+    let mut sorted: Vec<f64> = sizes
+        .iter()
+        .copied()
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .collect();
+    if sorted.is_empty() {
+        return 10.0;
     }
-    let max_freq = freq.values().copied().max().unwrap_or(0);
-    let mut best: Option<f64> = None;
-    for s in sizes {
-        let key = format!("{:.1}", (s * 10.0).round() / 10.0);
-        if freq.get(&key).copied().unwrap_or(0) == max_freq {
-            best = Some(match best {
-                None => *s,
-                Some(b) => b.min(*s),
-            });
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Greedy 1-D clustering: a size joins the current cluster while it is within
+    // `CLUSTER_TOL` of that cluster's anchor (its smallest member), so jitter
+    // chains cannot drift the anchor upward past a genuinely distinct size. 5%
+    // keeps a 7pt table separate from a 10pt body (30% apart) while merging the
+    // ~2-4% jitter one nominal size carries.
+    const CLUSTER_TOL: f64 = 0.05;
+    let mut clusters: Vec<(f64, usize)> = Vec::new();
+    for &s in &sorted {
+        match clusters.last_mut() {
+            Some((anchor, count)) if s <= *anchor * (1.0 + CLUSTER_TOL) => *count += 1,
+            _ => clusters.push((s, 1)),
         }
     }
-    best.unwrap_or(10.0).max(1.0)
+
+    // Body is the size class with the most lines. Clusters are ascending, so
+    // keeping the first on an equal count preserves the old smallest-on-tie rule.
+    let (mut best, mut best_count) = clusters[0];
+    for &(anchor, count) in &clusters[1..] {
+        if count > best_count {
+            best = anchor;
+            best_count = count;
+        }
+    }
+    best.max(1.0)
 }
 
 /// Computes the body (regular prose) font size for a full page's lines — the
@@ -2234,6 +2259,38 @@ mod structural_tests {
     fn empty_line_is_not_a_heading() {
         let line = one_span_line("   ", BODY * 1.6, true);
         assert_eq!(detect_heading_level(&line, BODY), None);
+    }
+
+    #[test]
+    fn uniform_small_table_text_does_not_become_the_body_size() {
+        // Regression: a page whose small (7pt) table/caption cells are perfectly
+        // uniform while the real 10pt prose carries ordinary metric jitter
+        // (9.8/9.9/10.0/10.1/10.2). The old per-0.1pt mode saw 16 identical 7pt
+        // lines beat each 4-line prose bin and returned 6.97; every real body
+        // line then measured >= 1.3 * body and was emitted as a `##` heading
+        // (observed on scratch/samples/mistral-pdf-tests.pdf page 6).
+        let mut lines: Vec<Vec<Span>> = Vec::new();
+        for _ in 0..16 {
+            lines.push(one_span_line("cell", 7.0, false));
+        }
+        for i in 0..20 {
+            let size = [9.8, 9.9, 10.0, 10.1, 10.2][i % 5];
+            lines.push(one_span_line(&format!("Body line {i}"), size, false));
+        }
+
+        let body = body_size_for(&lines);
+        assert!(
+            body >= 9.5,
+            "body size must follow the 10pt prose cluster, not the 7pt table: got {body}"
+        );
+
+        // The prose line itself must stay ordinary body text, not a heading.
+        let prose = one_span_line("Our work demonstrates that models compress knowledge", 10.0, false);
+        assert_eq!(
+            detect_heading_level(&prose, body),
+            None,
+            "a body-sized prose line must not be promoted to a heading"
+        );
     }
 
     // -- detect_list_marker ---------------------------------------------------
