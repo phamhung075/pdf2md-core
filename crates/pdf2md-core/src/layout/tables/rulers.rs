@@ -256,7 +256,28 @@ fn table_rulers_opts(
     let end_rulers = dedup(
         end_candidates
             .into_iter()
-            .filter(|&x| window_rows.iter().all(|&ri| !row_straddles(&info[ri], x, tol, min_gutter)))
+            .filter(|&x| {
+                window_rows.iter().all(|&ri| !row_straddles(&info[ri], x, tol, min_gutter))
+                    // The end pass exists for a *right-aligned value column*
+                    // whose values are their own cells. A left-aligned text
+                    // column whose two longest cells merely share a rendered
+                    // width — the target fixture's "Gesamtbetrag der
+                    // Zuschläge" / "…Abschläge" — ends on the same x with no
+                    // cell boundary there: each is one contiguous multi-word
+                    // label anchored at that column's own start ruler. Reading
+                    // their shared right edge as a new column boundary splits
+                    // the label column and strands the unit "EUR" in a phantom
+                    // middle column, which the totals-row consolidator then
+                    // folds into a bogus multi-row span. Require at least two
+                    // rows where the word ending on x is itself a separate cell
+                    // (the row's first word, or preceded by a column gutter), so
+                    // a shared text right-edge cannot invent a column.
+                    && window_rows
+                        .iter()
+                        .filter(|&&ri| end_ruler_is_separate_cell(&info[ri], x, tol, min_gutter))
+                        .count()
+                        >= 2
+            })
             .collect(),
     );
 
@@ -299,6 +320,32 @@ fn row_matches_ruler(row: &RowInfo, r: f64, tol: f64) -> bool {
 /// cells.
 fn row_has_internal_gutter(words: &[WordTok], min_gutter: f64) -> bool {
     words.windows(2).any(|p| p[1].x0 - p[0].x1 >= min_gutter)
+}
+
+/// Whether the word of `row` ending on `x` is a *separate value cell* rather
+/// than part of the row's leading (label) cell. The leading cell is the run of
+/// words from the row's start up to the first column-like gutter; a right edge
+/// inside that run is just the label column's ragged extent. Only a word at or
+/// after the first gutter — a standalone value, or the last token of a
+/// multi-word value such as "1 200,00 €" — can testify that `x` is a
+/// right-aligned column edge. A row that is one contiguous cell throughout has
+/// no separate value cell at all.
+fn end_ruler_is_separate_cell(row: &RowInfo, x: f64, tol: f64, min_gutter: f64) -> bool {
+    let first_gutter = row
+        .words
+        .windows(2)
+        .position(|p| p[1].x0 - p[0].x1 >= min_gutter)
+        .map(|i| i + 1)
+        .unwrap_or(row.words.len());
+    if first_gutter >= row.words.len() {
+        return false;
+    }
+    for (i, w) in row.words.iter().enumerate() {
+        if (w.x1 - x).abs() <= tol {
+            return i >= first_gutter;
+        }
+    }
+    false
 }
 
 /// Whether row `row` straddles ruler `x` (a word starts strictly left of it
@@ -847,5 +894,66 @@ mod tests {
         let line = vec![sp("left", 0.0, 18.0), sp("right", 60.0, 25.0)];
         let words: Vec<String> = line_words(&line).into_iter().map(|w| w.text).collect();
         assert_eq!(words, vec!["left", "right"], "real gutter was not split: {words:?}");
+    }
+
+    fn sp_at(text: &str, x: f64, y: f64, advance: f64) -> Span {
+        Span {
+            text: text.to_string(),
+            x,
+            y,
+            size: 10.0,
+            advance,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_vertical: false,
+        }
+    }
+
+    /// Two left-aligned label cells in a totals column ("Gesamtbetrag der
+    /// Zuschläge" / "…Abschläge") have the same rendered width, so their right
+    /// edges fall on the same x. The end-ruler pass used to promote that shared
+    /// text edge to a column boundary because neither row *straddled* it (the
+    /// words end exactly on it). That split the label column, stranded the unit
+    /// "EUR" in a phantom middle column, and made `consolidate_table_rows`
+    /// fold four distinct totals rows into a single `<br>`-joined row. The end
+    /// pass must only accept a shared right edge when the word ending there is
+    /// a separate value cell, not the tail of a leading label.
+    #[test]
+    fn shared_label_right_edge_does_not_invent_a_column() {
+        let label = |t: &str, y: f64, adv: f64| sp_at(t, 287.56, y, adv);
+        let amount = |t: &str, x: f64, y: f64, adv: f64| sp_at(t, x, y, adv);
+        let lines: Vec<Vec<Span>> = vec![
+            vec![label("Positionssumme", 405.20, 83.98), amount("473,00", 508.03, 405.20, 36.00)],
+            vec![label("Gesamtbetrag der Zuschläge", 392.38, 155.96), amount("0,00", 520.03, 392.38, 24.00)],
+            vec![label("Gesamtbetrag der Abschläge", 379.56, 155.96), amount("-0,00", 514.03, 379.56, 30.00)],
+            vec![label("Rechnungssumme ohne USt.", 366.74, 143.96), amount("473,00", 508.03, 366.74, 36.00)],
+            vec![
+                label("Steuerbetrag in", 353.92, 95.97),
+                amount("EUR", 454.05, 353.92, 24.00),
+                amount("56,87", 508.03, 353.92, 36.00),
+            ],
+            vec![label("Bruttosumme", 341.10, 65.98), amount("529,87", 508.03, 341.10, 36.00)],
+            vec![label("Erhaltene Anzahlungen", 326.03, 125.96), amount("-0,00", 514.03, 326.03, 30.00)],
+            vec![label("Zahlbetrag", 313.21, 59.98), amount("529,87", 508.03, 313.21, 36.00)],
+        ];
+        let hits = find_tables(&lines);
+        let hit = hits
+            .iter()
+            .find(|h| h.rows.iter().any(|r| r.iter().any(|c| c.contains("Positionssumme"))))
+            .expect("totals table was not detected");
+        assert_eq!(
+            hit.rows.iter().map(|r| r.len()).max(),
+            Some(2),
+            "phantom middle column appeared: {:?}",
+            hit.rows
+        );
+        assert_eq!(hit.rows.len(), 8, "distinct totals rows were merged: {:?}", hit.rows);
+        assert_eq!(hit.rows[5][0], "Bruttosumme", "row 5 folded into row 4: {:?}", hit.rows);
+        assert!(
+            hit.rows.iter().all(|r| !r.iter().any(|c| c.contains("<br>"))),
+            "rows were folded together: {:?}",
+            hit.rows
+        );
     }
 }
