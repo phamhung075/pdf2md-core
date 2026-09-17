@@ -162,3 +162,100 @@ pub fn encode_png_rgba(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     chunk(&mut out, b"IEND", &[]);
     out
 }
+
+/// Decode an 8-bit, non-interlaced RGBA PNG (color type 6) into a tightly
+/// packed RGBA8 buffer, together with its pixel width/height.
+///
+/// This is deliberately the minimal inverse of [`encode_png_rgba`] — the exact
+/// stream layout this crate emits for reconstructed rasters — so the adaptive
+/// embed-resize path can re-downsample an already-encoded image without linking
+/// a PNG codec in the default build. Any other bit depth, color type, or
+/// interlace mode returns `None` rather than guessing. All five PNG scanline
+/// filters are handled so the decoder is not silently tied to the filter-0
+/// layout of our own encoder.
+pub(crate) fn decode_png_rgba(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    const SIG: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if data.len() < 8 || &data[..8] != SIG {
+        return None;
+    }
+    let mut pos = 8usize;
+    let (mut width, mut height) = (0u32, 0u32);
+    let (mut bit_depth, mut color_type, mut interlace) = (0u8, 0u8, 0u8);
+    let mut seen_ihdr = false;
+    let mut idat: Vec<u8> = Vec::new();
+    while pos + 8 <= data.len() {
+        let len = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+            as usize;
+        let kind = &data[pos + 4..pos + 8];
+        let body_start = pos + 8;
+        let body_end = body_start.checked_add(len)?;
+        if body_end + 4 > data.len() {
+            return None;
+        }
+        match kind {
+            b"IHDR" => {
+                if len < 13 {
+                    return None;
+                }
+                let b = &data[body_start..body_start + 13];
+                width = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+                height = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+                bit_depth = b[8];
+                color_type = b[9];
+                interlace = b[12];
+                seen_ihdr = true;
+            }
+            b"IDAT" => idat.extend_from_slice(&data[body_start..body_end]),
+            b"IEND" => break,
+            _ => {}
+        }
+        pos = body_end + 4; // data + 4-byte CRC
+    }
+    if !seen_ihdr || width == 0 || height == 0 {
+        return None;
+    }
+    if bit_depth != 8 || color_type != 6 || interlace != 0 {
+        return None;
+    }
+    let stride = width as usize * 4;
+    let raw = inflate(&idat)?;
+    if raw.len() < (stride + 1) * height as usize {
+        return None;
+    }
+    let mut out = vec![0u8; stride * height as usize];
+    let mut prev = vec![0u8; stride];
+    for y in 0..height as usize {
+        let row = &raw[y * (stride + 1)..];
+        let filter = row[0];
+        let line = &row[1..1 + stride];
+        let cur = &mut out[y * stride..(y + 1) * stride];
+        for x in 0..stride {
+            let a = if x >= 4 { cur[x - 4] } else { 0 };
+            let b = prev[x];
+            let c = if x >= 4 { prev[x - 4] } else { 0 };
+            cur[x] = match filter {
+                0 => line[x],
+                1 => line[x].wrapping_add(a),
+                2 => line[x].wrapping_add(b),
+                3 => line[x].wrapping_add(((a as u16 + b as u16) / 2) as u8),
+                4 => {
+                    let p = a as i16 + b as i16 - c as i16;
+                    let pa = (p - a as i16).abs();
+                    let pb = (p - b as i16).abs();
+                    let pc = (p - c as i16).abs();
+                    let pred = if pa <= pb && pa <= pc {
+                        a
+                    } else if pb <= pc {
+                        b
+                    } else {
+                        c
+                    };
+                    line[x].wrapping_add(pred)
+                }
+                _ => return None,
+            };
+        }
+        prev.copy_from_slice(cur);
+    }
+    Some((out, width, height))
+}

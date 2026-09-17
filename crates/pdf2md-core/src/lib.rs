@@ -801,32 +801,38 @@ pub fn convert_pdf_bytes_to_markdown(
             for m in imgs {
                 let my = (m.y0 + m.y1) / 2.0;
                 let b64_len = m.data_b64.len();
-                let img_md = if media_budget_used.saturating_add(b64_len)
-                    > options.max_media_bytes_per_doc
-                {
-                    // Over the per-document embed budget: keep the figure's
-                    // reading-order position (so surrounding text still makes
-                    // sense) but drop the payload instead of inlining another
-                    // multi-hundred-KB data URI. `media_items`/`media` (the
-                    // JSON side-channel) still carries the full image for
-                    // callers that want it.
-                    format!(
-                        "*[{} omitted: {}x{} {}, {} KB — over the {} KB per-document image budget]*\n\n",
-                        m.kind.as_str(),
-                        m.width,
-                        m.height,
-                        m.format,
-                        b64_len / 1024,
-                        options.max_media_bytes_per_doc / 1024,
-                    )
-                } else {
+                // Inline payload to splice into the markdown: either the
+                // original data URI or an adaptive shrink when the full-size
+                // copy would push the running total over budget. `None` is the
+                // true last resort (omission placeholder).
+                let mut inline: Option<(String, &str)> = None;
+                if media_budget_used.saturating_add(b64_len) <= options.max_media_bytes_per_doc {
                     media_budget_used += b64_len;
-                    match embed_width_frac(m, page_bbox) {
+                    inline = Some((m.data_b64.clone(), m.format.as_str()));
+                } else {
+                    // Over the per-document embed budget: before falling back
+                    // to the omission placeholder, try progressively
+                    // downscaling (and, under `vision`, JPEG-recompressing)
+                    // the figure so it fits the *remaining* budget. Only this
+                    // markdown copy is shrunk — `media_items`/`media` (the
+                    // JSON side-channel, pushed above) keeps the full bytes.
+                    let remaining =
+                        options.max_media_bytes_per_doc.saturating_sub(media_budget_used);
+                    if let Some((bytes, mime)) =
+                        media::raster::shrink_encoded_image_to_fit(&m.data, &m.format, remaining)
+                    {
+                        let b64 = media::b64encode(&bytes);
+                        media_budget_used += b64.len();
+                        inline = Some((b64, mime));
+                    }
+                }
+                let img_md = match inline {
+                    Some((b64, mime)) => match embed_width_frac(m, page_bbox) {
                         Some(frac) => format!(
                             "<img alt=\"{}\" src=\"data:{};base64,{}\" width=\"{}\" />\n\n",
                             m.kind.as_str(),
-                            m.format,
-                            m.data_b64,
+                            mime,
+                            b64,
                             // Emit as a percent of the reader's content width, which
                             // matches the fraction of the page the image occupied.
                             format!("{}%", (frac * 100.0).round() as u32),
@@ -834,10 +840,23 @@ pub fn convert_pdf_bytes_to_markdown(
                         None => format!(
                             "![{}](data:{};base64,{})\n\n",
                             m.kind.as_str(),
-                            m.format,
-                            m.data_b64
+                            mime,
+                            b64
                         ),
-                    }
+                    },
+                    // Even the pixel/quality floor does not fit: keep the
+                    // figure's reading-order position (so surrounding text
+                    // still makes sense) but drop the payload instead of
+                    // inlining another multi-hundred-KB data URI.
+                    None => format!(
+                        "*[{} omitted: {}x{} {}, {} KB — over the {} KB per-document image budget]*\n\n",
+                        m.kind.as_str(),
+                        m.width,
+                        m.height,
+                        m.format,
+                        b64_len / 1024,
+                        options.max_media_bytes_per_doc / 1024,
+                    ),
                 };
 
                 // Find the first block strictly below the image
@@ -1297,6 +1316,211 @@ mod regression_tests {
                 "a small fixture image must not trip the default 512KB budget"
             );
         }
+    }
+
+    /// Build a one-page PDF with a single uncompressed `DeviceRGB` image
+    /// XObject of deterministic pseudo-random noise. Noise makes the
+    /// reconstructed PNG effectively incompressible (its size scales with
+    /// pixel area), which is exactly the shape the adaptive embed-budget step
+    /// has to handle. The image is painted at 250x200 pt on a 400x400 page so
+    /// `classify_geometry` sees a non-decorative chart, not a full-page
+    /// background.
+    fn synthetic_noise_image_pdf(width: u32, height: u32) -> Vec<u8> {
+        let mut samples = Vec::with_capacity(width as usize * height as usize * 3);
+        let mut state: u32 = 0x1234_5678;
+        for _ in 0..(width as usize * height as usize * 3) {
+            // xorshift32 — deterministic and dependency-free.
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            samples.push((state & 0xff) as u8);
+        }
+
+        let mut doc = lopdf::Document::new();
+        let mut img_dict = lopdf::Dictionary::new();
+        img_dict.set(b"Type", lopdf::Object::Name(b"XObject".to_vec()));
+        img_dict.set(b"Subtype", lopdf::Object::Name(b"Image".to_vec()));
+        img_dict.set(b"Width", lopdf::Object::Integer(width as i64));
+        img_dict.set(b"Height", lopdf::Object::Integer(height as i64));
+        img_dict.set(b"ColorSpace", lopdf::Object::Name(b"DeviceRGB".to_vec()));
+        img_dict.set(b"BitsPerComponent", lopdf::Object::Integer(8));
+        let img_id = doc.add_object(lopdf::Object::Stream(lopdf::Stream::new(img_dict, samples)));
+
+        // A minimal Helvetica text layer: without it `convert_pdf_bytes_to_markdown`
+        // rejects the synthetic page as a scan before the embed loop runs.
+        let mut font_dict = lopdf::Dictionary::new();
+        font_dict.set(b"Type", lopdf::Object::Name(b"Font".to_vec()));
+        font_dict.set(b"Subtype", lopdf::Object::Name(b"Type1".to_vec()));
+        font_dict.set(b"BaseFont", lopdf::Object::Name(b"Helvetica".to_vec()));
+        font_dict.set(b"Encoding", lopdf::Object::Name(b"WinAnsiEncoding".to_vec()));
+        let font_id = doc.add_object(lopdf::Object::Dictionary(font_dict));
+
+        let content = "BT /F1 12 Tf 60 360 Td (Synthetic sample text for the media budget test) Tj ET\n\
+                       q 250 0 0 200 75 100 cm /Im0 Do Q\n";
+        let content_id = doc.add_object(lopdf::Object::Stream(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            content.as_bytes().to_vec(),
+        )));
+
+        let mut page_dict = lopdf::Dictionary::new();
+        page_dict.set(b"Type", lopdf::Object::Name(b"Page".to_vec()));
+        page_dict.set(
+            b"MediaBox",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(400),
+                lopdf::Object::Integer(400),
+            ]),
+        );
+        let mut xobj = lopdf::Dictionary::new();
+        xobj.set(b"Im0", lopdf::Object::Reference(img_id));
+        let mut font_res = lopdf::Dictionary::new();
+        font_res.set(b"F1", lopdf::Object::Reference(font_id));
+        let mut res_dict = lopdf::Dictionary::new();
+        res_dict.set(b"XObject", lopdf::Object::Dictionary(xobj));
+        res_dict.set(b"Font", lopdf::Object::Dictionary(font_res));
+        page_dict.set(b"Resources", lopdf::Object::Dictionary(res_dict));
+        page_dict.set(b"Contents", lopdf::Object::Reference(content_id));
+        let page_id = doc.add_object(lopdf::Object::Dictionary(page_dict));
+
+        let mut pages_dict = lopdf::Dictionary::new();
+        pages_dict.set(b"Type", lopdf::Object::Name(b"Pages".to_vec()));
+        pages_dict.set(
+            b"Kids",
+            lopdf::Object::Array(vec![lopdf::Object::Reference(page_id)]),
+        );
+        pages_dict.set(b"Count", lopdf::Object::Integer(1));
+        let pages_id = doc.add_object(lopdf::Object::Dictionary(pages_dict));
+
+        let mut catalog_dict = lopdf::Dictionary::new();
+        catalog_dict.set(b"Type", lopdf::Object::Name(b"Catalog".to_vec()));
+        catalog_dict.set(b"Pages", lopdf::Object::Reference(pages_id));
+        let catalog_id = doc.add_object(lopdf::Object::Dictionary(catalog_dict));
+        doc.trailer.set(b"Root", lopdf::Object::Reference(catalog_id));
+
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).expect("save synthetic image pdf");
+        bytes
+    }
+
+    /// Extract the base64 payload of the first inlined data URI.
+    fn first_inline_b64_len(markdown: &str) -> Option<usize> {
+        let start = markdown.find("base64,")? + "base64,".len();
+        let end = markdown[start..]
+            .find(|c| c == '"' || c == ')')
+            .map(|i| start + i)
+            .unwrap_or(markdown.len());
+        Some(end - start)
+    }
+
+    #[test]
+    fn media_budget_downscales_an_oversized_image_to_fit() {
+        let bytes = synthetic_noise_image_pdf(1000, 1000);
+        // The full-size PNG is several MB of base64; 1.5 MB can only be met
+        // after the adaptive downscale, and sits well above the ~400 px floor
+        // so the figure must be embedded rather than omitted.
+        let opts = ConversionOptions {
+            max_media_bytes_per_doc: 1_500_000,
+            ..Default::default()
+        };
+        let res = convert_pdf_bytes_to_markdown(&bytes, &opts).unwrap();
+        let md = &res.markdown;
+        assert!(
+            md.contains("data:image/"),
+            "an oversized image must be adaptively downscaled and embedded, got: {md}"
+        );
+        // The default (non-`vision`) build has no JPEG codec, so its only
+        // shrink path is a PNG downscale.
+        #[cfg(not(feature = "vision"))]
+        assert!(
+            md.contains("data:image/png"),
+            "the default build must re-encode the shrunk copy as PNG, got: {md}"
+        );
+        assert!(
+            !md.contains("omitted"),
+            "a downscaled-to-fit image must not fall back to the placeholder"
+        );
+        // The JSON side-channel keeps the full-fidelity bytes; only the inline
+        // markdown copy is shrunk.
+        let full = res
+            .media
+            .iter()
+            .find(|m| !m.data_b64.is_empty())
+            .expect("media side-channel must still carry the image");
+        let inline = first_inline_b64_len(md).expect("inline data URI");
+        assert!(
+            inline <= opts.max_media_bytes_per_doc,
+            "inlined payload ({inline}) must respect the budget"
+        );
+        assert!(
+            inline < full.data_b64.len(),
+            "inline copy ({inline}) must be the shrunk one while the side-channel keeps the full {} bytes",
+            full.data_b64.len()
+        );
+    }
+
+    #[test]
+    fn media_budget_omits_when_the_downscale_floor_still_exceeds_budget() {
+        let bytes = synthetic_noise_image_pdf(1000, 1000);
+        // Far below what even the ~400 px floor can fit, so the omission
+        // placeholder remains the true last resort.
+        let opts = ConversionOptions {
+            max_media_bytes_per_doc: 32 * 1024,
+            ..Default::default()
+        };
+        let res = convert_pdf_bytes_to_markdown(&bytes, &opts).unwrap();
+        let md = &res.markdown;
+        assert!(
+            !md.contains("data:image/"),
+            "nothing should inline at a 32 KB budget, got: {md}"
+        );
+        assert!(
+            md.contains("omitted") && md.contains("per-document image budget"),
+            "a still-over-budget-at-the-floor image must leave the placeholder, got: {md}"
+        );
+    }
+
+    #[cfg(feature = "vision")]
+    #[test]
+    fn media_budget_vision_jpeg_reencode_fits_where_png_downscale_cannot() {
+        let bytes = synthetic_noise_image_pdf(1000, 1000);
+        // Calibrated so the PNG downscale floor (~600 KB of base64 for this
+        // noise image) still exceeds the budget while a JPEG re-encode at the
+        // quality floor fits. Without the vision JPEG path this case would be
+        // omitted.
+        let budget = 300 * 1024;
+        let opts = ConversionOptions {
+            max_media_bytes_per_doc: budget,
+            ..Default::default()
+        };
+        let res = convert_pdf_bytes_to_markdown(&bytes, &opts).unwrap();
+        let md = &res.markdown;
+        assert!(
+            md.contains("data:image/jpeg"),
+            "vision build must JPEG-recompress to fit, got: {md}"
+        );
+        assert!(
+            !md.contains("omitted"),
+            "JPEG re-encode should avoid the placeholder, got: {md}"
+        );
+        let inline = first_inline_b64_len(md).expect("inline data URI");
+        assert!(
+            inline <= budget,
+            "inlined JPEG ({inline}) must respect the budget"
+        );
+        // Side-channel still advertises the original PNG, untouched.
+        let full = res
+            .media
+            .iter()
+            .find(|m| !m.data_b64.is_empty())
+            .expect("media side-channel must still carry the image");
+        assert_eq!(full.format, "image/png");
+        assert!(
+            inline < full.data_b64.len(),
+            "inlined JPEG ({inline}) must be smaller than the full PNG ({})",
+            full.data_b64.len()
+        );
     }
 
     #[test]

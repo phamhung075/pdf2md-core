@@ -240,18 +240,30 @@ pub struct ConversionOptions {
     /// for byte-identical plain extraction (no `$...$` synthesis).
     pub detect_math: bool,
     /// Maximum pixel dimension (width or height) for a raw/PNG-reconstructed
-    /// raster before it is downscaled proportionally. Only applies to the
-    /// non-JPEG decode path (`decode_xobject_bytes`) — JPEG streams are kept
-    /// as a byte-for-byte passthrough since re-encoding them needs a JPEG
-    /// codec that the default (non-`vision`) build does not link. Bounds
-    /// per-image payload size and markdown-render latency for scanned pages.
+    /// raster before it is downscaled proportionally. Applies to the
+    /// non-JPEG decode path (`decode_xobject_bytes`) at extraction time —
+    /// JPEG streams are kept as a byte-for-byte passthrough since re-encoding
+    /// them needs a JPEG codec that the default (non-`vision`) build does not
+    /// link. The embed loop may additionally downscale/JPEG-recompress an
+    /// already-encoded image to fit `max_media_bytes_per_doc` (see there).
+    /// Bounds per-image payload size and markdown-render latency for scanned
+    /// pages.
     pub max_image_dimension: u32,
     /// Maximum total bytes of base64-encoded image data inlined into the
-    /// markdown across the whole document (`embed_media`). Once this budget
-    /// is exhausted, further images are replaced with a short text
-    /// placeholder instead of a `data:` URI, so a scan-heavy document can
-    /// never blow the emitted markdown up to megabytes (which both slows
-    /// rendering and can overflow a downstream LLM prompt/token limit).
+    /// markdown across the whole document (`embed_media`).
+    ///
+    /// When an image's full-size payload would exceed the remaining budget it
+    /// is first adaptively shrunk to fit: progressively downscaled (aspect
+    /// preserved, never below a ~400 px longest edge) re-measuring the base64
+    /// size at each step, and under the `vision` feature also recompressed to
+    /// JPEG over a descending quality ladder (80→40). Only if even that floor
+    /// is still over budget is the image replaced with the short text
+    /// placeholder, so a scan-heavy document can never blow the emitted
+    /// markdown up to megabytes (which both slows rendering and can overflow a
+    /// downstream LLM prompt/token limit). The JSON `media` side-channel
+    /// always keeps the full-fidelity image; only the inline markdown copy is
+    /// shrunk or omitted. The shrink is deterministic and bounded (a handful
+    /// of encode attempts, no unbounded search).
     pub max_media_bytes_per_doc: usize,
 }
 
