@@ -1226,7 +1226,20 @@ fn open_style(out: &mut String, st: InlineStyle) {
 }
 
 /// Close the Markdown emphasis delimiters for `st` (reverse order of `open_style`).
+///
+/// A span's own text can embed a trailing space (a producer drawing the bold
+/// run `"2 "` as one glyph run, rather than emitting the space as its own
+/// span). CommonMark rejects a closing delimiter that is preceded by
+/// whitespace — `**2 **` is *not* bold — and the orphaned `**` then consumes
+/// the next `**…**` run on the line. So any whitespace sitting at the end of
+/// the open run is re-emitted *after* the closing delimiters instead.
 fn close_style(out: &mut String, st: InlineStyle) {
+    if st == InlineStyle::default() {
+        return;
+    }
+    let kept = out.trim_end_matches(' ').len();
+    let trailing_space = out[kept..].to_string();
+    out.truncate(kept);
     if st.bold {
         out.push_str("**");
     }
@@ -1236,6 +1249,7 @@ fn close_style(out: &mut String, st: InlineStyle) {
     if st.underline {
         out.push_str("</u>");
     }
+    out.push_str(&trailing_space);
 }
 
 /// Render one visual line's spans to text with inline `**bold**` / `*italic*` /
@@ -1296,11 +1310,25 @@ pub(crate) fn render_spans(line: &[Span]) -> String {
         } else {
             let st = InlineStyle::of(span);
             if st != cur {
+                // Opening a new delimiter. A span's own text can also *begin*
+                // with a space (a producer run like `" www.caf.fr"`); an
+                // opening delimiter followed by whitespace (`** x**`) is not
+                // emphasis either, so flush that leading space outside the
+                // delimiter. `close_style` already moved any trailing space of
+                // the previous run outside its closing delimiter.
+                let lead = span.text.len() - span.text.trim_start_matches(' ').len();
                 close_style(&mut out, cur);
+                if lead > 0 && !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
+                    out.push(' ');
+                }
                 open_style(&mut out, st);
                 cur = st;
+                out.push_str(&span.text[lead..]);
+            } else {
+                // Same style stays open: the whole run is emphasized and any
+                // embedded whitespace is interior, so it is kept verbatim.
+                out.push_str(&span.text);
             }
-            out.push_str(&span.text);
         }
 
         prev_x = Some(span.x);
@@ -2160,6 +2188,58 @@ mod tests {
             span("After", 165.0, (false, false, false)),
         ];
         assert_eq!(render_spans(&line), "**BoldTail** After");
+    }
+
+    #[test]
+    fn embedded_trailing_space_is_moved_outside_bold_delimiters() {
+        // Regression for SeConnecterAMonComptePartenaire.pdf: the producer draws
+        // the bold run "2 " (digit + trailing space) as ONE glyph run, so the
+        // space is not its own span and the `is_space` branch never fires. It
+        // used to be pushed inside the emphasis, producing the invalid `**2 **`
+        // (a closing delimiter preceded by whitespace), which also swallowed the
+        // following `**mail**` run. The space must land after the closing `**`.
+        let line = vec![
+            span("dans ", 100.0, (false, false, false)),
+            span("2 ", 130.0, (true, false, false)),
+            span("mail", 142.0, (false, false, false)),
+        ];
+        let rendered = render_spans(&line);
+        assert_eq!(rendered, "dans **2** mail");
+        assert!(
+            !rendered.contains("2 **"),
+            "closing delimiter must not be preceded by a space: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn embedded_trailing_space_is_moved_out_before_a_different_style() {
+        // Same pathology when the next span switches style: the bold run must
+        // close flush against "2" and the space live between the two runs.
+        let line = vec![
+            span("dans ", 100.0, (false, false, false)),
+            span("2 ", 130.0, (true, false, false)),
+            span("mail", 142.0, (false, true, false)),
+        ];
+        let rendered = render_spans(&line);
+        assert_eq!(rendered, "dans **2** *mail*");
+        assert!(!rendered.contains("2 **"), "{rendered:?}");
+    }
+
+    #[test]
+    fn embedded_leading_space_is_moved_outside_bold_delimiters() {
+        // Mirror case: a span whose own text begins with a space (`" 2"`).
+        // An opening delimiter followed by whitespace (`** 2**`) is not
+        // emphasis either; the space belongs before the opening `**`.
+        let line = vec![
+            span(" 2", 100.0, (true, false, false)),
+            span("mail", 120.0, (false, false, false)),
+        ];
+        let rendered = render_spans(&line);
+        assert_eq!(rendered, "**2** mail");
+        assert!(
+            !rendered.starts_with("** "),
+            "opening delimiter must not be followed by a space: {rendered:?}"
+        );
     }
 
     #[test]
