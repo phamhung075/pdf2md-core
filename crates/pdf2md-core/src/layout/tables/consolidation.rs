@@ -32,6 +32,105 @@ pub fn bucket(info: &[RowInfo], ri: usize, rulers: &[f64]) -> Vec<String> {
     cells.into_iter().map(|c| c.join(" ")).collect()
 }
 
+/// Bucket every row of a window with [`bucket`], then pull back words that the
+/// pure midpoint rule stranded in the following column.
+///
+/// `bucket` assigns a word to whichever column's ruler midpoint contains the
+/// word's *start*. That is right for the two ordinary shapes — a left-aligned
+/// cell beginning at its column ruler, and a right-aligned numeric value whose
+/// (varying) start still falls inside its own column — but it mis-files the
+/// tail of the *previous* column's multi-word label when that tail happens to
+/// start beyond the midpoint. In the totals block of the ZUGFeRD "EN16931
+/// Rabatte" invoice, "Steuerbetrag in EUR" renders with "EUR" at x=454, past
+/// the midpoint (398) between the label ruler (288) and the amount ruler (508),
+/// so the amount cell came out as "EUR 21,30" instead of "Steuerbetrag in EUR"
+/// + "21,30" (the vision transcription and the raw span geometry both read the
+/// unit as part of the label).
+///
+/// A word is rescued only when every one of these holds:
+///   * it is the leading token of a *value* cell whose remaining tokens are all
+///     numeric — the "<unit> <amount>" shape ("EUR 21,30"). This keeps the
+///     rescue from re-filing header words or wrapped multi-word cells in
+///     unrelated grids;
+///   * it starts at least a full alignment tolerance before its own column's
+///     start ruler, so a value merely jittering around the ruler is untouched;
+///   * it begins to the right of the previous column's content edge and is
+///     geometrically closer to that edge than to this column's ruler, so a long
+///     value whose start dips left of the ruler is not moved.
+pub fn bucket_rows_content_aware(
+    info: &[RowInfo],
+    win_rows: &[usize],
+    rulers: &[f64],
+    tol: f64,
+) -> Vec<Vec<String>> {
+    let ncol = rulers.len();
+    let bounds: Vec<f64> = rulers.windows(2).map(|p| (p[0] + p[1]) / 2.0).collect();
+    let assign = |w: &WordTok| bounds.iter().position(|&b| w.x0 < b).unwrap_or(ncol - 1);
+    let has_digit = |t: &str| t.chars().any(|c| c.is_ascii_digit());
+
+    // Pass 1: the right edge of the content each column actually holds, using
+    // the ordinary midpoint assignment. This is what a rescued word is compared
+    // against — per-row extents are not enough, because the label that "EUR"
+    // continues ("…Zuschläge") reaches farther right on a different row.
+    let mut extents = vec![f64::NEG_INFINITY; ncol];
+    for &ri in win_rows {
+        for w in &info[ri].words {
+            let col = assign(w);
+            extents[col] = extents[col].max(w.x1);
+        }
+    }
+
+    win_rows
+        .iter()
+        .map(|&ri| {
+            let words = &info[ri].words;
+            let assigned: Vec<usize> = words.iter().map(assign).collect();
+            let is_leading_unit = |wi: usize| {
+                let col = assigned[wi];
+                if has_digit(&words[wi].text) || assigned[..wi].contains(&col) {
+                    return false;
+                }
+                let mut have_number = false;
+                for (j, &c) in assigned.iter().enumerate() {
+                    if j == wi || c != col {
+                        continue;
+                    }
+                    if !has_digit(&words[j].text) {
+                        return false;
+                    }
+                    have_number = true;
+                }
+                have_number
+            };
+
+            let mut cells: Vec<Vec<String>> = vec![Vec::new(); ncol];
+            for (wi, w) in words.iter().enumerate() {
+                let mut col = assigned[wi];
+                while col > 0 && is_leading_unit(wi) {
+                    let ruler = rulers[col];
+                    if w.x0 >= ruler - tol {
+                        break;
+                    }
+                    let left_extent = extents[..col]
+                        .iter()
+                        .cloned()
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    if left_extent.is_finite()
+                        && w.x0 > left_extent
+                        && (w.x0 - left_extent) < (ruler - w.x0)
+                    {
+                        col -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                cells[col].push(w.text.clone());
+            }
+            cells.into_iter().map(|c| c.join(" ")).collect()
+        })
+        .collect()
+}
+
 /// Merges complementary adjacent columns (e.g. where an indented cell value never co-occurs with the column header,
 /// the content falls geometrically inside the text span of column c and they never co-occur on the same line).
 pub fn merge_complementary_columns(

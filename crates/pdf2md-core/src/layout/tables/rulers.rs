@@ -5,7 +5,7 @@
 //! Stage 3 & Stage 3b ruler scanning, grid alignment, and column corridor analysis.
 
 use crate::layout::glyph_stream::Span;
-use crate::layout::tables::consolidation::{bucket, bucket_words, consolidate_table_rows, merge_complementary_columns};
+use crate::layout::tables::consolidation::{bucket, bucket_rows_content_aware, bucket_words, consolidate_table_rows, merge_complementary_columns};
 use crate::layout::tables::validation::is_tabular_rows;
 use crate::models::BoundingBox;
 
@@ -784,10 +784,8 @@ fn scan_aligned_grids_opts(
                             continue;
                         }
 
-                        let table_rows: Vec<Vec<String>> = win_rows
-                            .iter()
-                            .map(|&i| bucket(&info, i, &rulers))
-                            .collect();
+                        let table_rows: Vec<Vec<String>> =
+                            bucket_rows_content_aware(&info, &win_rows, &rulers, tol);
                         let (table_rows, rulers) =
                             merge_complementary_columns(table_rows, &win_rows, &info, &rulers, tol);
                         // Drop fully-empty edge columns.
@@ -979,6 +977,53 @@ mod tests {
         assert!(
             hit.rows.iter().all(|r| !r.iter().any(|c| c.contains("<br>"))),
             "rows were folded together: {:?}",
+            hit.rows
+        );
+    }
+
+    /// The very same totals block, but asserting the *cell contents* the
+    /// previous test left unchecked: the unit "EUR" of the label "Steuerbetrag
+    /// in EUR" renders at x=454, beyond the midpoint (398) between the label
+    /// ruler (288) and the amount ruler (508), so the plain midpoint bucketer
+    /// filed it into the amount column and produced "EUR 56,87". The unit is
+    /// part of the label cell and must stay there. Fails before the
+    /// content-aware bucketing fix, passes after.
+    #[test]
+    fn stranded_unit_word_stays_in_its_label_cell() {
+        let label = |t: &str, y: f64, adv: f64| sp_at(t, 287.56, y, adv);
+        let amount = |t: &str, x: f64, y: f64, adv: f64| sp_at(t, x, y, adv);
+        let lines: Vec<Vec<Span>> = vec![
+            vec![label("Positionssumme", 405.20, 83.98), amount("473,00", 508.03, 405.20, 36.00)],
+            vec![label("Gesamtbetrag der Zuschläge", 392.38, 155.96), amount("0,00", 520.03, 392.38, 24.00)],
+            vec![label("Gesamtbetrag der Abschläge", 379.56, 155.96), amount("-0,00", 514.03, 379.56, 30.00)],
+            vec![label("Rechnungssumme ohne USt.", 366.74, 143.96), amount("473,00", 508.03, 366.74, 36.00)],
+            vec![
+                label("Steuerbetrag in", 353.92, 95.97),
+                amount("EUR", 454.05, 353.92, 24.00),
+                amount("56,87", 508.03, 353.92, 36.00),
+            ],
+            vec![label("Bruttosumme", 341.10, 65.98), amount("529,87", 508.03, 341.10, 36.00)],
+            vec![label("Erhaltene Anzahlungen", 326.03, 125.96), amount("-0,00", 514.03, 326.03, 30.00)],
+            vec![label("Zahlbetrag", 313.21, 59.98), amount("529,87", 508.03, 313.21, 36.00)],
+        ];
+        let hits = find_tables(&lines);
+        let hit = hits
+            .iter()
+            .find(|h| h.rows.iter().any(|r| r.iter().any(|c| c.contains("Positionssumme"))))
+            .expect("totals table was not detected");
+        let row = hit
+            .rows
+            .iter()
+            .find(|r| r.iter().any(|c| c.contains("Steuerbetrag")))
+            .expect("Steuerbetrag row missing");
+        assert_eq!(
+            row[0], "Steuerbetrag in EUR",
+            "label's unit was stranded in the amount column: {:?}",
+            hit.rows
+        );
+        assert_eq!(
+            row[1], "56,87",
+            "amount cell absorbed the label's unit: {:?}",
             hit.rows
         );
     }
