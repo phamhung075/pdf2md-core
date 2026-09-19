@@ -1024,7 +1024,7 @@ fn extract_page(
     detect_tables: bool,
     detect_layout: bool,
     detect_math: bool,
-) -> Result<PageText, String> {
+) -> Result<(PageText, Option<bool>), String> {
     let chain = resource_dicts(doc, page_id);
     let mut fonts: BTreeMap<Vec<u8>, &Dictionary> = BTreeMap::new();
     collect_fonts(doc, &chain, &mut fonts);
@@ -1052,15 +1052,107 @@ fn extract_page(
     // string walker is kept so table-less callers stay byte-identical.
     let has_tj = content.operations.iter().any(|op| op.operator == "TJ");
     let has_tj_plain = content.operations.iter().any(|op| op.operator == "Tj");
+    // `'` / `"` show a string and advance to the next line; some statement
+    // generators position every fragment with them (plus `Td`) and no `Tj`/`TJ`.
+    let has_quote = content
+        .operations
+        .iter()
+        .any(|op| op.operator == "'" || op.operator == "\"");
     let has_td = content.operations.iter().any(|op| op.operator == "TD");
+    // `Td` (lowercase) is the ordinary line/positioning operator. Some
+    // producers (CAF payslips, Engie bills) position every fragment with
+    // `Tj` + `Td` and no `Tm`/`TD`, so the old check missed them and they
+    // stayed in the string walker — no table geometry and content-stream
+    // reading order. Route those only when the `Td` moves are *fragment*
+    // placements (most carry a horizontal component), not the vertical-only
+    // line advances of ordinary one-BT-per-line prose (tickets, books), whose
+    // string-walker output must stay byte-identical. The table-less path keeps
+    // its exact legacy signature.
+    let has_plain_td = {
+        let (mut total, mut horizontal) = (0usize, 0usize);
+        for op in &content.operations {
+            if op.operator == "Td" {
+                total += 1;
+                if let Some(tx) = op.operands.first().and_then(|o| o.as_float().ok()) {
+                    if tx.abs() > 0.01 {
+                        horizontal += 1;
+                    }
+                }
+            }
+        }
+        total >= 2 && horizontal * 2 >= total
+    };
     let has_tm = content.operations.iter().any(|op| op.operator == "Tm");
+    // Legacy geometry routing (a `TJ`/`Tj` page positioned with `TD`/`Tm`);
+    // this is the pre-existing signature and is never re-checked below.
+    let legacy_geometry = (has_tj || has_tj_plain) && (has_td || has_tm);
     let route_to_layout = if detect_tables {
-        (has_tj || has_tj_plain) && (has_td || has_tm)
+        // `Tj` positioned with `Td` (CAF payslips, Engie bills) and quote
+        // show-ops (`'`/`"`). A quote page is routed only when it also carries
+        // explicit `Td` fragment placements: a page that shows every string
+        // with `'` at one `Tm` and zero leading is one-string-per-line prose
+        // the geometry path would merge into a single run, so it stays on the
+        // string walker.
+        legacy_geometry || ((has_tj_plain || has_quote) && has_plain_td)
     } else {
         has_tj && !has_tj_plain && has_td
     };
+    // The `Tj`+`Td` / quote triggers were added by the layout batch. The
+    // geometry engine can drop text held in rotated or Form-XObject content
+    // that the string walker reaches, so those newly-routed pages are checked
+    // against the walker before their output is trusted.
+    let new_geometry = route_to_layout && !legacy_geometry && detect_tables;
     if route_to_layout {
-        return crate::layout::extract_page_glyphs(doc, page_id, detect_tables, detect_layout, detect_math);
+        if new_geometry {
+            let mut walker = String::new();
+            let mut walker_ops = false;
+            let mut form_path: Vec<ObjectId> = Vec::new();
+            walk_content(
+                doc,
+                &chain,
+                &content.operations,
+                &mut walker,
+                &mut walker_ops,
+                &mut form_path,
+            );
+            let walker = walker.trim_end().to_string();
+            let marker_hint = Some(first_line_looks_like_heading(&walker));
+            match crate::layout::extract_page_glyphs(
+                doc,
+                page_id,
+                detect_tables,
+                detect_layout,
+                detect_math,
+            ) {
+                Ok(pt) => {
+                    // No table recovered, or a decoded digit run is missing:
+                    // the walker is the lossless output, so keep it (tables
+                    // are not worth unique content).
+                    if pt.tables == 0 || loses_digit_content(&walker, &pt.text) {
+                        return Ok((
+                            PageText {
+                                text: walker,
+                                text_ops_seen: walker_ops,
+                                has_fonts,
+                                tables: 0,
+                                blocks: Vec::new(),
+                            },
+                            marker_hint,
+                        ));
+                    }
+                    return Ok((pt, marker_hint));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        return crate::layout::extract_page_glyphs(
+            doc,
+            page_id,
+            detect_tables,
+            detect_layout,
+            detect_math,
+        )
+        .map(|pt| (pt, None));
     }
 
     let mut out = String::new();
@@ -1075,13 +1167,37 @@ fn extract_page(
         &mut form_path,
     );
 
-    Ok(PageText {
-        text: out.trim_end().to_string(),
-        text_ops_seen,
-        has_fonts,
-        tables: 0,
-        blocks: Vec::new(),
-    })
+    Ok((
+        PageText {
+            text: out.trim_end().to_string(),
+            text_ops_seen,
+            has_fonts,
+            tables: 0,
+            blocks: Vec::new(),
+        },
+        None,
+    ))
+}
+
+/// True when the geometry output dropped a digit run (>= 3 digits) that the
+/// string walker decoded. Compared as a substring of the output's concatenated
+/// digits so re-tokenisation (`1 234` → `1234`) is not mistaken for a loss.
+fn loses_digit_content(walker: &str, layout: &str) -> bool {
+    let layout_digits: String = layout.chars().filter(|c| c.is_ascii_digit()).collect();
+    walker
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|run| run.len() >= 3)
+        .any(|run| !layout_digits.contains(run))
+}
+
+/// The page-marker heuristic `convert_pdf_bytes_to_markdown` applies to a
+/// page's first line. Computed here on the string-walker text so a newly
+/// routed page keeps the marker the non-routed path emitted.
+fn first_line_looks_like_heading(text: &str) -> bool {
+    text.starts_with("# ")
+        || text.lines().next().map_or(false, |l| {
+            l.len() < 60 && l.chars().all(|c| c.is_alphanumeric() || c.is_whitespace())
+        })
 }
 
 /// Reports the text for one page (1-based page numbers, as used by
@@ -1094,6 +1210,26 @@ pub fn extract_page_text_report(
     detect_layout: bool,
     detect_math: bool,
 ) -> Result<PageText, String> {
+    extract_page_text_report_with_marker(
+        doc,
+        page_number,
+        detect_tables,
+        detect_layout,
+        detect_math,
+    )
+    .map(|(pt, _)| pt)
+}
+
+/// Like `extract_page_text_report`, but also returns the caller's page-marker
+/// hint for a page the layout batch newly routed (`Some`), so the caller can
+/// keep the marker the non-routed string-walker path would have emitted.
+pub fn extract_page_text_report_with_marker(
+    doc: &Document,
+    page_number: u32,
+    detect_tables: bool,
+    detect_layout: bool,
+    detect_math: bool,
+) -> Result<(PageText, Option<bool>), String> {
     let pages: std::collections::BTreeMap<u32, ObjectId> = doc.get_pages();
     let page_id = pages
         .get(&page_number)

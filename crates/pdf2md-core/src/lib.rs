@@ -599,6 +599,261 @@ fn is_caption_block(text: &str, gap: f64, size_hint: f64) -> bool {
         || (caption_prefix && gap <= 4.0 * size_hint)
 }
 
+/// True when `c` is the kind of punctuation that separates a running footer's
+/// fields ("… - page 2", "| page 2", "· page 2"). Used to tell a page-varying
+/// footer apart from body prose that merely contains the word "page".
+fn is_furniture_separator(c: char) -> bool {
+    matches!(
+        c,
+        '-' | '\u{2013}' | '\u{2014}' | '\u{00b7}' | '|' | '\u{2022}' | '\u{00a9}' | '\u{00ae}' | ',' | ';' | ':'
+    )
+}
+
+/// Mask a bare/short page-number token (`2`, `2/7`) that directly follows a
+/// `page`/`p.` marker in a running header/footer. Anything longer than three
+/// digits, or carrying any other character (amounts, dates, postal codes,
+/// IBAN/SIRET runs), is rejected so two different values never compare equal.
+fn mask_page_token(tok: &str) -> Option<String> {
+    let trimmed = tok.trim_matches(|c: char| ".,;:*_()[]{}".contains(c));
+    let parts: Vec<&str> = trimmed.split('/').collect();
+    if parts.is_empty() || parts.len() > 2 {
+        return None;
+    }
+    if !parts
+        .iter()
+        .all(|p| !p.is_empty() && p.len() <= 3 && p.chars().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some(parts.iter().map(|_| "#").collect::<Vec<_>>().join("/"))
+}
+
+/// Normalize a short line for running-furniture comparison: lowercase, drop
+/// punctuation, and collapse whitespace. A page number that directly follows a
+/// `page`/`p.` marker *set off by a separator* ("… - page 2") is masked to `#`,
+/// so a page-varying legal footer compares equal across pages; a bare number in
+/// body prose ("corps page 2") is kept verbatim, as are amounts, dates and
+/// postal/account runs, so unique per-page content is never treated as furniture.
+fn furniture_line_key(t: &str) -> String {
+    let toks: Vec<&str> = t.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    while i < toks.len() {
+        let tok = toks[i];
+        let stripped: String = tok
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase();
+        let marker = stripped == "page" || stripped == "p";
+        let leading_sep = tok
+            .chars()
+            .take_while(|c| !c.is_alphanumeric())
+            .any(is_furniture_separator);
+        let prev_sep = i > 0 && toks[i - 1].chars().any(is_furniture_separator);
+        if marker && (prev_sep || leading_sep || tok.ends_with('.')) {
+            if let Some(masked) = toks.get(i + 1).and_then(|n| mask_page_token(n)) {
+                if !stripped.is_empty() {
+                    out.push(stripped);
+                }
+                out.push(masked);
+                i += 2;
+                continue;
+            }
+        }
+        if !stripped.is_empty() {
+            out.push(stripped);
+        }
+        i += 1;
+    }
+    out.join(" ")
+}
+
+/// Parse a *pure* page-counter line — `Page N`, `Page N/M`, `N/M`, `N / M`,
+/// `N sur M` — alone on its line. A bare `N` counts only with the `Page`
+/// marker. Returns `(N, M)`.
+fn parse_page_counter(t: &str) -> Option<(u32, Option<u32>)> {
+    let lower = t.trim().to_lowercase();
+    let (body, marked) = match lower.strip_prefix("page") {
+        Some(rest) => (rest, true),
+        None => (lower.as_str(), false),
+    };
+    let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.is_empty() {
+        return None;
+    }
+    if let Some((a, b)) = compact.split_once('/') {
+        if a.is_empty() || b.is_empty() || b.contains('/') {
+            return None;
+        }
+        return Some((a.parse().ok()?, Some(b.parse().ok()?)));
+    }
+    if let Some((a, b)) = compact.split_once("sur") {
+        if a.is_empty() || b.is_empty() {
+            return None;
+        }
+        return Some((a.parse().ok()?, Some(b.parse().ok()?)));
+    }
+    if marked {
+        return compact.parse::<u32>().ok().map(|n| (n, None));
+    }
+    None
+}
+
+/// Drop pure page-counter lines that are *corroborated* as counters: they sit
+/// in a page's top/bottom band, their `N` differs across pages, and their `M`
+/// is consistent (all equal, or equal to the page count). A standalone ratio
+/// cell (`3/4` repeated unchanged on every page) and a `1/2` mid-page are
+/// therefore kept.
+fn suppress_page_counters(page_md: &mut [(u32, String)]) {
+    use std::collections::HashSet;
+    const BAND: usize = 3;
+    if page_md.len() < 2 {
+        return;
+    }
+    let mut ns: HashSet<u32> = HashSet::new();
+    let mut ms: Vec<u32> = Vec::new();
+    let mut pages_with: HashSet<u32> = HashSet::new();
+    for (page, chunk) in page_md.iter() {
+        let lines: Vec<&str> = chunk.lines().filter(|l| !l.trim().is_empty()).collect();
+        let n = lines.len();
+        for (i, l) in lines.iter().enumerate() {
+            if i >= BAND && i + BAND < n {
+                continue;
+            }
+            if let Some((cn, cm)) = parse_page_counter(l) {
+                ns.insert(cn);
+                if let Some(m) = cm {
+                    ms.push(m);
+                }
+                pages_with.insert(*page);
+            }
+        }
+    }
+    if pages_with.len() < 2 || ns.len() < 2 {
+        return;
+    }
+    let m_ok = ms.is_empty() || ms.iter().all(|m| *m == ms[0]);
+    if !m_ok {
+        return;
+    }
+    for (_page, chunk) in page_md.iter_mut() {
+        let lines: Vec<&str> = chunk.lines().filter(|l| !l.trim().is_empty()).collect();
+        let n = lines.len();
+        let mut out = String::with_capacity(chunk.len());
+        let mut idx = 0usize;
+        for l in chunk.lines() {
+            let drop = if l.trim().is_empty() {
+                false
+            } else {
+                let here = idx;
+                idx += 1;
+                (here < BAND || here + BAND >= n) && parse_page_counter(l).is_some()
+            };
+            if !drop {
+                out.push_str(l);
+                out.push('\n');
+            }
+        }
+        if out.ends_with('\n') {
+            out.pop();
+        }
+        *chunk = out;
+    }
+}
+
+/// Suppress running headers/footers in the assembled per-page markdown for
+/// documents whose pages carry no structured blocks (the string-walker path),
+/// where `tag_running_furniture` has nothing to inspect.
+///
+/// Only a page's first/last few non-empty lines are candidates, and a line is
+/// dropped only when its key recurs on at least three pages (keeping its first
+/// occurrence). A page whose whole body is short repeats (a ticket printed
+/// identically on every page) is skipped entirely so its content survives.
+/// Table rows, images, headings and letterless data lines are never candidates.
+fn strip_running_lines(page_md: &mut [(u32, String)]) {
+    use std::collections::{HashMap, HashSet};
+    const BAND: usize = 3;
+    const MIN_PAGES: u32 = 3;
+    if page_md.len() < 2 {
+        return;
+    }
+    let is_candidate = |l: &str| -> bool {
+        let t = l.trim();
+        !t.is_empty()
+            && t.chars().any(|c| c.is_alphabetic())
+            && !t.starts_with('|')
+            && !t.starts_with('<')
+            && !t.starts_with('#')
+            && !t.starts_with("![")
+            && t.split_whitespace().count() <= 14
+    };
+    // A wholly-repeated sparse page (fewer than 2*BAND non-empty lines) is
+    // content, not furniture: every line would fall in a band and be dropped.
+    let sparse = |chunk: &str| chunk.lines().filter(|l| !l.trim().is_empty()).count() <= 2 * BAND;
+
+    let mut first_seen: HashMap<String, u32> = HashMap::new();
+    let mut page_count: HashMap<String, u32> = HashMap::new();
+    for (page, chunk) in page_md.iter() {
+        if sparse(chunk) {
+            continue;
+        }
+        let lines: Vec<&str> = chunk.lines().filter(|l| !l.trim().is_empty()).collect();
+        let n = lines.len();
+        let mut seen_here: HashSet<String> = HashSet::new();
+        for (i, l) in lines.iter().enumerate() {
+            if !is_candidate(l) || (i >= BAND && i + BAND < n) {
+                continue;
+            }
+            let key = furniture_line_key(l);
+            if key.is_empty() {
+                continue;
+            }
+            first_seen.entry(key.clone()).or_insert(*page);
+            if seen_here.insert(key.clone()) {
+                *page_count.entry(key).or_insert(0) += 1;
+            }
+        }
+    }
+    let repeated: HashSet<String> = page_count
+        .into_iter()
+        .filter(|(_, c)| *c >= MIN_PAGES)
+        .map(|(k, _)| k)
+        .collect();
+
+    for (page, chunk) in page_md.iter_mut() {
+        if sparse(chunk) {
+            continue;
+        }
+        let n = chunk.lines().filter(|l| !l.trim().is_empty()).count();
+        let mut out = String::with_capacity(chunk.len());
+        let mut idx = 0usize;
+        for l in chunk.lines() {
+            let drop = if l.trim().is_empty() {
+                false
+            } else {
+                let here = idx;
+                idx += 1;
+                if is_candidate(l) && (here < BAND || here + BAND >= n) {
+                    let key = furniture_line_key(l);
+                    repeated.contains(&key)
+                        && first_seen.get(&key).copied().unwrap_or(*page) < *page
+                } else {
+                    false
+                }
+            };
+            if !drop {
+                out.push_str(l);
+                out.push('\n');
+            }
+        }
+        if out.ends_with('\n') {
+            out.pop();
+        }
+        *chunk = out;
+    }
+}
+
 /// Tag blocks whose text repeats near the top/bottom of >= 3 pages as running
 /// headers/footers. Operates purely on the structured block list.
 fn tag_running_furniture(blocks: &mut [layout::DocBlock]) {
@@ -611,15 +866,7 @@ fn tag_running_furniture(blocks: &mut [layout::DocBlock]) {
         e.0 = e.0.min(b.y0.min(b.y1));
         e.1 = e.1.max(b.y0.max(b.y1));
     }
-    let norm = |t: &str| -> String {
-        t.chars()
-            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase()
-    };
+    let norm = |t: &str| -> String { furniture_line_key(t) };
     let mut header_counts: HashMap<String, usize> = HashMap::new();
     let mut footer_counts: HashMap<String, usize> = HashMap::new();
     for b in blocks.iter() {
@@ -628,6 +875,12 @@ fn tag_running_furniture(blocks: &mut [layout::DocBlock]) {
         }
         if b.text.split_whitespace().count() > 14 {
             continue; // paragraphs aren't furniture
+        }
+        // A line with no letters is a data value, not furniture; digit
+        // normalization would otherwise collapse distinct numbers ("0.19" /
+        // "0.29" → "#.##") into one bogus repeated header.
+        if !b.text.chars().any(|c| c.is_alphabetic()) {
+            continue;
         }
         let n = norm(&b.text);
         if n.is_empty() {
@@ -649,6 +902,9 @@ fn tag_running_furniture(blocks: &mut [layout::DocBlock]) {
             continue;
         }
         if b.text.split_whitespace().count() > 14 {
+            continue;
+        }
+        if !b.text.chars().any(|c| c.is_alphabetic()) {
             continue;
         }
         let n = norm(&b.text);
@@ -843,25 +1099,31 @@ pub fn convert_pdf_bytes_to_markdown(
         // Prefer our own multilingual decoder (correct WinAnsi/Differences/
         // ToUnicode handling — see text_extract.rs) and only fall back to
         // lopdf's extractor when the page content cannot be parsed at all.
-        let page_text = {
-            let geo = text_extract::extract_page_text_report(
+        let (page_text, marker_hint) = {
+            let geo = text_extract::extract_page_text_report_with_marker(
                 &doc,
                 page_num,
                 options.detect_tables,
                 options.detect_layout,
                 options.detect_math,
             );
-            let geo = match geo {
-                Ok(pt) => pt,
-                Err(_) => text_extract::PageText {
-                    text: doc
-                        .extract_text_with_limit(&[page_num], text_extract::MAX_PAGE_CONTENT_TOTAL)
-                        .unwrap_or_default(),
-                    text_ops_seen: true,
-                    has_fonts: !text_extract::page_fonts(&doc, page_id).is_empty(),
-                    tables: 0,
-                    blocks: Vec::new(),
-                },
+            let (geo, geo_hint) = match geo {
+                Ok(pair) => pair,
+                Err(_) => (
+                    text_extract::PageText {
+                        text: doc
+                            .extract_text_with_limit(
+                                &[page_num],
+                                text_extract::MAX_PAGE_CONTENT_TOTAL,
+                            )
+                            .unwrap_or_default(),
+                        text_ops_seen: true,
+                        has_fonts: !text_extract::page_fonts(&doc, page_id).is_empty(),
+                        tables: 0,
+                        blocks: Vec::new(),
+                    },
+                    None,
+                ),
             };
             // When the document is tagged (/StructTreeRoot, PDF/UA, Word/
             // LibreOffice/Acrobat exports) the structure tree is ground truth for
@@ -874,21 +1136,24 @@ pub fn convert_pdf_bytes_to_markdown(
                 if let Some(tagged) = layout::extract_tagged_page(&doc, page_id, options.detect_math) {
                     let geo_words = geo.text.split_whitespace().count();
                     if tagged.words >= 5 && tagged.words * 100 >= 85 * geo_words {
-                        text_extract::PageText {
-                            text: tagged.text,
-                            text_ops_seen: true,
-                            has_fonts: true,
-                            tables: tagged.tables,
-                            blocks: tagged.blocks,
-                        }
+                        (
+                            text_extract::PageText {
+                                text: tagged.text,
+                                text_ops_seen: true,
+                                has_fonts: true,
+                                tables: tagged.tables,
+                                blocks: tagged.blocks,
+                            },
+                            None,
+                        )
                     } else {
-                        geo
+                        (geo, geo_hint)
                     }
                 } else {
-                    geo
+                    (geo, geo_hint)
                 }
             } else {
-                geo
+                (geo, geo_hint)
             }
         };
         any_text_ops |= page_text.text_ops_seen;
@@ -994,12 +1259,15 @@ pub fn convert_pdf_bytes_to_markdown(
         }
 
         let mut chunk = String::new();
-        if options.detect_headings
-            && (text.starts_with("# ")
+        // A newly-routed page reports the marker decision from the string
+        // walker (`marker_hint`), so routing does not move its page boundary.
+        let heading_like = marker_hint.unwrap_or_else(|| {
+            text.starts_with("# ")
                 || text.lines().next().map_or(false, |l| {
                     l.len() < 60 && l.chars().all(|c| c.is_alphanumeric() || c.is_whitespace())
-                }))
-        {
+                })
+        });
+        if options.detect_headings && heading_like {
             chunk.push_str(&format!("\n## Page {}\n\n", page_num));
         }
 
@@ -1226,7 +1494,10 @@ pub fn convert_pdf_bytes_to_markdown(
     if options.detect_layout && !block_items.is_empty() {
         tag_running_furniture(&mut block_items);
         // Keep a running header/footer only on its first page; strip the
-        // repeated occurrences from every later page of the markdown.
+        // repeated occurrences from every later page of the markdown. Matching
+        // is on the normalized key (which masks only a page-number tail set off
+        // by a separator), so a page-varying footer is suppressed while body
+        // prose and data values are kept.
         let mut furniture: Vec<(String, u32)> = Vec::new();
         for b in block_items
             .iter()
@@ -1236,30 +1507,38 @@ pub fn convert_pdf_bytes_to_markdown(
             if t.len() <= 1 {
                 continue;
             }
-            match furniture.iter_mut().find(|(ft, _)| ft == t) {
+            let key = furniture_line_key(t);
+            match furniture.iter_mut().find(|(fk, _)| *fk == key) {
                 Some((_, first)) => *first = (*first).min(b.page as u32),
-                None => furniture.push((t.to_string(), b.page as u32)),
+                None => furniture.push((key, b.page as u32)),
             }
         }
         for (page, chunk) in page_md.iter_mut() {
-            for (line_text, first_page) in furniture.iter() {
-                if *page <= *first_page {
-                    continue; // keep on the first page it occurs
-                }
-                let mut out = String::with_capacity(chunk.len());
-                for ln in chunk.lines() {
-                    if ln.trim() == line_text {
-                        continue;
-                    }
+            let mut out = String::with_capacity(chunk.len());
+            for ln in chunk.lines() {
+                let drop = !ln.trim().is_empty()
+                    && !ln.trim().starts_with('|')
+                    && furniture.iter().any(|(key, first_page)| {
+                        *page > *first_page && furniture_line_key(ln.trim()) == *key
+                    });
+                if !drop {
                     out.push_str(ln);
                     out.push('\n');
                 }
-                if out.ends_with('\n') {
-                    out.pop();
-                }
-                *chunk = out;
             }
+            if out.ends_with('\n') {
+                out.pop();
+            }
+            *chunk = out;
         }
+    } else if options.detect_layout {
+        strip_running_lines(&mut page_md);
+    }
+    // Pure page counters are corroborated at the document level (they vary
+    // across pages and share a page count) before any are dropped, so a
+    // standalone ratio/data value survives.
+    if options.detect_layout {
+        suppress_page_counters(&mut page_md);
     }
     for (_p, chunk) in page_md {
         full_markdown.push_str(&chunk);
@@ -1926,6 +2205,109 @@ mod regression_tests {
         bytes
     }
 
+    /// Escape a synthetic literal string for a PDF content stream.
+    fn pdf_string(s: &str) -> String {
+        s.replace('\\', "\\\\")
+            .replace('(', "\\(")
+            .replace(')', "\\)")
+    }
+
+    /// Build a multi-page PDF from raw content streams (Helvetica/WinAnsi), so
+    /// a test controls the exact `Tm`/`Td`/`Tj`/`'` operators. All content is
+    /// synthetic placeholder text.
+    fn synth_pages_pdf(pages: &[String]) -> Vec<u8> {
+        let mut doc = lopdf::Document::new();
+        let font_id = helvetica_font(&mut doc);
+        let content_ids: Vec<lopdf::ObjectId> = pages
+            .iter()
+            .map(|c| {
+                doc.add_object(lopdf::Object::Stream(lopdf::Stream::new(
+                    lopdf::Dictionary::new(),
+                    c.as_bytes().to_vec(),
+                )))
+            })
+            .collect();
+        let mut pages = lopdf::Dictionary::new();
+        pages.set(b"Type", lopdf::Object::Name(b"Pages".to_vec()));
+        pages.set(b"Kids", lopdf::Object::Array(Vec::new()));
+        pages.set(b"Count", lopdf::Object::Integer(content_ids.len() as i64));
+        let pages_id = doc.add_object(lopdf::Object::Dictionary(pages));
+        let mut kids = Vec::new();
+        for cid in content_ids {
+            let mut fonts = lopdf::Dictionary::new();
+            fonts.set(b"F1", lopdf::Object::Reference(font_id));
+            let mut res = lopdf::Dictionary::new();
+            res.set(b"Font", lopdf::Object::Dictionary(fonts));
+            let mut page = lopdf::Dictionary::new();
+            page.set(b"Type", lopdf::Object::Name(b"Page".to_vec()));
+            page.set(b"Parent", lopdf::Object::Reference(pages_id));
+            page.set(
+                b"MediaBox",
+                lopdf::Object::Array(vec![
+                    lopdf::Object::Integer(0),
+                    lopdf::Object::Integer(0),
+                    lopdf::Object::Integer(595),
+                    lopdf::Object::Integer(842),
+                ]),
+            );
+            page.set(b"Contents", lopdf::Object::Reference(cid));
+            page.set(b"Resources", lopdf::Object::Dictionary(res));
+            let pid = doc.add_object(lopdf::Object::Dictionary(page));
+            kids.push(lopdf::Object::Reference(pid));
+        }
+        doc.get_object_mut(pages_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set(b"Kids", lopdf::Object::Array(kids));
+        finish_catalog(&mut doc, pages_id)
+    }
+
+    /// A `Tm`-positioned text op.
+    fn tm_text(x: f64, y: f64, s: &str) -> String {
+        format!(
+            "BT /F1 11 Tf 1 0 0 1 {x} {y} Tm ({}) Tj ET",
+            pdf_string(s)
+        )
+    }
+
+    /// A `Tj`+`Td` content stream; `horizontal` picks fragment placement vs the
+    /// vertical-only line advances of ordinary prose.
+    fn td_text(lines: &[&str], horizontal: bool) -> String {
+        let mut parts = vec!["BT /F1 10 Tf".to_string()];
+        parts.push(if horizontal {
+            "300 800 Td".to_string()
+        } else {
+            "72 800 Td".to_string()
+        });
+        for (i, ln) in lines.iter().enumerate() {
+            parts.push(format!("({}) Tj", pdf_string(ln)));
+            if i + 1 != lines.len() {
+                parts.push(if horizontal {
+                    "-228 -16 Td".to_string()
+                } else {
+                    "0 -16 Td".to_string()
+                });
+            }
+        }
+        parts.push("ET".to_string());
+        parts.join(" ")
+    }
+
+    /// A `'`-only content stream at one `Tm` (no `Td`, zero leading).
+    fn quote_text(lines: &[&str]) -> String {
+        let mut parts = vec!["BT /F1 12 Tf 1 0 0 1 72 800 Tm".to_string()];
+        for ln in lines {
+            parts.push(format!("({}) '", pdf_string(ln)));
+        }
+        parts.push("ET".to_string());
+        parts.join(" ")
+    }
+
+    fn count_occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
     /// One page whose `/Resources` live inline on the `/Pages` parent, not on
     /// the page object (the QZP payslip shape). lopdf 0.44's
     /// `get_page_fonts` only collects inherited resources that are *indirect*
@@ -2447,5 +2829,314 @@ mod regression_tests {
         let err = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
             .expect_err("a document over the page cap must fail explicitly");
         assert!(err.contains("page limit"), "unexpected error: {err}");
+    }
+
+    /// The furniture key masks only a page number set off from a `page`/`p.`
+    /// marker by a separator, so a page-varying footer matches across pages
+    /// while body prose and longer identifiers stay distinct.
+    #[test]
+    fn furniture_key_masks_only_separated_page_tails() {
+        assert_eq!(
+            furniture_line_key("Societe Exemple SAS - page 2"),
+            furniture_line_key("Societe Exemple SAS - page 3")
+        );
+        assert_eq!(
+            furniture_line_key("Mentions legales | page 12"),
+            furniture_line_key("Mentions legales | page 47")
+        );
+        assert_ne!(
+            furniture_line_key("corps page 1"),
+            furniture_line_key("corps page 2"),
+            "a page word embedded in body prose must not be normalized"
+        );
+        assert_ne!(
+            furniture_line_key("13004 MARSEILLE"),
+            furniture_line_key("13009 MARSEILLE"),
+            "distinct postal codes must not collapse to one key"
+        );
+        assert_ne!(
+            furniture_line_key("page 2024"),
+            furniture_line_key("page 2025"),
+            "four-digit year-like tokens must not be masked"
+        );
+    }
+
+    #[test]
+    fn page_counter_line_detection() {
+        assert_eq!(parse_page_counter("2/7"), Some((2, Some(7))));
+        assert_eq!(parse_page_counter(" 2 / 7 "), Some((2, Some(7))));
+        assert_eq!(parse_page_counter("Page 3/9"), Some((3, Some(9))));
+        assert_eq!(parse_page_counter("2 sur 7"), Some((2, Some(7))));
+        assert_eq!(parse_page_counter("Page 12"), Some((12, None)));
+        assert_eq!(parse_page_counter("12"), None, "a bare number is not a counter");
+        assert_eq!(parse_page_counter("13004 MARSEILLE"), None);
+        assert_eq!(parse_page_counter("RCS 542 107 651"), None);
+    }
+
+    /// Only corroborated counters fall: a standalone ratio repeated unchanged
+    /// on every page must survive.
+    #[test]
+    fn suppress_page_counters_drops_corroborated_only() {
+        let mut pages: Vec<(u32, String)> = (1..=4)
+            .map(|i| (i, format!("corps {i}\n3/4")))
+            .collect();
+        suppress_page_counters(&mut pages);
+        let all = pages.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+        assert_eq!(all.matches("3/4").count(), 4, "uncorroborated ratio dropped: {all}");
+
+        let mut counters: Vec<(u32, String)> = (1..=4)
+            .map(|i| (i, format!("corps {i}\nPage {}/4", i)))
+            .collect();
+        suppress_page_counters(&mut counters);
+        let call = counters.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+        for i in 1..=4 {
+            assert!(!call.contains(&format!("Page {i}/4")), "counter survived: {call}");
+        }
+    }
+
+    /// The line-based pass drops a repeated band header after page 1 only on
+    /// dense pages; a sparse page whose whole body repeats (a ticket) survives.
+    #[test]
+    fn strip_running_lines_keeps_sparse_repeated_content() {
+        let filler = "l1\nl2\nl3\nl4\nl5\nl6\nl7";
+        let mut pages = vec![
+            (1u32, format!("head band\n{filler}\nbody alpha\n")),
+            (2u32, format!("head band\n{filler}\nbody beta\n")),
+            (3u32, format!("head band\n{filler}\nbody gamma\n")),
+        ];
+        strip_running_lines(&mut pages);
+        let all = pages.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+        assert_eq!(all.matches("head band").count(), 1, "repeated header kept once: {all}");
+        for unique in ["body alpha", "body beta", "body gamma"] {
+            assert!(all.contains(unique), "unique line {unique} was dropped: {all}");
+        }
+
+        let ticket = "TICKET DE CAISSE\nArticle un 5,00\nArticle deux 7,50\nTOTAL 12,50";
+        let mut sparse: Vec<(u32, String)> = (1..=3).map(|i| (i, ticket.to_string())).collect();
+        strip_running_lines(&mut sparse);
+        let kept = sparse.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            kept.matches("TICKET DE CAISSE").count(),
+            3,
+            "sparse repeated content must survive: {kept}"
+        );
+    }
+
+    // ---- Synthetic end-to-end cases for the layout batch (QA list) ----
+
+    fn convert_synth(pages: &[String]) -> String {
+        let bytes = synth_pages_pdf(pages);
+        convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
+            .expect("synthetic pdf must convert")
+            .markdown
+    }
+
+    /// A ratio inside a table row and as a standalone footer-style line must
+    /// both survive: it is not a corroborated page counter.
+    #[test]
+    fn synthetic_ratio_cell_and_standalone_survive() {
+        let pages: Vec<String> = (1..=4)
+            .map(|i| {
+                [
+                    tm_text(72.0, 815.0, &format!("RATIO-SHEET-{i}")),
+                    tm_text(72.0, 720.0, "Ratio"),
+                    tm_text(72.0, 705.0, "3/4"),
+                    tm_text(72.0, 300.0, &format!("unique prose line number {i} for this sheet only")),
+                    tm_text(72.0, 90.0, "3/4"),
+                ]
+                .join("\n")
+            })
+            .collect();
+        let md = convert_synth(&pages);
+        assert_eq!(count_occurrences(&md, "3/4"), 8, "ratio cells/footers lost:\n{md}");
+        for i in 1..=4 {
+            assert!(md.contains(&format!("RATIO-SHEET-{i}")), "page {i} header lost:\n{md}");
+        }
+    }
+
+    /// `Sous-total page N: <amount>` data rows must survive: the label carries
+    /// a varying amount, not a plain counter.
+    #[test]
+    fn synthetic_subtotal_rows_survive() {
+        let amounts = ["120,50", "98,00", "75,25", "61,10"];
+        let pages: Vec<String> = (0..4)
+            .map(|i| {
+                [
+                    tm_text(72.0, 815.0, &format!("RELEVE-{} EN-TETE COURANT", i + 1)),
+                    tm_text(72.0, 500.0, &format!("ligne de donnees propre a la page {}", i + 1)),
+                    tm_text(72.0, 95.0, &format!("Sous-total page {}: {}", i + 1, amounts[i])),
+                ]
+                .join("\n")
+            })
+            .collect();
+        let md = convert_synth(&pages);
+        for a in amounts {
+            assert!(md.contains(a), "amount {a} lost:\n{md}");
+        }
+        assert_eq!(count_occurrences(&md, "Sous-total"), 4, "subtotal rows lost:\n{md}");
+    }
+
+    /// A repeated column header inside table rows must survive.
+    #[test]
+    fn synthetic_repeated_montant_header_survives() {
+        let pages: Vec<String> = (1..=3)
+            .map(|i| {
+                [
+                    tm_text(72.0, 780.0, "Montant"),
+                    tm_text(300.0, 780.0, "Detail"),
+                    tm_text(72.0, 765.0, &format!("poste-{i}A")),
+                    tm_text(300.0, 765.0, "100,00"),
+                    tm_text(72.0, 750.0, &format!("poste-{i}B")),
+                    tm_text(300.0, 750.0, "200,00"),
+                ]
+                .join("\n")
+            })
+            .collect();
+        let md = convert_synth(&pages);
+        assert_eq!(count_occurrences(&md, "Montant"), 3, "repeated header lost:\n{md}");
+    }
+
+    /// Distinct postal codes must never be folded into one furniture key.
+    #[test]
+    fn synthetic_postal_codes_survive() {
+        let pages: Vec<String> = (1..=4)
+            .map(|i| {
+                let city = if i % 2 == 1 { "75001 PARIS" } else { "69001 LYON" };
+                [
+                    tm_text(72.0, 800.0, &format!("Adresse: {city}")),
+                    tm_text(72.0, 780.0, &format!("dossier numero {i}0000001")),
+                    tm_text(72.0, 300.0, &format!("texte metier distinct page {i}")),
+                ]
+                .join("\n")
+            })
+            .collect();
+        let md = convert_synth(&pages);
+        assert_eq!(count_occurrences(&md, "75001 PARIS"), 2, "postal code lost:\n{md}");
+        assert_eq!(count_occurrences(&md, "69001 LYON"), 2, "postal code lost:\n{md}");
+    }
+
+    /// `Page 2/7`, `2 / 7`, `2/7` counters that vary across pages are dropped.
+    #[test]
+    fn synthetic_page_counters_are_removed() {
+        let forms = ["Page 2/7", "2 / 7", "2/7", "Page 5/7"];
+        let pages: Vec<String> = (1..=4)
+            .map(|i| {
+                [
+                    tm_text(72.0, 815.0, forms[i - 1]),
+                    tm_text(72.0, 300.0, &format!("contenu reel de la page {i} a conserver")),
+                    tm_text(72.0, 90.0, forms[i % 4]),
+                ]
+                .join("\n")
+            })
+            .collect();
+        let md = convert_synth(&pages);
+        for f in forms {
+            assert!(!md.contains(f), "counter {f} survived:\n{md}");
+        }
+        assert_eq!(count_occurrences(&md, "contenu reel"), 4, "body lost:\n{md}");
+    }
+
+    /// A legal footer whose only varying field is a page number is dropped,
+    /// while a body line that merely says "corps page N" survives.
+    #[test]
+    fn synthetic_page_varying_legal_footer_removed_body_kept() {
+        let pages: Vec<String> = (1..=4)
+            .map(|i| {
+                [
+                    tm_text(72.0, 700.0, &format!("corps page {i}")),
+                    tm_text(72.0, 80.0, &format!("Societe Exemple SAS - RCS 123 456 789 - page {i}")),
+                ]
+                .join("\n")
+            })
+            .collect();
+        let md = convert_synth(&pages);
+        assert_eq!(count_occurrences(&md, "RCS"), 1, "page-varying footer kept:\n{md}");
+        assert_eq!(count_occurrences(&md, "corps page"), 4, "unique body line dropped:\n{md}");
+    }
+
+    /// A ticket whose lines repeat identically on every page must survive.
+    #[test]
+    fn synthetic_repeated_page_ticket_survives() {
+        let body = ["TICKET DE CAISSE", "Article un 5,00", "Article deux 7,50", "TOTAL 12,50"];
+        let page = td_text(&body, false);
+        let pages = vec![page; 3];
+        let md = convert_synth(&pages);
+        assert_eq!(
+            count_occurrences(&md, "TICKET DE CAISSE"),
+            3,
+            "repeated ticket content emptied:\n{md}"
+        );
+        for b in body {
+            assert_eq!(count_occurrences(&md, b), 3, "line {b} lost:\n{md}");
+        }
+    }
+
+    /// A horizontally-positioned `Tj`+`Td` prose page must keep every line.
+    #[test]
+    fn synthetic_td_prose_page_keeps_content() {
+        let body = [
+            "Le contenu de cette page est dispose",
+            "par fragments successifs avec des",
+            "deplacements horizontaux puis verticaux",
+            "afin de tester le routage vers",
+            "le moteur de mise en page du document",
+        ];
+        let pages = vec![td_text(&body, true); 3];
+        let md = convert_synth(&pages);
+        for b in body {
+            assert_eq!(count_occurrences(&md, b), 3, "prose line {b} lost:\n{md}");
+        }
+    }
+
+    /// A `'`-only letter (one `Tm`, zero leading) must keep word boundaries
+    /// instead of being merged into a single fragment.
+    #[test]
+    fn synthetic_quote_show_letter_keeps_words() {
+        let body = [
+            "Objet: votre demande de dossier",
+            "Madame, Monsieur,",
+            "Nous accusons reception de votre courrier",
+            "et vous remercions de votre confiance.",
+        ];
+        let pages = vec![quote_text(&body); 2];
+        let md = convert_synth(&pages);
+        assert!(!md.contains("dossierMadame"), "quote fragments merged:\n{md}");
+        for b in body {
+            assert!(md.contains(b), "letter line lost: {b}\n{md}");
+        }
+    }
+
+    /// The layout path's overdraw dedup is intentional: it folds only an exact
+    /// overstrike (same text, same baseline) and must never merge two distinct
+    /// strings that happen to overlap.
+    #[test]
+    fn overdraw_dedup_folds_only_identical_spans() {
+        use crate::layout::{build_lines, Span};
+        let span = |text: &str, x: f64, y: f64| Span {
+            text: text.to_string(),
+            x,
+            y,
+            size: 10.0,
+            advance: 20.0,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_vertical: false,
+        };
+        let overstrike = build_lines(&[span("Montant", 100.0, 500.0), span("Montant", 100.2, 500.0)]);
+        assert_eq!(
+            overstrike.iter().map(|l| l.len()).sum::<usize>(),
+            1,
+            "an identical overstrike must collapse to one span"
+        );
+        let distinct = build_lines(&[
+            span("ALPHA-COST", 100.0, 500.0),
+            span("BRAVO-COST", 100.0, 500.4),
+        ]);
+        let texts: Vec<&str> = distinct.iter().flatten().map(|s| s.text.as_str()).collect();
+        assert!(
+            texts.contains(&"ALPHA-COST") && texts.contains(&"BRAVO-COST"),
+            "distinct overlapping strings must both survive: {texts:?}"
+        );
     }
 }
