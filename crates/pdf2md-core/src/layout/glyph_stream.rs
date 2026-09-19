@@ -971,7 +971,7 @@ pub fn extract_page_glyphs(
     detect_layout: bool,
     detect_math: bool,
 ) -> Result<PageText, String> {
-    let fonts = doc.get_page_fonts(page_id).map_err(|e| e.to_string())?;
+    let fonts = crate::text_extract::page_fonts(doc, page_id);
     let has_fonts = !fonts.is_empty();
 
     struct FontInfo {

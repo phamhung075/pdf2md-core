@@ -29,7 +29,7 @@
 //! only). If content parsing fails, the caller falls back to lopdf's own
 //! extractor.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId};
@@ -385,6 +385,121 @@ pub(crate) fn deref<'d>(doc: &'d Document, obj: &'d Object) -> Option<&'d Object
     None
 }
 
+/// The `/Resources` dictionaries that apply to a page, nearest first (the page
+/// itself, then each `/Pages` ancestor up to the root). `lopdf`'s
+/// `get_page_resources` only collects ancestor resources that are *indirect*
+/// references, so a page whose parent carries `/Resources << ... >>` inline
+/// (QZP payslips, some bank exports) resolves to nothing; walking the chain
+/// ourselves handles both shapes. Cycle-safe and depth-bounded.
+pub(crate) fn resource_dicts<'a>(doc: &'a Document, page_id: ObjectId) -> Vec<&'a Dictionary> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut cur = Some(page_id);
+    while let Some(id) = cur {
+        if out.len() >= 32 || !seen.insert(id) {
+            break;
+        }
+        let Ok(dict) = doc.get_dictionary(id) else { break };
+        if let Some(res) = dict
+            .get(b"Resources")
+            .ok()
+            .and_then(|o| deref(doc, o))
+            .and_then(|o| o.as_dict().ok())
+        {
+            out.push(res);
+        }
+        cur = dict.get(b"Parent").ok().and_then(|o| o.as_reference().ok());
+    }
+    out
+}
+
+/// Merge the `/Font` entries of a resource chain into `fonts`, nearest-wins and
+/// without overwriting a name already found closer to the page.
+pub(crate) fn collect_fonts<'a>(
+    doc: &'a Document,
+    chain: &[&'a Dictionary],
+    fonts: &mut BTreeMap<Vec<u8>, &'a Dictionary>,
+) {
+    for resources in chain {
+        let Some(font) = resources
+            .get(b"Font")
+            .ok()
+            .and_then(|o| deref(doc, o))
+            .and_then(|o| o.as_dict().ok())
+        else {
+            continue;
+        };
+        for (name, value) in font.iter() {
+            if fonts.contains_key(name) {
+                continue;
+            }
+            if let Some(fd) = deref(doc, value).and_then(|o| o.as_dict().ok()) {
+                fonts.insert(name.clone(), fd);
+            }
+        }
+    }
+}
+
+/// Fonts available to a page, resolving `/Resources` inherited from the
+/// `/Pages` tree (see [`resource_dicts`]).
+pub(crate) fn page_fonts<'a>(
+    doc: &'a Document,
+    page_id: ObjectId,
+) -> BTreeMap<Vec<u8>, &'a Dictionary> {
+    let mut fonts = BTreeMap::new();
+    let chain = resource_dicts(doc, page_id);
+    collect_fonts(doc, &chain, &mut fonts);
+    fonts
+}
+
+/// The `/Resources` dictionary in effect inside a Form XObject: its own when
+/// present, otherwise the enclosing page/form resources.
+pub(crate) fn form_resource_chain<'a>(
+    doc: &'a Document,
+    form: &'a Dictionary,
+    parent: &[&'a Dictionary],
+) -> Vec<&'a Dictionary> {
+    match form
+        .get(b"Resources")
+        .ok()
+        .and_then(|o| deref(doc, o))
+        .and_then(|o| o.as_dict().ok())
+    {
+        Some(res) => vec![res],
+        None => parent.to_vec(),
+    }
+}
+
+/// Resolve a `Do` operand to a Form XObject stream, searching the resource
+/// chain nearest-first. The returned id is `Some` when the XObject was an
+/// indirect reference, letting callers detect a form that draws itself.
+pub(crate) fn lookup_form<'a>(
+    doc: &'a Document,
+    chain: &[&'a Dictionary],
+    name: &[u8],
+) -> Option<(Option<ObjectId>, &'a lopdf::Stream)> {
+    for resources in chain {
+        let Some(xobjects) = resources
+            .get(b"XObject")
+            .ok()
+            .and_then(|o| deref(doc, o))
+            .and_then(|o| o.as_dict().ok())
+        else {
+            continue;
+        };
+        let Some(value) = xobjects.get(name).ok() else {
+            continue;
+        };
+        let id = value.as_reference().ok();
+        if let Some(Object::Stream(stream)) = deref(doc, value) {
+            if get_name(&stream.dict, b"Subtype") == Some(b"Form") {
+                return Some((id, stream));
+            }
+        }
+    }
+    None
+}
+
 /// ASCII-only base used for StandardEncoding / MacExpertEncoding /
 /// PDFDocEncoding / unknown names: high bytes decode to nothing instead of to
 /// corrupt letters (lopdf's fallback table maps 0xE9 -> 'Ø' etc.).
@@ -419,6 +534,12 @@ fn glyph_unicode(name: &[u8]) -> Option<u16> {
         let hex = std::str::from_utf8(&name[3..]).ok()?;
         return u16::from_str_radix(hex, 16).ok();
     }
+    // "UNICXXXX" is the same idea with a producer-specific prefix (seen on BNP
+    // Paribas Type3 statements, whose /Differences are entirely /UNICxxxx).
+    if name.len() == 8 && name[..4].eq_ignore_ascii_case(b"unic") {
+        let hex = std::str::from_utf8(&name[4..]).ok()?;
+        return u16::from_str_radix(hex, 16).ok();
+    }
     None
 }
 
@@ -443,16 +564,10 @@ fn apply_differences(table: &mut ByteTable, doc: &Document, array: &Object) {
     }
 }
 
-fn is_symbolic(doc: &Document, font: &Dictionary) -> bool {
-    if let Some(desc) = font.get(b"FontDescriptor").ok().and_then(|o| deref(doc, o)) {
-        if let Object::Dictionary(d) = desc {
-            if let Ok(flags) = d.get(b"Flags").and_then(|f| f.as_i64()) {
-                if flags & 0x4 != 0 {
-                    return true;
-                }
-            }
-        }
-    }
+/// True for the handful of faces whose byte codes index a built-in glyph set
+/// with no Latin semantics (dingbats/dingbat-like fonts). A font merely flagged
+/// Symbolic but named as a text face is *not* one of these.
+fn is_dingbat_face(font: &Dictionary) -> bool {
     if let Some(bf) = get_name(font, b"BaseFont") {
         let upper = bf.to_ascii_uppercase();
         for marker in [
@@ -467,6 +582,19 @@ fn is_symbolic(doc: &Document, font: &Dictionary) -> bool {
         }
     }
     false
+}
+
+fn is_symbolic(doc: &Document, font: &Dictionary) -> bool {
+    if let Some(desc) = font.get(b"FontDescriptor").ok().and_then(|o| deref(doc, o)) {
+        if let Object::Dictionary(d) = desc {
+            if let Ok(flags) = d.get(b"Flags").and_then(|f| f.as_i64()) {
+                if flags & 0x4 != 0 {
+                    return true;
+                }
+            }
+        }
+    }
+    is_dingbat_face(font)
 }
 
 /// Extract the `/ToUnicode` CMap of a font (handles indirect references).
@@ -511,7 +639,17 @@ pub(crate) fn resolve_codec(doc: &Document, font: &Dictionary) -> Option<Codec> 
                 // faces are routinely flagged Symbolic with no /Encoding while
                 // shipping a full /ToUnicode. Decode through that rather than
                 // dropping every glyph drawn in the font.
-                return font_to_unicode(doc, font).map(|cm| Codec::CMap(cm, None));
+                if let Some(cm) = font_to_unicode(doc, font) {
+                    return Some(Codec::CMap(cm, None));
+                }
+                // A Latin text face merely flagged Symbolic (very common on
+                // subset CFF/Type1 fonts, e.g. Bouygues bills) still draws
+                // StandardEncoding-compatible bytes; decode those through the
+                // Latin table instead of dropping the whole document. Only the
+                // genuine dingbat faces are left unmapped so they escalate.
+                if is_dingbat_face(font) {
+                    return None;
+                }
             }
             // Non-symbolic simple fonts with no declared encoding almost
             // universally use WinAnsi byte values for accented Latin text.
@@ -610,57 +748,27 @@ pub struct PageText {
     pub blocks: Vec<crate::layout::DocBlock>,
 }
 
-fn extract_page(
+/// Walk a content stream (a page or a Form XObject) appending decoded text to
+/// `out`. Fonts come from `chain`; `Do` recurses into Form XObjects so text
+/// buried there — a common payslip/invoice generator shape — is not dropped.
+/// Recursion is depth-bounded and never revisits a form already on the current
+/// path, so a self-referential form cannot loop.
+fn walk_content(
     doc: &Document,
-    page_id: ObjectId,
-    detect_tables: bool,
-    detect_layout: bool,
-    detect_math: bool,
-) -> Result<PageText, String> {
-    let fonts = doc.get_page_fonts(page_id).map_err(|e| format!("{e}"))?;
-    let has_fonts = !fonts.is_empty();
+    chain: &[&Dictionary],
+    ops: &[Operation],
+    out: &mut String,
+    text_ops_seen: &mut bool,
+    form_path: &mut Vec<ObjectId>,
+) {
+    let mut fonts: BTreeMap<Vec<u8>, &Dictionary> = BTreeMap::new();
+    collect_fonts(doc, chain, &mut fonts);
     let codecs: Vec<(Vec<u8>, Codec)> = fonts
         .iter()
         .filter_map(|(name, fd)| resolve_codec(doc, fd).map(|c| (name.clone(), c)))
         .collect();
 
-    let content: Content<Vec<Operation>> = doc
-        .get_and_decode_page_content(page_id)
-        .map_err(|e| format!("{e}"))?;
-
-    // Glyph-positioned pages (one glyph per text object with absolute
-    // coordinates, e.g. LibreOffice forms) need a geometry engine — word
-    // boundaries are encoded as inter-glyph gaps, not as space glyphs, and the
-    // content stream is not in reading order. Delegate those to `layout`.
-    //
-    // Signature: `TJ` arrays only (no plain `Tj` strings) **and** per-glyph
-    // `TD` positioning. Docs that use `Tm` with multi-string `TJ` arrays
-    // (e.g. some Enedis bills) still extract correctly through the string
-    // walker, so they must not be re-routed.
-    //
-    // Table recovery is the exception: Enedis-style notes place every cell
-    // (and every word) at an absolute `Tm` position, so the geometry engine
-    // can reconstruct their grids while the string walker flattens them. When
-    // `detect_tables` is on we therefore also route `TJ`-only pages that
-    // position with `Tm` (no `TD` needed) through the geometry engine, which
-    // recovers reading order *and* Stage-3 grids. Without `detect_tables` the
-    // string walker is kept so table-less callers stay byte-identical.
-    let has_tj = content.operations.iter().any(|op| op.operator == "TJ");
-    let has_tj_plain = content.operations.iter().any(|op| op.operator == "Tj");
-    let has_td = content.operations.iter().any(|op| op.operator == "TD");
-    let has_tm = content.operations.iter().any(|op| op.operator == "Tm");
-    let route_to_layout = if detect_tables {
-        (has_tj || has_tj_plain) && (has_td || has_tm)
-    } else {
-        has_tj && !has_tj_plain && has_td
-    };
-    if route_to_layout {
-        return crate::layout::extract_page_glyphs(doc, page_id, detect_tables, detect_layout, detect_math);
-    }
-
-    let mut out = String::new();
     let mut cur: Option<usize> = None;
-    let mut text_ops_seen = false;
 
     // Position-aware reconstruction for "absolute" layout producers (form
     // generators, table tools, print drivers) that place one glyph per block
@@ -673,9 +781,8 @@ fn extract_page(
     // relative `Td` moves (EDF/Enedis, tickets, books) keep the simple
     // heuristic — spaces come from the strings, line breaks from `ET`/`T*` — so
     // coordinate noise never breaks them.
-    let has_tj_array = content.operations.iter().any(|op| op.operator == "TJ");
-    let has_abs_pos = content
-        .operations
+    let has_tj_array = ops.iter().any(|op| op.operator == "TJ");
+    let has_abs_pos = ops
         .iter()
         .any(|op| matches!(op.operator.as_str(), "Tm" | "TD"));
     let pos_mode = has_tj_array && has_abs_pos;
@@ -728,7 +835,7 @@ fn extract_page(
         }
     }
 
-    for op in &content.operations {
+    for op in ops {
         match op.operator.as_str() {
             "Tf" => {
                 let name = op.operands.first().and_then(|o| o.as_name().ok());
@@ -742,7 +849,7 @@ fn extract_page(
                 // case a vertical move is a line advance even when the
                 // producer emits no `ET`/`T*` between the lines (see `Td`).
                 if !pos_mode && td_advances_line(op) {
-                    break_line(&mut out);
+                    break_line(out);
                 }
                 cur_pos = pos2(op, 0);
             }
@@ -754,14 +861,14 @@ fn extract_page(
                 // single paragraph with doubled spaces between the four
                 // source lines.
                 if !pos_mode && td_advances_line(op) {
-                    break_line(&mut out);
+                    break_line(out);
                 }
             }
             "Tj" => {
-                text_ops_seen = true;
+                *text_ops_seen = true;
                 if let Some(ci) = cur {
                     show_pos(
-                        &mut out,
+                        out,
                         &codecs[ci].1,
                         &op.operands,
                         pos_mode,
@@ -774,10 +881,10 @@ fn extract_page(
                 }
             }
             "TJ" => {
-                text_ops_seen = true;
+                *text_ops_seen = true;
                 if let Some(ci) = cur {
                     show_pos(
-                        &mut out,
+                        out,
                         &codecs[ci].1,
                         &op.operands,
                         pos_mode,
@@ -790,24 +897,24 @@ fn extract_page(
                 }
             }
             "'" => {
-                text_ops_seen = true;
+                *text_ops_seen = true;
                 last_pos_show = false;
-                if !ends_with_ws(&out) {
+                if !ends_with_ws(out) {
                     out.push('\n');
                 }
                 if let Some(ci) = cur {
-                    show_text(&mut out, &codecs[ci].1, &op.operands);
+                    show_text(out, &codecs[ci].1, &op.operands);
                 }
             }
             "\"" => {
-                text_ops_seen = true;
+                *text_ops_seen = true;
                 last_pos_show = false;
-                if !ends_with_ws(&out) {
+                if !ends_with_ws(out) {
                     out.push('\n');
                 }
                 if let Some(ci) = cur {
                     if let Some(s) = op.operands.get(2) {
-                        show_text(&mut out, &codecs[ci].1, std::slice::from_ref(s));
+                        show_text(out, &codecs[ci].1, std::slice::from_ref(s));
                     }
                 }
             }
@@ -815,16 +922,108 @@ fn extract_page(
             // previous show was a positionally-placed glyph, the y-jump already
             // produced the break; suppress the extra newline.
             "T*" | "ET" => {
-                if !last_pos_show && !ends_with_ws(&out) {
+                if !last_pos_show && !ends_with_ws(out) {
                     out.push('\n');
                 }
                 if op.operator.as_str() == "T*" {
                     prev_pos = None;
                 }
             }
+            // Form XObject text: pages whose only content is `/x Do` (some
+            // payslip/invoice generators) would otherwise extract nothing.
+            "Do" => {
+                if form_path.len() >= 8 {
+                    continue;
+                }
+                let Some(name) = op.operands.first().and_then(|o| o.as_name().ok()) else {
+                    continue;
+                };
+                let Some((id, form)) = lookup_form(doc, chain, name) else {
+                    continue;
+                };
+                // A form already on the current path draws itself (directly or
+                // through a chain); the depth cap alone would still terminate,
+                // but this stops the wasted re-walk.
+                if id.map_or(false, |id| form_path.contains(&id)) {
+                    continue;
+                }
+                let fchain = form_resource_chain(doc, &form.dict, chain);
+                let Ok(data) = form.get_plain_content_with_limit(16 << 20) else {
+                    continue;
+                };
+                let Ok(fc) = Content::decode(&data) else {
+                    continue;
+                };
+                if let Some(id) = id {
+                    form_path.push(id);
+                }
+                walk_content(doc, &fchain, &fc.operations, out, text_ops_seen, form_path);
+                if id.is_some() {
+                    form_path.pop();
+                }
+            }
             _ => {}
         }
     }
+}
+
+fn extract_page(
+    doc: &Document,
+    page_id: ObjectId,
+    detect_tables: bool,
+    detect_layout: bool,
+    detect_math: bool,
+) -> Result<PageText, String> {
+    let chain = resource_dicts(doc, page_id);
+    let mut fonts: BTreeMap<Vec<u8>, &Dictionary> = BTreeMap::new();
+    collect_fonts(doc, &chain, &mut fonts);
+    let has_fonts = !fonts.is_empty();
+
+    let content: Content<Vec<Operation>> = doc
+        .get_and_decode_page_content(page_id)
+        .map_err(|e| format!("{e}"))?;
+
+    // Glyph-positioned pages (one glyph per text object with absolute
+    // coordinates, e.g. LibreOffice forms) need a geometry engine — word
+    // boundaries are encoded as inter-glyph gaps, not as space glyphs, and the
+    // content stream is not in reading order. Delegate those to `layout`.
+    //
+    // Signature: `TJ` arrays only (no plain `Tj` strings) **and** per-glyph
+    // `TD` positioning. Docs that use `Tm` with multi-string `TJ` arrays
+    // (e.g. some Enedis bills) still extract correctly through the string
+    // walker, so they must not be re-routed.
+    //
+    // Table recovery is the exception: Enedis-style notes place every cell
+    // (and every word) at an absolute `Tm` position, so the geometry engine
+    // can reconstruct their grids while the string walker flattens them. When
+    // `detect_tables` is on we therefore also route `TJ`-only pages that
+    // position with `Tm` (no `TD` needed) through the geometry engine, which
+    // recovers reading order *and* Stage-3 grids. Without `detect_tables` the
+    // string walker is kept so table-less callers stay byte-identical.
+    let has_tj = content.operations.iter().any(|op| op.operator == "TJ");
+    let has_tj_plain = content.operations.iter().any(|op| op.operator == "Tj");
+    let has_td = content.operations.iter().any(|op| op.operator == "TD");
+    let has_tm = content.operations.iter().any(|op| op.operator == "Tm");
+    let route_to_layout = if detect_tables {
+        (has_tj || has_tj_plain) && (has_td || has_tm)
+    } else {
+        has_tj && !has_tj_plain && has_td
+    };
+    if route_to_layout {
+        return crate::layout::extract_page_glyphs(doc, page_id, detect_tables, detect_layout, detect_math);
+    }
+
+    let mut out = String::new();
+    let mut text_ops_seen = false;
+    let mut form_path: Vec<ObjectId> = Vec::new();
+    walk_content(
+        doc,
+        &chain,
+        &content.operations,
+        &mut out,
+        &mut text_ops_seen,
+        &mut form_path,
+    );
 
     Ok(PageText {
         text: out.trim_end().to_string(),
@@ -934,6 +1133,64 @@ mod tests {
         let mut s = String::new();
         codec.decode(&[0x57], &mut s);
         assert_eq!(s, "W");
+    }
+
+    #[test]
+    fn unic_prefixed_differences_map_to_unicode() {
+        // BNP Paribas Type3 statements name every glyph `/UNIC00E9`, a prefix
+        // the AGL does not know. Without this the /Differences resolve to
+        // nothing and all 859 characters of the statement are dropped.
+        assert_eq!(glyph_unicode(b"UNIC00E9"), Some(0xE9));
+        assert_eq!(glyph_unicode(b"unic0041"), Some(0x41));
+        assert_eq!(glyph_unicode(b"UNKNOWN1"), None);
+
+        let mut enc = Dictionary::new();
+        enc.set(b"Type", Object::Name(b"Encoding".to_vec()));
+        enc.set(
+            b"Differences",
+            Object::Array(vec![
+                Object::Integer(65),
+                Object::Name(b"UNIC0041".to_vec()),
+                Object::Name(b"UNIC0042".to_vec()),
+            ]),
+        );
+        let mut font = Dictionary::new();
+        font.set(b"Subtype", Object::Name(b"Type3".to_vec()));
+        font.set(b"Encoding", Object::Dictionary(enc));
+        let doc = Document::new();
+        let codec = resolve_codec(&doc, &font).expect("Type3 with UNIC differences resolves");
+        let mut s = String::new();
+        codec.decode(&[65, 66], &mut s);
+        assert_eq!(s, "AB");
+    }
+
+    #[test]
+    fn symbolic_latin_face_falls_back_but_dingbats_do_not() {
+        // Subset CFF/Type1 text faces routinely set the Symbolic flag while
+        // drawing StandardEncoding-compatible bytes (Bouygues bills). Decoding
+        // them through the Latin table recovers the document; a genuine dingbat
+        // face must stay unmapped so it still escalates.
+        let mut fd = Dictionary::new();
+        fd.set(b"Flags", 4);
+        let mut latin = Dictionary::new();
+        latin.set(b"Subtype", Object::Name(b"Type1".to_vec()));
+        latin.set(b"BaseFont", Object::Name(b"ABCDEF+ArialMT".to_vec()));
+        latin.set(b"FontDescriptor", Object::Dictionary(fd.clone()));
+        let doc = Document::new();
+        let codec =
+            resolve_codec(&doc, &latin).expect("a Latin face flagged Symbolic must resolve");
+        let mut s = String::new();
+        codec.decode(b"Bonjour", &mut s);
+        assert_eq!(s, "Bonjour");
+
+        let mut dingbat = Dictionary::new();
+        dingbat.set(b"Subtype", Object::Name(b"Type1".to_vec()));
+        dingbat.set(b"BaseFont", Object::Name(b"ABCDEF+Wingdings".to_vec()));
+        dingbat.set(b"FontDescriptor", Object::Dictionary(fd));
+        assert!(
+            resolve_codec(&doc, &dingbat).is_none(),
+            "a dingbat face must not be decoded as Latin text"
+        );
     }
 
     #[test]

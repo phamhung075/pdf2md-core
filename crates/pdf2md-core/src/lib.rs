@@ -37,6 +37,16 @@ pub use models::{
 
 use crate::time::MonoClock;
 
+/// Largest decompressed size any single stream may reach during load or object
+/// stream recovery. A tiny Flate stream can inflate without bound (a
+/// "decompression bomb"); object/xref streams in real documents are tiny
+/// dictionaries, so 16 MiB is orders of magnitude above any legitimate value.
+const MAX_DECOMPRESSED_STREAM: usize = 16 << 20;
+/// Total decompression budget for all object streams recovered in one document.
+const MAX_OBJSTM_TOTAL: usize = 64 << 20;
+/// Upper bound on how many object streams are examined in one document.
+const MAX_OBJSTM_STREAMS: usize = 256;
+
 /// Loads a PDF with lopdf, transparently repairing a classic cross-reference
 /// table whose `startxref` pointer and/or per-object byte offsets are stale.
 ///
@@ -46,18 +56,146 @@ use crate::time::MonoClock;
 /// the whole load with `invalid file trailer`, even though MuPDF, browsers and
 /// every other reader open the file. This is a fallback only: a well-formed
 /// document is loaded on the first, unmodified attempt.
+///
+/// All loads decode object/xref streams with [`lopdf::LoadOptions::max_decompressed_size`]
+/// so a crafted object stream cannot allocate unbounded memory before our code
+/// runs; a stream over the cap is skipped by lopdf instead of failing the load.
 fn load_pdf_document(bytes: &[u8]) -> Result<lopdf::Document, String> {
-    match lopdf::Document::load_mem(bytes) {
-        Ok(doc) => Ok(doc),
+    match load_bounded(bytes) {
+        Ok(doc) => Ok(recover_object_streams(doc)),
         Err(first_err) => {
+            // Recovery 1: some producers pad the file with bytes after `%%EOF`
+            // (fixed-size host buffers), which pushes the marker outside the
+            // last-512-byte window lopdf scans for `startxref` and makes the
+            // otherwise-valid classic xref unreadable (`invalid start value`).
+            if let Some(trimmed) = truncate_after_last_eof(bytes) {
+                if let Ok(doc) = load_bounded(&trimmed) {
+                    return Ok(recover_object_streams(doc));
+                }
+                if let Some(repaired) = repair_classic_xref(&trimmed) {
+                    if let Ok(doc) = load_bounded(&repaired) {
+                        return Ok(recover_object_streams(doc));
+                    }
+                }
+            }
+            // Recovery 2: the existing repair for a classic xref whose declared
+            // offsets drifted.
             if let Some(repaired) = repair_classic_xref(bytes) {
-                if let Ok(doc) = lopdf::Document::load_mem(&repaired) {
-                    return Ok(doc);
+                if let Ok(doc) = load_bounded(&repaired) {
+                    return Ok(recover_object_streams(doc));
                 }
             }
             Err(format!("lopdf parsing error: {}", first_err))
         }
     }
+}
+
+/// [`lopdf::Document::load_mem`] with the decompression-bomb cap applied.
+fn load_bounded(bytes: &[u8]) -> Result<lopdf::Document, lopdf::Error> {
+    lopdf::Document::load_mem_with_options(
+        bytes,
+        lopdf::LoadOptions::with_max_decompressed_size(MAX_DECOMPRESSED_STREAM),
+    )
+}
+
+/// Returns `bytes` truncated just past the last `%%EOF` marker, or `None` when
+/// there is nothing to trim (well-formed file) or no marker at all.
+fn truncate_after_last_eof(bytes: &[u8]) -> Option<Vec<u8>> {
+    let eof = find_last(bytes, b"%%EOF")?;
+    let end = eof + b"%%EOF".len();
+    if end >= bytes.len() {
+        return None;
+    }
+    Some(bytes[..end].to_vec())
+}
+
+/// lopdf expands `/Type /ObjStm` object streams by parsing each embedded object
+/// with a parser that does not skip `%` comments. A number of real producers
+/// separate the embedded objects with `% N G` comment lines (ORNIKAR CGV), so
+/// every compressed object fails to parse and the page tree root disappears —
+/// `get_pages()` returns empty even though the file is valid. When that happens,
+/// decompress each object stream, blank those line-leading comments in place,
+/// and re-parse it ourselves, folding the recovered objects into the document.
+/// Only invoked when the normal load produced no pages. Each stream is decoded
+/// under a size cap, with a total budget and a stream cap for the pass, so a
+/// decompression bomb is skipped instead of exhausting memory.
+fn recover_object_streams(mut doc: lopdf::Document) -> lopdf::Document {
+    if !doc.get_pages().is_empty() {
+        return doc;
+    }
+    let streams: Vec<lopdf::ObjectId> = doc
+        .objects
+        .iter()
+        .filter_map(|(id, object)| match object {
+            lopdf::Object::Stream(stream)
+                if crate::text_extract::get_name(&stream.dict, b"Type") == Some(b"ObjStm") =>
+            {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .take(MAX_OBJSTM_STREAMS)
+        .collect();
+    if streams.is_empty() {
+        return doc;
+    }
+    let mut recovered: Vec<(lopdf::ObjectId, lopdf::Object)> = Vec::new();
+    // Bound the whole recovery pass: a document can hold many object streams, so
+    // cap both how much each one may expand and how much is decoded in total. A
+    // stream over its budget is skipped rather than failing the conversion.
+    let mut budget = MAX_OBJSTM_TOTAL;
+    for id in streams {
+        if budget == 0 {
+            break;
+        }
+        let Some(lopdf::Object::Stream(stream)) = doc.objects.get_mut(&id) else {
+            continue;
+        };
+        let Ok(mut content) =
+            stream.decompressed_content_with_limit(budget.min(MAX_DECOMPRESSED_STREAM))
+        else {
+            continue;
+        };
+        budget = budget.saturating_sub(content.len());
+        if !blank_line_comments(&mut content) {
+            continue;
+        }
+        // Re-parse the now comment-free bytes directly: drop the filter so
+        // `ObjectStream` does not try to decompress the plain content again.
+        stream.dict.remove(b"Filter");
+        stream.dict.remove(b"DecodeParms");
+        stream.set_content(content);
+        if let Ok(object_stream) = lopdf::ObjectStream::new(stream) {
+            recovered.extend(object_stream.objects);
+        }
+    }
+    for (id, object) in recovered {
+        doc.objects.entry(id).or_insert(object);
+    }
+    doc
+}
+
+/// Blank PDF comments (`%` to end of line) that start a line, preserving the
+/// byte length so nothing else has to be re-offset. Returns whether anything
+/// changed.
+fn blank_line_comments(content: &mut [u8]) -> bool {
+    let mut at_line_start = true;
+    let mut changed = false;
+    let mut i = 0;
+    while i < content.len() {
+        let byte = content[i];
+        if at_line_start && byte == b'%' {
+            while i < content.len() && content[i] != b'\n' && content[i] != b'\r' {
+                content[i] = b' ';
+                i += 1;
+            }
+            changed = true;
+            continue;
+        }
+        at_line_start = matches!(byte, b'\n' | b'\r' | b' ');
+        i += 1;
+    }
+    changed
 }
 
 /// Rebuilds a classic cross-reference table from the actual `N G obj` headers
@@ -203,6 +341,78 @@ fn parse_object_header(bytes: &[u8], space: usize) -> Option<(u32, usize)> {
     Some((num, k))
 }
 
+/// True when a page (or a Form XObject it draws, recursively) references fonts
+/// or issues a text-show operator. This is what makes a page "digital" for
+/// routing; it must resolve inherited `/Resources` and descend into forms.
+fn page_has_text_layer(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> bool {
+    let chain = text_extract::resource_dicts(doc, page_id);
+    let mut fonts = std::collections::BTreeMap::new();
+    text_extract::collect_fonts(doc, &chain, &mut fonts);
+    if !fonts.is_empty() {
+        return true;
+    }
+    let Ok(content) = doc.get_and_decode_page_content(page_id) else {
+        return false;
+    };
+    content_has_text_layer(doc, &chain, &content.operations, &mut Vec::new())
+}
+
+fn content_has_text_layer(
+    doc: &lopdf::Document,
+    chain: &[&lopdf::Dictionary],
+    ops: &[lopdf::content::Operation],
+    form_path: &mut Vec<lopdf::ObjectId>,
+) -> bool {
+    if ops
+        .iter()
+        .any(|op| matches!(op.operator.as_str(), "Tj" | "TJ" | "'" | "\""))
+    {
+        return true;
+    }
+    if form_path.len() >= 8 {
+        return false;
+    }
+    for op in ops {
+        if op.operator != "Do" {
+            continue;
+        }
+        let Some(name) = op.operands.first().and_then(|o| o.as_name().ok()) else {
+            continue;
+        };
+        let Some((id, form)) = text_extract::lookup_form(doc, chain, name) else {
+            continue;
+        };
+        // A form already on the current path draws itself (directly or through
+        // a chain); stop instead of recursing.
+        if id.map_or(false, |id| form_path.contains(&id)) {
+            continue;
+        }
+        let fchain = text_extract::form_resource_chain(doc, &form.dict, chain);
+        let mut fonts = std::collections::BTreeMap::new();
+        text_extract::collect_fonts(doc, &fchain, &mut fonts);
+        if !fonts.is_empty() {
+            return true;
+        }
+        if let Some(id) = id {
+            form_path.push(id);
+        }
+        let found = form
+            .get_plain_content_with_limit(16 << 20)
+            .ok()
+            .and_then(|data| lopdf::content::Content::decode(&data).ok())
+            .map_or(false, |fc| {
+                content_has_text_layer(doc, &fchain, &fc.operations, form_path)
+            });
+        if id.is_some() {
+            form_path.pop();
+        }
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
 /// Probes whether raw PDF bytes contain a digital text stream without full rendering.
 pub fn is_digital_pdf_bytes(bytes: &[u8]) -> bool {
     if bytes.len() < 32 || !bytes.starts_with(b"%PDF-") {
@@ -213,20 +423,12 @@ pub fn is_digital_pdf_bytes(bytes: &[u8]) -> bool {
     // string scan, this handles content streams that are FlateDecode-compressed
     // (where "BT"/"Tj" never appear in the raw bytes) — e.g. PDFCreator/
     // Ghostscript tickets and most modern PDFs. A page is "digital" if it
-    // references any font or issues any text-show operator.
+    // references any font (including one inherited from the /Pages tree) or
+    // issues any text-show operator, descending recursively into Form XObjects.
     if let Ok(doc) = load_pdf_document(bytes) {
         for (_page_num, page_id) in doc.get_pages() {
-            if doc.get_page_fonts(page_id).map_or(false, |f| !f.is_empty()) {
+            if page_has_text_layer(&doc, page_id) {
                 return true;
-            }
-            if let Ok(content) = doc.get_and_decode_page_content(page_id) {
-                if content
-                    .operations
-                    .iter()
-                    .any(|op| matches!(op.operator.as_str(), "Tj" | "TJ" | "'" | "\""))
-                {
-                    return true;
-                }
             }
         }
         return false;
@@ -644,7 +846,7 @@ pub fn convert_pdf_bytes_to_markdown(
                 Err(_) => text_extract::PageText {
                     text: doc.extract_text(&[page_num]).unwrap_or_default(),
                     text_ops_seen: true,
-                    has_fonts: doc.get_page_fonts(page_id).map_or(false, |f| !f.is_empty()),
+                    has_fonts: !text_extract::page_fonts(&doc, page_id).is_empty(),
                     tables: 0,
                     blocks: Vec::new(),
                 },
@@ -1686,5 +1888,377 @@ mod regression_tests {
 
         // A short line far away is not a caption either.
         assert!(!is_caption_block("unrelated body text", 3.0 * 12.0, 12.0));
+    }
+
+    /// Minimal Helvetica font dictionary shared by the synthetic builders.
+    fn helvetica_font(doc: &mut lopdf::Document) -> lopdf::ObjectId {
+        let mut font = lopdf::Dictionary::new();
+        font.set(b"Type", lopdf::Object::Name(b"Font".to_vec()));
+        font.set(b"Subtype", lopdf::Object::Name(b"Type1".to_vec()));
+        font.set(b"BaseFont", lopdf::Object::Name(b"Helvetica".to_vec()));
+        font.set(b"Encoding", lopdf::Object::Name(b"WinAnsiEncoding".to_vec()));
+        doc.add_object(lopdf::Object::Dictionary(font))
+    }
+
+    fn finish_catalog(
+        doc: &mut lopdf::Document,
+        pages_id: lopdf::ObjectId,
+    ) -> Vec<u8> {
+        let mut catalog = lopdf::Dictionary::new();
+        catalog.set(b"Type", lopdf::Object::Name(b"Catalog".to_vec()));
+        catalog.set(b"Pages", lopdf::Object::Reference(pages_id));
+        let catalog_id = doc.add_object(lopdf::Object::Dictionary(catalog));
+        doc.trailer.set(b"Root", lopdf::Object::Reference(catalog_id));
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).expect("save synthetic pdf");
+        bytes
+    }
+
+    /// One page whose `/Resources` live inline on the `/Pages` parent, not on
+    /// the page object (the QZP payslip shape). lopdf 0.44's
+    /// `get_page_fonts` only collects inherited resources that are *indirect*
+    /// references, so it returns zero fonts here; our own resolver must still
+    /// decode the text instead of dropping every `Tj`.
+    fn inherited_inline_resources_pdf() -> Vec<u8> {
+        let mut doc = lopdf::Document::new();
+        let font_id = helvetica_font(&mut doc);
+        let content = b"BT /F1 12 Tf 40 120 Td (Inherited Resource Text) Tj ET".to_vec();
+        let content_id = doc.add_object(lopdf::Object::Stream(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            content,
+        )));
+
+        let mut pages = lopdf::Dictionary::new();
+        pages.set(b"Type", lopdf::Object::Name(b"Pages".to_vec()));
+        pages.set(b"Kids", lopdf::Object::Array(Vec::new()));
+        pages.set(b"Count", lopdf::Object::Integer(1));
+        let pages_id = doc.add_object(lopdf::Object::Dictionary(pages));
+
+        let mut page = lopdf::Dictionary::new();
+        page.set(b"Type", lopdf::Object::Name(b"Page".to_vec()));
+        page.set(b"Parent", lopdf::Object::Reference(pages_id));
+        page.set(
+            b"MediaBox",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(595),
+                lopdf::Object::Integer(842),
+            ]),
+        );
+        page.set(b"Contents", lopdf::Object::Reference(content_id));
+        let page_id = doc.add_object(lopdf::Object::Dictionary(page));
+
+        let mut font_res = lopdf::Dictionary::new();
+        font_res.set(b"F1", lopdf::Object::Reference(font_id));
+        let mut resources = lopdf::Dictionary::new();
+        resources.set(b"Font", lopdf::Object::Dictionary(font_res));
+        // The Resources belong to the /Pages node only.
+        let pages = doc
+            .get_object_mut(pages_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap();
+        pages.set(
+            b"Kids",
+            lopdf::Object::Array(vec![lopdf::Object::Reference(page_id)]),
+        );
+        pages.set(b"Resources", lopdf::Object::Dictionary(resources));
+        finish_catalog(&mut doc, pages_id)
+    }
+
+    #[test]
+    fn inline_resources_inherited_from_pages_are_resolved() {
+        let bytes = inherited_inline_resources_pdf();
+        // Documenting the root cause: the stock lopdf resolver misses the
+        // inline ancestor dictionary, so without our fix no codec resolves.
+        let stock = lopdf::Document::load_mem(&bytes).unwrap();
+        let page_id = *stock.get_pages().values().next().unwrap();
+        assert_eq!(
+            stock.get_page_fonts(page_id).map(|f| f.len()).unwrap_or(0),
+            0,
+            "premise: lopdf must miss inline /Pages resources for this regression to matter"
+        );
+
+        assert!(is_digital_pdf_bytes(&bytes));
+        let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
+            .expect("text must decode once inherited resources resolve");
+        assert!(
+            res.markdown.contains("Inherited Resource Text"),
+            "got: {}",
+            res.markdown
+        );
+    }
+
+    /// One page whose content is only `/Fm0 Do`, with the text and fonts inside
+    /// the Form XObject — the Bouygues/payslip shape that was classified as
+    /// scanned because neither detection nor extraction looked inside the form.
+    fn form_xobject_text_pdf() -> Vec<u8> {
+        let mut doc = lopdf::Document::new();
+        let font_id = helvetica_font(&mut doc);
+
+        let mut form_fonts = lopdf::Dictionary::new();
+        form_fonts.set(b"F1", lopdf::Object::Reference(font_id));
+        let mut form_res = lopdf::Dictionary::new();
+        form_res.set(b"Font", lopdf::Object::Dictionary(form_fonts));
+        let mut form_dict = lopdf::Dictionary::new();
+        form_dict.set(b"Type", lopdf::Object::Name(b"XObject".to_vec()));
+        form_dict.set(b"Subtype", lopdf::Object::Name(b"Form".to_vec()));
+        form_dict.set(b"Resources", lopdf::Object::Dictionary(form_res));
+        form_dict.set(
+            b"BBox",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(595),
+                lopdf::Object::Integer(842),
+            ]),
+        );
+        let form_content = b"BT /F1 12 Tf 40 120 Td (Form XObject Text) Tj ET".to_vec();
+        let form_id = doc.add_object(lopdf::Object::Stream(lopdf::Stream::new(
+            form_dict,
+            form_content,
+        )));
+
+        let page_content = b"q /Fm0 Do Q".to_vec();
+        let content_id = doc.add_object(lopdf::Object::Stream(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            page_content,
+        )));
+
+        let mut pages = lopdf::Dictionary::new();
+        pages.set(b"Type", lopdf::Object::Name(b"Pages".to_vec()));
+        pages.set(b"Kids", lopdf::Object::Array(Vec::new()));
+        pages.set(b"Count", lopdf::Object::Integer(1));
+        let pages_id = doc.add_object(lopdf::Object::Dictionary(pages));
+
+        let mut xobjects = lopdf::Dictionary::new();
+        xobjects.set(b"Fm0", lopdf::Object::Reference(form_id));
+        let mut page_res = lopdf::Dictionary::new();
+        page_res.set(b"XObject", lopdf::Object::Dictionary(xobjects));
+        let mut page = lopdf::Dictionary::new();
+        page.set(b"Type", lopdf::Object::Name(b"Page".to_vec()));
+        page.set(b"Parent", lopdf::Object::Reference(pages_id));
+        page.set(
+            b"MediaBox",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(595),
+                lopdf::Object::Integer(842),
+            ]),
+        );
+        page.set(b"Resources", lopdf::Object::Dictionary(page_res));
+        page.set(b"Contents", lopdf::Object::Reference(content_id));
+        let page_id = doc.add_object(lopdf::Object::Dictionary(page));
+        doc.get_object_mut(pages_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set(
+                b"Kids",
+                lopdf::Object::Array(vec![lopdf::Object::Reference(page_id)]),
+            );
+        finish_catalog(&mut doc, pages_id)
+    }
+
+    #[test]
+    fn text_inside_form_xobjects_is_detected_and_extracted() {
+        let bytes = form_xobject_text_pdf();
+        assert!(
+            is_digital_pdf_bytes(&bytes),
+            "a page whose only text lives in a Form XObject must classify as digital"
+        );
+        let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
+            .expect("Form XObject text must be extracted");
+        assert!(res.markdown.contains("Form XObject Text"), "got: {}", res.markdown);
+    }
+
+    #[test]
+    fn trailing_bytes_after_eof_do_not_defeat_loading() {
+        let mut padded = inherited_inline_resources_pdf();
+        // Host buffers pad files with NULs; once the tail exceeds lopdf's
+        // last-512-byte `startxref` window the classic xref is unreadable.
+        padded.extend(std::iter::repeat(0u8).take(2048));
+        assert!(
+            lopdf::Document::load_mem(&padded).is_err(),
+            "premise: the padded file must fail the stock loader"
+        );
+        let doc = load_pdf_document(&padded).expect("recovery must trim past %%EOF");
+        assert_eq!(doc.get_pages().len(), 1);
+        assert!(is_digital_pdf_bytes(&padded));
+    }
+
+    #[test]
+    fn objstm_objects_separated_by_comments_are_recovered() {
+        // lopdf parses ObjStm entries with a parser that does not skip `%`
+        // comments; real producers (ORNIKAR CGV) prefix every embedded object
+        // with `% N G`, so the whole page tree vanishes. The recovery blanks
+        // those comments and re-parses.
+        let index = b"3 0 4 36\n";
+        let mut content = index.to_vec();
+        content.extend_from_slice(b"% 3 0\n<< /Type /Pages /Count 0 >>\n");
+        content.extend_from_slice(b"% 4 0\n<< /Type /Catalog >>\n");
+        let mut dict = lopdf::Dictionary::new();
+        dict.set(b"Type", lopdf::Object::Name(b"ObjStm".to_vec()));
+        dict.set(b"N", lopdf::Object::Integer(2));
+        dict.set(b"First", lopdf::Object::Integer(index.len() as i64));
+        let mut doc = lopdf::Document::new();
+        doc.add_object(lopdf::Object::Stream(lopdf::Stream::new(dict, content)));
+        // Premise: without the recovery, the comment-prefixed objects are lost.
+        assert!(!doc.objects.contains_key(&(3, 0)));
+        let doc = recover_object_streams(doc);
+        assert!(
+            doc.objects.contains_key(&(3, 0)),
+            "comment-separated ObjStm objects must be recovered"
+        );
+        assert!(doc.objects.contains_key(&(4, 0)));
+    }
+
+    /// One page that draws a Form XObject which draws *itself* and then shows
+    /// text. The self-reference must not multiply the text or loop.
+    fn self_referential_form_pdf() -> Vec<u8> {
+        let mut doc = lopdf::Document::new();
+        let font_id = helvetica_font(&mut doc);
+
+        let form_content = b"q /Fm0 Do Q BT /F1 12 Tf 40 120 Td (Self Form Text) Tj ET".to_vec();
+        let mut form_dict = lopdf::Dictionary::new();
+        form_dict.set(b"Type", lopdf::Object::Name(b"XObject".to_vec()));
+        form_dict.set(b"Subtype", lopdf::Object::Name(b"Form".to_vec()));
+        form_dict.set(
+            b"BBox",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(595),
+                lopdf::Object::Integer(842),
+            ]),
+        );
+        let form_id = doc.add_object(lopdf::Object::Stream(lopdf::Stream::new(
+            form_dict,
+            form_content,
+        )));
+
+        // The form's own resources map /Fm0 back to itself plus its font.
+        let mut xobjects = lopdf::Dictionary::new();
+        xobjects.set(b"Fm0", lopdf::Object::Reference(form_id));
+        let mut fonts = lopdf::Dictionary::new();
+        fonts.set(b"F1", lopdf::Object::Reference(font_id));
+        let mut res = lopdf::Dictionary::new();
+        res.set(b"XObject", lopdf::Object::Dictionary(xobjects));
+        res.set(b"Font", lopdf::Object::Dictionary(fonts));
+        doc.get_object_mut(form_id)
+            .unwrap()
+            .as_stream_mut()
+            .unwrap()
+            .dict
+            .set(b"Resources", lopdf::Object::Dictionary(res));
+
+        let content_id = doc.add_object(lopdf::Object::Stream(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            b"q /Fm0 Do Q".to_vec(),
+        )));
+        let mut pages = lopdf::Dictionary::new();
+        pages.set(b"Type", lopdf::Object::Name(b"Pages".to_vec()));
+        pages.set(b"Kids", lopdf::Object::Array(Vec::new()));
+        pages.set(b"Count", lopdf::Object::Integer(1));
+        let pages_id = doc.add_object(lopdf::Object::Dictionary(pages));
+        let mut page_res = lopdf::Dictionary::new();
+        let mut page_xobjects = lopdf::Dictionary::new();
+        page_xobjects.set(b"Fm0", lopdf::Object::Reference(form_id));
+        page_res.set(b"XObject", lopdf::Object::Dictionary(page_xobjects));
+        let mut page = lopdf::Dictionary::new();
+        page.set(b"Type", lopdf::Object::Name(b"Page".to_vec()));
+        page.set(b"Parent", lopdf::Object::Reference(pages_id));
+        page.set(
+            b"MediaBox",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(595),
+                lopdf::Object::Integer(842),
+            ]),
+        );
+        page.set(b"Resources", lopdf::Object::Dictionary(page_res));
+        page.set(b"Contents", lopdf::Object::Reference(content_id));
+        let page_id = doc.add_object(lopdf::Object::Dictionary(page));
+        doc.get_object_mut(pages_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set(
+                b"Kids",
+                lopdf::Object::Array(vec![lopdf::Object::Reference(page_id)]),
+            );
+        finish_catalog(&mut doc, pages_id)
+    }
+
+    #[test]
+    fn self_referential_form_is_walked_once() {
+        let bytes = self_referential_form_pdf();
+        assert!(is_digital_pdf_bytes(&bytes));
+        let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
+            .expect("text after the self-reference must be extracted");
+        assert_eq!(
+            res.markdown.matches("Self Form Text").count(),
+            1,
+            "a form that draws itself must be entered once, got: {}",
+            res.markdown
+        );
+    }
+
+    #[test]
+    fn object_stream_bomb_is_rejected_without_inflating() {
+        use std::io::Write as _;
+
+        // A payload far above the per-stream cap that still compresses to a few
+        // KiB: the classic decompression-bomb shape. The first object is valid,
+        // so an unbounded decoder would recover it and allocate the whole 20 MiB.
+        let index = b"0 0 ";
+        let mut payload = index.to_vec();
+        payload.extend_from_slice(b"<< /Type /Pages /Kids [] /Count 1 >>");
+        payload.resize(MAX_DECOMPRESSED_STREAM + (4 << 20), b'A');
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&payload).unwrap();
+        let compressed = enc.finish().unwrap();
+        assert!(
+            compressed.len() < 64 * 1024,
+            "the bomb must be small on disk, got {} bytes",
+            compressed.len()
+        );
+
+        let mut dict = lopdf::Dictionary::new();
+        dict.set(b"Type", lopdf::Object::Name(b"ObjStm".to_vec()));
+        dict.set(b"N", lopdf::Object::Integer(1));
+        dict.set(b"First", lopdf::Object::Integer(index.len() as i64));
+        dict.set(b"Filter", lopdf::Object::Name(b"FlateDecode".to_vec()));
+
+        // Premise: the guard, not the data, is what keeps this finite.
+        let probe = lopdf::Stream::new(dict.clone(), compressed.clone());
+        assert!(
+            probe
+                .decompressed_content_with_limit(MAX_DECOMPRESSED_STREAM)
+                .is_err(),
+            "premise: the payload must exceed the per-stream cap"
+        );
+
+        let mut doc = lopdf::Document::new();
+        let mut pages = lopdf::Dictionary::new();
+        pages.set(b"Type", lopdf::Object::Name(b"Pages".to_vec()));
+        pages.set(b"Kids", lopdf::Object::Array(Vec::new()));
+        pages.set(b"Count", lopdf::Object::Integer(0));
+        let pages_id = doc.add_object(lopdf::Object::Dictionary(pages));
+        doc.add_object(lopdf::Object::Stream(lopdf::Stream::new(dict, compressed)));
+        let bytes = finish_catalog(&mut doc, pages_id);
+
+        let loaded = load_pdf_document(&bytes).expect("a bomb must not fail the load");
+        assert!(
+            loaded.get_pages().is_empty(),
+            "the bomb object stream must be skipped, not expanded"
+        );
+        assert!(
+            convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default()).is_err(),
+            "the bomb must fall through to the explicit no-text-layer error"
+        );
     }
 }
