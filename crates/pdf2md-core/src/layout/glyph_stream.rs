@@ -582,6 +582,30 @@ pub(crate) fn resolve_font_style(doc: &Document, font: &Dictionary) -> (bool, bo
     (is_bold, is_italic)
 }
 
+/// Fold the Latin presentation-form ligatures (U+FB00–U+FB06) to their letter
+/// sequences. A font's `/ToUnicode` map is allowed to return the ligature
+/// codepoint itself, so "fi scal" comes out as "ﬁ scal"; the ligature carries
+/// no meaning a reader wants and breaks text search, so normalise it on the
+/// way out. `advance` is measured from the raw glyph widths and is unaffected.
+fn fold_ligatures(s: &mut String) {
+    if !s.chars().any(|c| ('\u{FB00}'..='\u{FB06}').contains(&c)) {
+        return;
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\u{FB00}' => out.push_str("ff"),
+            '\u{FB01}' => out.push_str("fi"),
+            '\u{FB02}' => out.push_str("fl"),
+            '\u{FB03}' => out.push_str("ffi"),
+            '\u{FB04}' => out.push_str("ffl"),
+            '\u{FB05}' | '\u{FB06}' => out.push_str("st"),
+            _ => out.push(c),
+        }
+    }
+    *s = out;
+}
+
 /// Decode one string operand into a positioned span (or nothing if it decodes
 /// to no text). `em_offset` is a preceding TJ-array number in 1/1000 em units.
 pub(crate) fn push_span(
@@ -597,6 +621,7 @@ pub(crate) fn push_span(
 ) {
     let mut text = String::new();
     codec.decode(bytes, &mut text);
+    fold_ligatures(&mut text);
     if text.is_empty() {
         return;
     }
@@ -1993,5 +2018,15 @@ mod tests {
             body.ends_with(margin),
             "without layout analysis the legacy append must be preserved: {body:?}"
         );
+    }
+
+    /// A `/ToUnicode` map may return a Latin presentation-form ligature
+    /// (U+FB00–U+FB06); it must be folded to its letter sequence so the output
+    /// reads "fi scal", not "ﬁ scal".
+    #[test]
+    fn ligatures_fold_to_letter_sequences() {
+        let mut s = "Num\u{FB01} scal \u{FB00}ort \u{FB03}cient \u{FB02}eur".to_string();
+        fold_ligatures(&mut s);
+        assert_eq!(s, "Numfi scal ffort fficient fleur");
     }
 }

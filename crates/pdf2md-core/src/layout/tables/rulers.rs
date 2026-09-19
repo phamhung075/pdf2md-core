@@ -109,7 +109,43 @@ pub fn line_words(line: &[Span]) -> Vec<WordTok> {
         last_end = sp.x + sp.advance;
     }
     flush(&mut out, &mut text, &mut x0, last_end);
-    merge_value_symbol_tokens(out)
+    merge_value_symbol_tokens(merge_sign_tokens(out))
+}
+
+/// Fold a lone sign glyph back onto the number it prefixes ("-" + "93" →
+/// "-93"). A producer often draws the sign as its own run a few points left of
+/// the digits — a kerning gap wider than the word-space threshold in
+/// `line_words` — so the two become separate tokens, are bucketed into
+/// separate columns, and the sign is emitted in one cell while the digits land
+/// in the next ("- -" / "93<br>269"). Joining them keeps the value — and its
+/// sign — in one cell.
+///
+/// Only a token that is *exactly* a sign and is immediately followed by the
+/// line's final token is joined. That is the shape of a right-aligned signed
+/// amount at the end of a row; an inline separator inside a longer run
+/// ("022 735 - 3477 (service …)") is left untouched, as is a standalone dash
+/// cell or a text bullet.
+fn merge_sign_tokens(words: Vec<WordTok>) -> Vec<WordTok> {
+    let last = words.len().saturating_sub(1);
+    let mut out: Vec<WordTok> = Vec::with_capacity(words.len());
+    for (i, w) in words.into_iter().enumerate() {
+        if let Some(prev) = out.last_mut() {
+            let prev_is_sign = matches!(prev.text.as_str(), "-" | "−" | "+");
+            let starts_digit = w
+                .text
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false);
+            if i == last && prev_is_sign && starts_digit {
+                prev.text.push_str(&w.text);
+                prev.x1 = prev.x1.max(w.x1);
+                continue;
+            }
+        }
+        out.push(w);
+    }
+    out
 }
 
 /// A lone currency/percent symbol that a PDF producer emitted as its own glyph
@@ -599,7 +635,15 @@ fn scan_aligned_grids_opts(
                 let gap = lines[prev][0].y - lines[i][0].y;
                 let scale = info[prev].size.max(r.size);
                 let line_pitch = 1.2 * scale;
-                if gap >= 0.0 && (gap <= 3.8 * line_pitch || gap <= 38.0) {
+                // Never bridge a region another pass already claimed. A band
+                // that spans a previous hit's rows keeps only the rows around
+                // it, yet the resulting `TableHit` covers the whole contiguous
+                // line range — so the covered rows are neither in the hit's
+                // `rows` nor rendered as text. Split the band instead, leaving
+                // the previous hit in place.
+                let bridges_covered = (prev + 1..i)
+                    .any(|k| covered.iter().any(|h| h.start <= k && k <= h.end));
+                if !bridges_covered && gap >= 0.0 && (gap <= 3.8 * line_pitch || gap <= 38.0) {
                     band.push(i);
                 } else {
                     bands.push(vec![i]);
@@ -1633,5 +1677,61 @@ mod tests {
                 "distinct data rows were joined with <br>: {out:?}"
             );
         }
+    }
+
+    fn wt(text: &str, x0: f64, x1: f64) -> WordTok {
+        WordTok { text: text.to_string(), x0, x1 }
+    }
+
+    /// A sign drawn as its own run before the line's final amount must fold
+    /// onto it, so the deduction keeps its sign instead of splitting into a
+    /// lone "-" cell and a separate "93" cell.
+    #[test]
+    fn merge_sign_tokens_joins_trailing_signed_amount() {
+        let words = vec![wt("revenu", 0.0, 30.0), wt("-", 50.0, 53.0), wt("93", 86.0, 100.0)];
+        let out = merge_sign_tokens(words);
+        assert_eq!(out.len(), 2, "sign was not folded: {out:?}");
+        assert_eq!(out[1].text, "-93");
+    }
+
+    /// An inline hyphen inside a longer run ("022 735 - 3477 (service …)") is
+    /// not a signed trailing amount and must be left as drawn.
+    #[test]
+    fn merge_sign_tokens_leaves_inline_hyphen_alone() {
+        let words = vec![
+            wt("022", 0.0, 20.0),
+            wt("735", 22.0, 40.0),
+            wt("-", 42.0, 45.0),
+            wt("3477", 60.0, 80.0),
+            wt("(service", 82.0, 120.0),
+        ];
+        let out = merge_sign_tokens(words);
+        assert!(out.iter().any(|w| w.text == "-"), "inline hyphen was folded: {out:?}");
+        assert!(out.iter().any(|w| w.text == "3477"));
+    }
+
+    /// A later pass must not build a band that bridges rows another pass already
+    /// claimed: the resulting hit would report the whole contiguous line range
+    /// while omitting those covered rows, so `de_overlap_tables` would keep it
+    /// and silently drop the covered table's data.
+    #[test]
+    fn gap_band_does_not_bridge_a_covered_region() {
+        let lines = vec![
+            vec![sp_at("label", 0.0, 400.0, 40.0), sp_at("100", 200.0, 400.0, 25.0)],
+            vec![sp_at("covered", 0.0, 388.0, 60.0), sp_at("200", 200.0, 388.0, 25.0)],
+            vec![sp_at("covered2", 0.0, 376.0, 65.0), sp_at("300", 200.0, 376.0, 25.0)],
+            vec![sp_at("tail", 0.0, 364.0, 30.0), sp_at("400", 200.0, 364.0, 25.0)],
+        ];
+        let covered = vec![TableHit {
+            start: 1,
+            end: 2,
+            rows: Vec::new(),
+            bbox: BoundingBox::new(0.0, 0.0, 0.0, 0.0),
+        }];
+        let hits = scan_aligned_grids_opts(&lines, 2.0, &covered, false);
+        assert!(
+            hits.iter().all(|h| h.end < 1 || h.start > 2),
+            "a gap hit bridged the covered rows: {hits:?}"
+        );
     }
 }
