@@ -252,7 +252,11 @@ pub fn cut_page_region(doc: &Document, page_id: ObjectId, r: &InkBox) -> Option<
     if w < 1.0 || h < 1.0 {
         return None;
     }
-    let orig_content = d.get_page_content(page_id);
+    let Ok(orig_content) =
+        d.get_page_content_with_limit(page_id, crate::text_extract::MAX_PAGE_CONTENT_TOTAL)
+    else {
+        return None;
+    };
     if orig_content.is_empty() {
         return None;
     }
@@ -300,7 +304,7 @@ pub fn extract_page_vector_figures(
     page_bbox: Option<(f64, f64, f64, f64)>,
 ) -> Vec<MediaItem> {
     let xobjects = page_xobjects(doc, page_id).unwrap_or_default();
-    let Ok(content) = doc.get_and_decode_page_content(page_id) else {
+    let Ok(content) = crate::text_extract::decode_page_content(doc, page_id) else {
         return Vec::new();
     };
     let mut boxes: Vec<InkBox> = Vec::new();

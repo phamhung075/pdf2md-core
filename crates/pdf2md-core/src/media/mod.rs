@@ -12,6 +12,15 @@ pub use codecs::{b64encode, encode_png_rgba};
 pub use raster::extract_page_media;
 pub use vector::extract_page_vector_figures;
 
+/// Hard ceiling on a single decoded raster's pixel count (~16 Mi pixels ≈
+/// 64 MiB RGBA8). Independent of the `P2M_MAX_IMAGE_DIM` downscale target:
+/// this is the allocation guard a crafted `/Width`×`/Height` cannot exceed.
+pub(crate) const MAX_IMAGE_PIXELS: usize = 16 << 20;
+/// Hard ceiling on a single image stream's decoded sample bytes (64 MiB). A
+/// tiny Flate image stream that inflates past this is rejected before the
+/// RGBA conversion ever allocates its `pixel × 4` buffer.
+pub(crate) const MAX_IMAGE_SAMPLES: usize = 64 << 20;
+
 use serde::{Deserialize, Serialize};
 
 /// Role guess for an extracted placement.

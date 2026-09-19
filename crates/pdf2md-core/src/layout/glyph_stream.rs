@@ -993,8 +993,7 @@ pub fn extract_page_glyphs(
         }
     }
 
-    let content: Content<Vec<Operation>> = doc
-        .get_and_decode_page_content(page_id)
+    let content: Content<Vec<Operation>> = crate::text_extract::decode_page_content(doc, page_id)
         .map_err(|e| e.to_string())?;
 
     let (init_ctm, page_height) = page_initial_transform(doc, page_id);

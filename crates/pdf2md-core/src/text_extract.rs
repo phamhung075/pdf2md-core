@@ -967,6 +967,57 @@ fn walk_content(
     }
 }
 
+/// Largest decoded size of a single page content stream (32 MiB). A content
+/// stream is a short list of drawing/text operators — orders of magnitude
+/// smaller in any real document — so a stream that inflates past this is a
+/// decompression bomb, not content we can use.
+pub(crate) const MAX_PAGE_CONTENT_STREAM: usize = 32 << 20;
+/// Largest total decoded content of one page (64 MiB), summed over its streams.
+pub(crate) const MAX_PAGE_CONTENT_TOTAL: usize = 64 << 20;
+
+/// Decode a page's content streams under explicit decompression caps.
+///
+/// Bounded replacement for `Document::get_and_decode_page_content`, whose
+/// single-stream decode is unbounded: a ~1 MiB Flate page stream can inflate to
+/// gigabytes. A page over either cap is rejected with a decompression error —
+/// the callers already treat an undecodable page as "no text" — never truncated
+/// mid-operator into garbage. A stream that fails for any other reason keeps
+/// lopdf's lenient fallback to its raw bytes, still within the page budget.
+pub(crate) fn decode_page_content(
+    doc: &Document,
+    page_id: ObjectId,
+) -> lopdf::Result<Content<Vec<Operation>>> {
+    let limit_err = || {
+        lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded {
+            limit: MAX_PAGE_CONTENT_TOTAL,
+        })
+    };
+    let mut data = Vec::new();
+    for object_id in doc.get_page_contents(page_id) {
+        let Ok(stream) = doc.get_object(object_id).and_then(Object::as_stream) else {
+            continue;
+        };
+        let remaining = MAX_PAGE_CONTENT_TOTAL.saturating_sub(data.len());
+        let budget = remaining.min(MAX_PAGE_CONTENT_STREAM);
+        match stream.get_plain_content_with_limit(budget) {
+            Ok(bytes) => data.extend_from_slice(&bytes),
+            Err(lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded {
+                ..
+            })) => {
+                return Err(limit_err());
+            }
+            Err(_) => {
+                if stream.content.len() > budget {
+                    return Err(limit_err());
+                }
+                data.extend_from_slice(&stream.content);
+            }
+        }
+        data.push(b'\n');
+    }
+    Content::decode(&data)
+}
+
 fn extract_page(
     doc: &Document,
     page_id: ObjectId,
@@ -979,9 +1030,8 @@ fn extract_page(
     collect_fonts(doc, &chain, &mut fonts);
     let has_fonts = !fonts.is_empty();
 
-    let content: Content<Vec<Operation>> = doc
-        .get_and_decode_page_content(page_id)
-        .map_err(|e| format!("{e}"))?;
+    let content: Content<Vec<Operation>> =
+        decode_page_content(doc, page_id).map_err(|e| format!("{e}"))?;
 
     // Glyph-positioned pages (one glyph per text object with absolute
     // coordinates, e.g. LibreOffice forms) need a geometry engine — word

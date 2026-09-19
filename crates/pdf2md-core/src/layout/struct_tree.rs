@@ -446,11 +446,11 @@ fn extract_marked_content(doc: &Document, page_id: ObjectId) -> HashMap<usize, M
     if fonts_info.is_empty() {
         return map;
     }
-    let content = match doc.get_and_decode_page_content(page_id) {
+    let content = match crate::text_extract::decode_page_content(doc, page_id) {
         Ok(c) => c,
         Err(e) => {
             if std::env::var("PDF2MD_STRUCT_DEBUG").is_ok() {
-                eprintln!("[struct] get_and_decode_page_content error: {:?}", e);
+                eprintln!("[struct] decode_page_content error: {:?}", e);
             }
             return map;
         }

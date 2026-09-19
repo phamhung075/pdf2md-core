@@ -122,7 +122,7 @@ pub fn page_dominant_raster_bytes(doc: &Document, page_id: ObjectId) -> Option<V
     };
 
     let xobjects = page_xobjects(doc, page_id)?;
-    let content = doc.get_and_decode_page_content(page_id).ok()?;
+    let content = crate::text_extract::decode_page_content(doc, page_id).ok()?;
     let (init_ctm, _) = crate::layout::glyph_stream::page_initial_transform(doc, page_id);
 
     let mut placements: Vec<Placement> = Vec::new();

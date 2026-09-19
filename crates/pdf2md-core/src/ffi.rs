@@ -174,7 +174,10 @@ pub extern "C" fn pdf2md_vision_signature(
         return cstring_into_raw(String::new());
     }
     let bytes = unsafe { std::slice::from_raw_parts(pdf_ptr, pdf_len) };
-    let sig = match lopdf::Document::load_mem(bytes) {
+    let sig = match lopdf::Document::load_mem_with_options(
+        bytes,
+        lopdf::LoadOptions::with_max_decompressed_size(crate::MAX_DECOMPRESSED_STREAM),
+    ) {
         Ok(doc) => {
             let cap = if max_pages > 0 { max_pages as usize } else { 8 };
             crate::phash::vision_signature(&doc, cap)

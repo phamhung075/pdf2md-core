@@ -23,11 +23,17 @@ pub fn b64encode(data: &[u8]) -> String {
     out
 }
 
-pub(crate) fn inflate(data: &[u8]) -> Option<Vec<u8>> {
-    let mut d = flate2::read::ZlibDecoder::new(data);
+/// Flate-decode `data`, rejecting output larger than `max_output` bytes.
+///
+/// The decoder reads at most `max_output + 1` bytes, so a small compressed
+/// input that expands without bound (a decompression bomb) is rejected without
+/// ever allocating the full output. Callers pass the sample size they are
+/// willing to interpret, never `usize::MAX`.
+pub(crate) fn inflate(data: &[u8], max_output: usize) -> Option<Vec<u8>> {
+    let mut d = flate2::read::ZlibDecoder::new(data).take(max_output as u64 + 1);
     let mut out = Vec::new();
     d.read_to_end(&mut out).ok()?;
-    Some(out)
+    (out.len() <= max_output).then_some(out)
 }
 
 pub(crate) fn decode_asciihex(data: &[u8]) -> Option<Vec<u8>> {
@@ -217,9 +223,13 @@ pub(crate) fn decode_png_rgba(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     if bit_depth != 8 || color_type != 6 || interlace != 0 {
         return None;
     }
+    if width as usize * height as usize > super::MAX_IMAGE_PIXELS {
+        return None;
+    }
     let stride = width as usize * 4;
-    let raw = inflate(&idat)?;
-    if raw.len() < (stride + 1) * height as usize {
+    let expected = (stride + 1).checked_mul(height as usize)?;
+    let raw = inflate(&idat, expected)?;
+    if raw.len() < expected {
         return None;
     }
     let mut out = vec![0u8; stride * height as usize];

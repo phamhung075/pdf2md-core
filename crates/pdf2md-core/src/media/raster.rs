@@ -88,7 +88,7 @@ pub fn extract_page_media(
     let Some(xobjects) = page_xobjects(doc, page_id) else {
         return Vec::new();
     };
-    let Ok(content) = doc.get_and_decode_page_content(page_id) else {
+    let Ok(content) = crate::text_extract::decode_page_content(doc, page_id) else {
         return Vec::new();
     };
     let mut placements: Vec<Placement> = Vec::new();
@@ -372,6 +372,11 @@ pub fn probe_stream(xobj: &Object) -> Option<(u32, u32, String)> {
     if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
         return None;
     }
+    // Reject an oversized declaration before any inflated sample or RGBA buffer
+    // is allocated; the pixel count is the true memory driver, not the box.
+    if width as usize * height as usize > super::MAX_IMAGE_PIXELS {
+        return None;
+    }
     let filters = stream_filters(s);
     if filters.iter().any(|f| f == b"DCTDecode" || f == b"JPXDecode") {
         Some((width, height, "image/jpeg".into()))
@@ -492,6 +497,18 @@ fn decode_for_shrink(data: &[u8], format: &str) -> Option<(Vec<u8>, u32, u32, bo
     } else {
         #[cfg(feature = "vision")]
         {
+            // Probe the header before decoding: a DCT/JPEG stream may declare
+            // one size in the PDF and carry a much larger frame, and
+            // `load_from_memory` would allocate it in full. Reject the pixel
+            // count at the same ceiling as the flate path.
+            let (w, h) = image::ImageReader::new(std::io::Cursor::new(data))
+                .with_guessed_format()
+                .ok()?
+                .into_dimensions()
+                .ok()?;
+            if w as usize * h as usize > super::MAX_IMAGE_PIXELS {
+                return None;
+            }
             let img = image::load_from_memory(data).ok()?;
             let rgba = img.to_rgba8();
             let (w, h) = (rgba.width(), rgba.height());
@@ -621,6 +638,11 @@ pub fn decode_xobject_bytes(
     if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
         return None;
     }
+    // Reject an oversized declaration before any inflated sample or RGBA buffer
+    // is allocated; the pixel count is the true memory driver, not the box.
+    if width as usize * height as usize > super::MAX_IMAGE_PIXELS {
+        return None;
+    }
     let filters = stream_filters(s);
     let mut data = s.content.clone();
     let mut is_jpeg = false;
@@ -628,7 +650,7 @@ pub fn decode_xobject_bytes(
         match f.as_slice() {
             b"ASCIIHexDecode" => data = decode_asciihex(&data)?,
             b"ASCII85Decode" => data = decode_ascii85(&data)?,
-            b"FlateDecode" => data = inflate(&data)?,
+            b"FlateDecode" => data = inflate(&data, super::MAX_IMAGE_SAMPLES)?,
             b"RunLengthDecode" => data = decode_runlength(&data)?,
             b"DCTDecode" | b"JPXDecode" => {
                 is_jpeg = true;
@@ -900,10 +922,20 @@ fn parse_inline_image(
     if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
         return None;
     }
+    // Reject an oversized declaration before any inflated sample or RGBA buffer
+    // is allocated; the pixel count is the true memory driver, not the box.
+    if width as usize * height as usize > super::MAX_IMAGE_PIXELS {
+        return None;
+    }
     let bpc = get(b"BPC")
         .or_else(|| get(b"BitsPerComponent"))
         .and_then(|o| o.as_i64().ok())
         .unwrap_or(8);
+    // Keep the unfiltered sample-span arithmetic below from overflowing on a
+    // crafted `BitsPerComponent`; the decoder only ever consumes 1/8-bit.
+    if !(1..=16).contains(&bpc) {
+        return None;
+    }
     let cs = get(b"CS")
         .or_else(|| get(b"ColorSpace"))
         .cloned()
@@ -952,7 +984,7 @@ fn parse_inline_image(
     if let Some(f) = &filter {
         let fv = f.as_name().ok().map(|n| n.to_vec())?;
         match fv.as_slice() {
-            b"FlateDecode" | b"Fl" => content = inflate(&content)?,
+            b"FlateDecode" | b"Fl" => content = inflate(&content, super::MAX_IMAGE_SAMPLES)?,
             b"RunLengthDecode" | b"RL" => content = decode_runlength(&content)?,
             b"ASCIIHexDecode" | b"AHx" => content = decode_asciihex(&content)?,
             b"ASCII85Decode" | b"A85" => content = decode_ascii85(&content)?,
@@ -1136,6 +1168,11 @@ pub(crate) fn scan_inline_images(data: &[u8], init_ctm: Mtx) -> Vec<Placement> {
 
 
 pub fn raster_to_rgba(doc: &Document, w: u32, h: u32, bits: u32, cs: &Object, data: &[u8]) -> Option<Vec<u8>> {
+    // Allocation guard for direct callers too: `pixel × 4` RGBA is the big
+    // buffer, so refuse an oversized raster before computing `n`.
+    if w as usize * h as usize > super::MAX_IMAGE_PIXELS {
+        return None;
+    }
     let n = w as usize * h as usize;
     if bits == 1 {
         let row_bytes = (w as usize + 7) / 8;

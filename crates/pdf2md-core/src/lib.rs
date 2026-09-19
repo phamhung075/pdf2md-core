@@ -41,11 +41,16 @@ use crate::time::MonoClock;
 /// stream recovery. A tiny Flate stream can inflate without bound (a
 /// "decompression bomb"); object/xref streams in real documents are tiny
 /// dictionaries, so 16 MiB is orders of magnitude above any legitimate value.
-const MAX_DECOMPRESSED_STREAM: usize = 16 << 20;
+pub(crate) const MAX_DECOMPRESSED_STREAM: usize = 16 << 20;
 /// Total decompression budget for all object streams recovered in one document.
 const MAX_OBJSTM_TOTAL: usize = 64 << 20;
 /// Upper bound on how many object streams are examined in one document.
 const MAX_OBJSTM_STREAMS: usize = 256;
+/// Upper bound on the pages one conversion parses, matching the Go worker's
+/// `maxSanePageCount` (5000). A crafted document can hold many thousands of
+/// tiny page objects in one small upload; past this the conversion fails
+/// explicitly instead of grinding through them for minutes.
+const MAX_PAGES: usize = 5000;
 
 /// Loads a PDF with lopdf, transparently repairing a classic cross-reference
 /// table whose `startxref` pointer and/or per-object byte offsets are stale.
@@ -351,7 +356,7 @@ fn page_has_text_layer(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> bool 
     if !fonts.is_empty() {
         return true;
     }
-    let Ok(content) = doc.get_and_decode_page_content(page_id) else {
+    let Ok(content) = text_extract::decode_page_content(doc, page_id) else {
         return false;
     };
     content_has_text_layer(doc, &chain, &content.operations, &mut Vec::new())
@@ -426,7 +431,7 @@ pub fn is_digital_pdf_bytes(bytes: &[u8]) -> bool {
     // references any font (including one inherited from the /Pages tree) or
     // issues any text-show operator, descending recursively into Form XObjects.
     if let Ok(doc) = load_pdf_document(bytes) {
-        for (_page_num, page_id) in doc.get_pages() {
+        for (_page_num, page_id) in doc.get_pages().into_iter().take(MAX_PAGES) {
             if page_has_text_layer(&doc, page_id) {
                 return true;
             }
@@ -798,6 +803,11 @@ pub fn convert_pdf_bytes_to_markdown(
 
     let mut full_markdown = String::new();
     let total_pages = doc.get_pages().len();
+    if total_pages > MAX_PAGES {
+        return Err(format!(
+            "document has {total_pages} pages, over the {MAX_PAGES}-page limit"
+        ));
+    }
     let mut total_words = 0;
     // Pages whose own word count falls below `options.min_words_per_page`.
     // Unlike `total_words == 0` (checked once, document-wide, below), this
@@ -844,7 +854,9 @@ pub fn convert_pdf_bytes_to_markdown(
             let geo = match geo {
                 Ok(pt) => pt,
                 Err(_) => text_extract::PageText {
-                    text: doc.extract_text(&[page_num]).unwrap_or_default(),
+                    text: doc
+                        .extract_text_with_limit(&[page_num], text_extract::MAX_PAGE_CONTENT_TOTAL)
+                        .unwrap_or_default(),
                     text_ops_seen: true,
                     has_fonts: !text_extract::page_fonts(&doc, page_id).is_empty(),
                     tables: 0,
@@ -2260,5 +2272,180 @@ mod regression_tests {
             convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default()).is_err(),
             "the bomb must fall through to the explicit no-text-layer error"
         );
+    }
+
+    /// A one-page PDF whose content stream inflates past the page-content cap
+    /// and whose resources carry a font, so the digital probe short-circuits on
+    /// the font and the conversion path itself has to reject the stream.
+    fn content_stream_bomb_pdf() -> Vec<u8> {
+        use std::io::Write as _;
+
+        let payload = vec![b' '; text_extract::MAX_PAGE_CONTENT_STREAM + (4 << 20)];
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&payload).unwrap();
+        let compressed = enc.finish().unwrap();
+        assert!(
+            compressed.len() < 64 * 1024,
+            "the bomb must be small on disk, got {} bytes",
+            compressed.len()
+        );
+
+        let mut doc = lopdf::Document::new();
+        let font_id = helvetica_font(&mut doc);
+        let mut stream_dict = lopdf::Dictionary::new();
+        stream_dict.set(b"Filter", lopdf::Object::Name(b"FlateDecode".to_vec()));
+        let content_id = doc.add_object(lopdf::Object::Stream(lopdf::Stream::new(
+            stream_dict,
+            compressed,
+        )));
+
+        let mut fonts = lopdf::Dictionary::new();
+        fonts.set(b"F1", lopdf::Object::Reference(font_id));
+        let mut resources = lopdf::Dictionary::new();
+        resources.set(b"Font", lopdf::Object::Dictionary(fonts));
+
+        let mut pages = lopdf::Dictionary::new();
+        pages.set(b"Type", lopdf::Object::Name(b"Pages".to_vec()));
+        pages.set(b"Kids", lopdf::Object::Array(Vec::new()));
+        pages.set(b"Count", lopdf::Object::Integer(1));
+        let pages_id = doc.add_object(lopdf::Object::Dictionary(pages));
+
+        let mut page = lopdf::Dictionary::new();
+        page.set(b"Type", lopdf::Object::Name(b"Page".to_vec()));
+        page.set(b"Parent", lopdf::Object::Reference(pages_id));
+        page.set(
+            b"MediaBox",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(612),
+                lopdf::Object::Integer(792),
+            ]),
+        );
+        page.set(b"Resources", lopdf::Object::Dictionary(resources));
+        page.set(b"Contents", lopdf::Object::Reference(content_id));
+        let page_id = doc.add_object(lopdf::Object::Dictionary(page));
+        doc.get_object_mut(pages_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set(
+                b"Kids",
+                lopdf::Object::Array(vec![lopdf::Object::Reference(page_id)]),
+            );
+        finish_catalog(&mut doc, pages_id)
+    }
+
+    #[test]
+    fn content_stream_bomb_is_rejected_without_inflating() {
+        let bytes = content_stream_bomb_pdf();
+        // The font makes the probe report a digital layer without decoding the
+        // bomb, so this exercises the conversion path, not the probe.
+        assert!(is_digital_pdf_bytes(&bytes));
+
+        let doc = load_pdf_document(&bytes).expect("a bomb must not fail the load");
+        let page_id = *doc.get_pages().values().next().unwrap();
+        let err = text_extract::decode_page_content(&doc, page_id)
+            .expect_err("an over-cap page stream must be rejected");
+        assert!(
+            matches!(
+                err,
+                lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { .. })
+            ),
+            "expected a limit error, got {err:?}"
+        );
+
+        let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default());
+        assert!(
+            res.is_err(),
+            "an undecodable page must fail explicitly instead of emitting a prefix, got: {res:?}"
+        );
+    }
+
+    #[test]
+    fn image_xobject_bomb_is_rejected_before_allocating() {
+        use std::io::Write as _;
+
+        let doc = lopdf::Document::new();
+
+        // Declared tiny, but the Flate stream inflates past the sample cap.
+        let payload = vec![0u8; media::MAX_IMAGE_SAMPLES + (1 << 20)];
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&payload).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let mut dict = lopdf::Dictionary::new();
+        dict.set(b"Width", lopdf::Object::Integer(64));
+        dict.set(b"Height", lopdf::Object::Integer(64));
+        dict.set(b"BitsPerComponent", lopdf::Object::Integer(8));
+        dict.set(b"ColorSpace", lopdf::Object::Name(b"DeviceGray".to_vec()));
+        dict.set(b"Filter", lopdf::Object::Name(b"FlateDecode".to_vec()));
+        let bomb = lopdf::Object::Stream(lopdf::Stream::new(dict, compressed));
+        assert!(
+            media::raster::decode_xobject_bytes(&doc, &bomb, u32::MAX).is_none(),
+            "an inflating image stream must be rejected"
+        );
+
+        // A huge declared frame is rejected without touching the stream bytes.
+        let mut dict = lopdf::Dictionary::new();
+        dict.set(b"Width", lopdf::Object::Integer(100_000));
+        dict.set(b"Height", lopdf::Object::Integer(100_000));
+        dict.set(b"BitsPerComponent", lopdf::Object::Integer(8));
+        dict.set(b"ColorSpace", lopdf::Object::Name(b"DeviceGray".to_vec()));
+        let huge = lopdf::Object::Stream(lopdf::Stream::new(dict, vec![0u8; 16]));
+        assert!(
+            media::raster::decode_xobject_bytes(&doc, &huge, u32::MAX).is_none(),
+            "a 100000x100000 declaration must be rejected"
+        );
+
+        // Just past the pixel cap at a legal dimension.
+        let mut dict = lopdf::Dictionary::new();
+        dict.set(b"Width", lopdf::Object::Integer(16_384));
+        dict.set(b"Height", lopdf::Object::Integer(16_384));
+        dict.set(b"BitsPerComponent", lopdf::Object::Integer(8));
+        dict.set(b"ColorSpace", lopdf::Object::Name(b"DeviceGray".to_vec()));
+        let wide = lopdf::Object::Stream(lopdf::Stream::new(dict, vec![0u8; 16]));
+        assert!(
+            media::raster::decode_xobject_bytes(&doc, &wide, u32::MAX).is_none(),
+            "a 16384x16384 declaration must be rejected"
+        );
+    }
+
+    #[test]
+    fn page_count_over_limit_is_rejected() {
+        let mut doc = lopdf::Document::new();
+        let mut pages = lopdf::Dictionary::new();
+        pages.set(b"Type", lopdf::Object::Name(b"Pages".to_vec()));
+        pages.set(b"Count", lopdf::Object::Integer(MAX_PAGES as i64 + 1));
+        let pages_id = doc.add_object(lopdf::Object::Dictionary(pages));
+
+        let mut kids = Vec::with_capacity(MAX_PAGES + 1);
+        for _ in 0..=MAX_PAGES {
+            let mut page = lopdf::Dictionary::new();
+            page.set(b"Type", lopdf::Object::Name(b"Page".to_vec()));
+            page.set(b"Parent", lopdf::Object::Reference(pages_id));
+            page.set(
+                b"MediaBox",
+                lopdf::Object::Array(vec![
+                    lopdf::Object::Integer(0),
+                    lopdf::Object::Integer(0),
+                    lopdf::Object::Integer(612),
+                    lopdf::Object::Integer(792),
+                ]),
+            );
+            kids.push(lopdf::Object::Reference(
+                doc.add_object(lopdf::Object::Dictionary(page)),
+            ));
+        }
+        doc.get_object_mut(pages_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set(b"Kids", lopdf::Object::Array(kids));
+        let bytes = finish_catalog(&mut doc, pages_id);
+
+        let err = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
+            .expect_err("a document over the page cap must fail explicitly");
+        assert!(err.contains("page limit"), "unexpected error: {err}");
     }
 }
