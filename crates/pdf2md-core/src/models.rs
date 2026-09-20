@@ -298,6 +298,14 @@ pub struct ConversionResult {
     pub pages_below_word_floor: usize,
     pub tables_detected: usize,
     pub duration_us: u64,
+    /// True when at least one page's extraction hit a hard work bound (Form
+    /// XObject `Do` invocation count, shared operator/decoded-byte budget, or
+    /// form recursion depth) and stopped descending early. The conversion still
+    /// succeeds with the text decoded so far — the flag makes the truncation
+    /// observable instead of silent, so a caller can choose to rescue the
+    /// document. `false` for every document that stays inside the budgets.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub budget_exhausted: bool,
     /// Extracted image placements (base64 payloads) when `detect_media`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<crate::media::MediaItem>,
@@ -305,6 +313,12 @@ pub struct ConversionResult {
     /// layout engine.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<crate::layout::DocBlock>,
+}
+
+/// `skip_serializing_if` helper: omit the `budget_exhausted` key when false, so
+/// the JSON of an ordinary conversion is byte-identical to before.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[cfg(test)]
@@ -366,5 +380,30 @@ mod tests {
         ]);
         let md = t.to_markdown();
         assert!(md.starts_with("| 1200.00 | 45.50 | 7.20 |\n"), "{md}");
+    }
+
+    /// `budget_exhausted` is an additive JSON field: omitted when false so an
+    /// ordinary conversion's JSON is unchanged, present when true.
+    #[test]
+    fn budget_exhausted_is_serialised_only_when_true() {
+        let mut r = ConversionResult {
+            markdown: String::new(),
+            total_pages: 1,
+            total_words: 0,
+            pages_below_word_floor: 0,
+            tables_detected: 0,
+            duration_us: 0,
+            budget_exhausted: false,
+            media: Vec::new(),
+            blocks: Vec::new(),
+        };
+        let v = serde_json::to_value(&r).expect("serialise");
+        assert!(
+            v.get("budget_exhausted").is_none(),
+            "false must be skipped: {v}"
+        );
+        r.budget_exhausted = true;
+        let v = serde_json::to_value(&r).expect("serialise");
+        assert_eq!(v.get("budget_exhausted"), Some(&serde_json::Value::Bool(true)));
     }
 }

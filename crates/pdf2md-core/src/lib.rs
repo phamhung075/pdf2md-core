@@ -13,6 +13,7 @@ pub mod media;
 pub mod models;
 #[cfg(feature = "vision")]
 pub mod phash;
+pub mod reflow;
 mod time;
 pub mod text_extract;
 
@@ -65,7 +66,47 @@ const MAX_PAGES: usize = 5000;
 /// All loads decode object/xref streams with [`lopdf::LoadOptions::max_decompressed_size`]
 /// so a crafted object stream cannot allocate unbounded memory before our code
 /// runs; a stream over the cap is skipped by lopdf instead of failing the load.
+/// A PDF the empty user password cannot open: `lopdf` loads it but leaves an
+/// `/Encrypt` entry in the trailer and no usable pages/objects. This is not a
+/// scanned document — vision rescue cannot read it either — so it must be
+/// reported as an encryption failure rather than routed to OCR.
+pub const ENCRYPTED_PDF_ERROR: &str = "encrypted PDF: password required";
+
+/// True when the loaded document is still encrypted after loading: the trailer
+/// carries an `/Encrypt` dictionary and lopdf did not decrypt it (on a
+/// successful empty-password authentication lopdf removes the trailer entry and
+/// records `encryption_state`). This is deliberately *not* conditioned on the
+/// page tree being empty: an encrypted document whose pages happen to remain
+/// parseable must still be reported as encrypted rather than silently converted
+/// or routed to OCR, which cannot read it either.
+fn encrypted_undecrypted(doc: &lopdf::Document) -> bool {
+    doc.trailer.get(b"Encrypt").is_ok() && !doc.was_encrypted()
+}
+
 fn load_pdf_document(bytes: &[u8]) -> Result<lopdf::Document, String> {
+    let doc = load_pdf_document_repaired(bytes)?;
+    if encrypted_undecrypted(&doc) {
+        return Err(ENCRYPTED_PDF_ERROR.to_string());
+    }
+    Ok(doc)
+}
+
+/// True when `bytes` is a PDF that the empty user password cannot open (the
+/// trailer keeps an `/Encrypt` entry after loading). `is_digital_pdf_bytes`
+/// reports such a document as "not digital"; the CLI calls this first so it can
+/// surface the distinct [`ENCRYPTED_PDF_ERROR`] message instead of the generic
+/// scanned-image one.
+pub fn pdf_password_required(bytes: &[u8]) -> bool {
+    if bytes.len() < 32 || !bytes.starts_with(b"%PDF-") {
+        return false;
+    }
+    match load_pdf_document_repaired(bytes) {
+        Ok(doc) => encrypted_undecrypted(&doc),
+        Err(_) => false,
+    }
+}
+
+fn load_pdf_document_repaired(bytes: &[u8]) -> Result<lopdf::Document, String> {
     match load_bounded(bytes) {
         Ok(doc) => Ok(recover_object_streams(doc)),
         Err(first_err) => {
@@ -359,7 +400,22 @@ fn page_has_text_layer(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> bool 
     let Ok(content) = text_extract::decode_page_content(doc, page_id) else {
         return false;
     };
-    content_has_text_layer(doc, &chain, &content.operations, &mut Vec::new())
+    let mut budget = text_extract::WalkerBudget::new();
+    let found = content_has_text_layer(
+        doc,
+        &chain,
+        &content.operations,
+        &mut Vec::new(),
+        0,
+        &mut budget,
+    );
+    // The probe shares the walker's work bounds; a page whose probe was
+    // truncated must not fail silently (it routes to rescue on an incomplete
+    // scan).
+    if budget.exhausted && std::env::var_os("PDF2MD_DEBUG").is_some() {
+        eprintln!("pdf2md: digital-text-layer probe hit a work bound; result may be incomplete");
+    }
+    found
 }
 
 fn content_has_text_layer(
@@ -367,19 +423,33 @@ fn content_has_text_layer(
     chain: &[&lopdf::Dictionary],
     ops: &[lopdf::content::Operation],
     form_path: &mut Vec<lopdf::ObjectId>,
+    depth: usize,
+    budget: &mut text_extract::WalkerBudget,
 ) -> bool {
-    if ops
-        .iter()
-        .any(|op| matches!(op.operator.as_str(), "Tj" | "TJ" | "'" | "\""))
-    {
-        return true;
-    }
-    if form_path.len() >= 8 {
+    if depth >= text_extract::MAX_WALKER_FORM_DEPTH {
+        budget.exhausted = true;
         return false;
+    }
+    // Scan this stream's operators for a text-show, charging the shared page
+    // budget so a form DAG cannot multiply the work (a page whose budget is
+    // exhausted is reported as needing rescue rather than walked forever).
+    for op in ops {
+        if budget.ops_left == 0 {
+            budget.exhausted = true;
+            return false;
+        }
+        budget.ops_left -= 1;
+        if matches!(op.operator.as_str(), "Tj" | "TJ" | "'" | "\"") {
+            return true;
+        }
     }
     for op in ops {
         if op.operator != "Do" {
             continue;
+        }
+        if budget.do_left == 0 {
+            budget.exhausted = true;
+            break;
         }
         let Some(name) = op.operands.first().and_then(|o| o.as_name().ok()) else {
             continue;
@@ -398,16 +468,35 @@ fn content_has_text_layer(
         if !fonts.is_empty() {
             return true;
         }
+        let Ok(data) = form.get_plain_content_with_limit(16 << 20) else {
+            continue;
+        };
+        if data.len() > budget.bytes_left {
+            budget.exhausted = true;
+            continue;
+        }
+        let Ok(fc) = lopdf::content::Content::decode(&data) else {
+            continue;
+        };
+        budget.bytes_left = budget.bytes_left.saturating_sub(data.len());
+        budget.ops_left = budget
+            .ops_left
+            .saturating_sub(text_extract::FORM_INVOCATION_OPS);
+        if budget.ops_left == 0 {
+            budget.exhausted = true;
+        }
+        budget.do_left -= 1;
         if let Some(id) = id {
             form_path.push(id);
         }
-        let found = form
-            .get_plain_content_with_limit(16 << 20)
-            .ok()
-            .and_then(|data| lopdf::content::Content::decode(&data).ok())
-            .map_or(false, |fc| {
-                content_has_text_layer(doc, &fchain, &fc.operations, form_path)
-            });
+        let found = content_has_text_layer(
+            doc,
+            &fchain,
+            &fc.operations,
+            form_path,
+            depth + 1,
+            budget,
+        );
         if id.is_some() {
             form_path.pop();
         }
@@ -628,6 +717,42 @@ fn mask_page_token(tok: &str) -> Option<String> {
     Some(parts.iter().map(|_| "#").collect::<Vec<_>>().join("/"))
 }
 
+/// Whether a short line carries a real data value that must never be treated
+/// as running furniture: a decimal amount (`\d+[.,]\d{2}`) or a long digit run
+/// (>= 4 contiguous digits). Identical fee/total rows often repeat in the
+/// footer band of every page; suppressing them as a "running footer" deletes
+/// real numbers. Short 3-digit identifier groups ("RCS 123 456 789") are not
+/// protected, so a page-varying legal footer is still suppressed.
+fn carries_data_value(t: &str) -> bool {
+    let chars: Vec<char> = t.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if !chars[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i - start >= 4 {
+            return true;
+        }
+        if i < chars.len() && (chars[i] == '.' || chars[i] == ',') {
+            let mut j = i + 1;
+            let mut decimals = 0usize;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+                decimals += 1;
+            }
+            if decimals == 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Normalize a short line for running-furniture comparison: lowercase, drop
 /// punctuation, and collapse whitespace. A page number that directly follows a
 /// `page`/`p.` marker *set off by a separator* ("… - page 2") is masked to `#`,
@@ -782,6 +907,7 @@ fn strip_running_lines(page_md: &mut [(u32, String)]) {
         let t = l.trim();
         !t.is_empty()
             && t.chars().any(|c| c.is_alphabetic())
+            && !carries_data_value(t)
             && !t.starts_with('|')
             && !t.starts_with('<')
             && !t.starts_with('#')
@@ -878,8 +1004,10 @@ fn tag_running_furniture(blocks: &mut [layout::DocBlock]) {
         }
         // A line with no letters is a data value, not furniture; digit
         // normalization would otherwise collapse distinct numbers ("0.19" /
-        // "0.29" → "#.##") into one bogus repeated header.
-        if !b.text.chars().any(|c| c.is_alphabetic()) {
+        // "0.29" → "#.##") into one bogus repeated header. A line that *does*
+        // carry an amount or a long number is equally data: identical fee/total
+        // rows repeat in the footer band of every page and must survive.
+        if !b.text.chars().any(|c| c.is_alphabetic()) || carries_data_value(&b.text) {
             continue;
         }
         let n = norm(&b.text);
@@ -904,7 +1032,7 @@ fn tag_running_furniture(blocks: &mut [layout::DocBlock]) {
         if b.text.split_whitespace().count() > 14 {
             continue;
         }
-        if !b.text.chars().any(|c| c.is_alphabetic()) {
+        if !b.text.chars().any(|c| c.is_alphabetic()) || carries_data_value(&b.text) {
             continue;
         }
         let n = norm(&b.text);
@@ -1078,6 +1206,8 @@ pub fn convert_pdf_bytes_to_markdown(
     let mut any_text_ops = false;
     let mut any_fonts = false;
     let mut tables_detected = 0usize;
+    // True when any page's extraction hit a work bound and truncated.
+    let mut budget_exhausted = false;
     let mut media_items: Vec<media::MediaItem> = Vec::new();
     // Running total of base64 bytes inlined into the markdown as `data:`
     // URIs so far, across every page. Once `options.max_media_bytes_per_doc`
@@ -1121,6 +1251,7 @@ pub fn convert_pdf_bytes_to_markdown(
                         has_fonts: !text_extract::page_fonts(&doc, page_id).is_empty(),
                         tables: 0,
                         blocks: Vec::new(),
+                        budget_exhausted: false,
                     },
                     None,
                 ),
@@ -1143,6 +1274,7 @@ pub fn convert_pdf_bytes_to_markdown(
                                 has_fonts: true,
                                 tables: tagged.tables,
                                 blocks: tagged.blocks,
+                                budget_exhausted: false,
                             },
                             None,
                         )
@@ -1159,10 +1291,16 @@ pub fn convert_pdf_bytes_to_markdown(
         any_text_ops |= page_text.text_ops_seen;
         any_fonts |= page_text.has_fonts;
         tables_detected += page_text.tables;
-        let text = page_text.text.clone();
+        budget_exhausted |= page_text.budget_exhausted;
+        // Fold presentation-form ligatures, drop soft hyphens and normalise the
+        // French digit-group no-break spaces, consistently for the string
+        // walker and the geometry path (the geometry path already folds
+        // ligatures, so this is a no-op there for those).
+        let text = text_extract::normalize_decoded_text(&page_text.text);
         let mut page_blocks: Vec<layout::DocBlock> = page_text.blocks;
         for b in &mut page_blocks {
             b.page = page_num as usize;
+            b.text = text_extract::normalize_decoded_text(&b.text);
         }
 
         let page_media: Vec<media::MediaItem> = if options.detect_media {
@@ -1541,10 +1679,22 @@ pub fn convert_pdf_bytes_to_markdown(
         suppress_page_counters(&mut page_md);
     }
     for (_p, chunk) in page_md {
-        full_markdown.push_str(&chunk);
+        // Paragraph reflow: join the walker's one-line-per-PDF-line output
+        // back into paragraphs. Run per page, after the line-based furniture
+        // and page-counter passes, so a running header or a suppressed
+        // counter is never welded into body prose.
+        let reflowed = reflow::reflow_markdown(&chunk);
+        full_markdown.push_str(&reflowed);
     }
 
     let duration_us = t0.elapsed_us();
+
+    // The C ABI/JSON surface (ffi.rs) is frozen, so the Go worker cannot see
+    // the flag through `ConversionResult`; make the truncation visible on the
+    // debug channel instead of failing silently.
+    if budget_exhausted && std::env::var_os("PDF2MD_DEBUG").is_some() {
+        eprintln!("pdf2md: a page hit an extraction work bound; output may be truncated");
+    }
 
     Ok(ConversionResult {
         markdown: full_markdown,
@@ -1553,6 +1703,7 @@ pub fn convert_pdf_bytes_to_markdown(
         pages_below_word_floor,
         tables_detected,
         duration_us,
+        budget_exhausted,
         media: media_items,
         blocks: block_items,
     })
@@ -1561,6 +1712,7 @@ pub fn convert_pdf_bytes_to_markdown(
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+    use lopdf::dictionary;
 
     /// Split a GFM pipe-table row `| a | b |` into normalized cell strings.
     fn split_cells(line: &str) -> Vec<String> {
@@ -2976,6 +3128,33 @@ mod regression_tests {
         assert_eq!(count_occurrences(&md, "Sous-total"), 4, "subtotal rows lost:\n{md}");
     }
 
+    /// An identical amount row repeated in the footer band on every page is a
+    /// real data row, not running furniture: it must survive on every page.
+    #[test]
+    fn synthetic_identical_footer_amount_row_survives() {
+        let pages: Vec<String> = (1..=4)
+            .map(|i| {
+                [
+                    tm_text(72.0, 815.0, "RELEVE MENSUEL"),
+                    tm_text(72.0, 500.0, &format!("operation unique de la page {i}")),
+                    tm_text(72.0, 80.0, "Frais de dossier: 45,00"),
+                ]
+                .join("\n")
+            })
+            .collect();
+        let md = convert_synth(&pages);
+        assert_eq!(
+            count_occurrences(&md, "45,00"),
+            4,
+            "identical footer amount row suppressed as furniture:\n{md}"
+        );
+        assert_eq!(
+            count_occurrences(&md, "Frais de dossier"),
+            4,
+            "identical footer amount label suppressed as furniture:\n{md}"
+        );
+    }
+
     /// A repeated column header inside table rows must survive.
     #[test]
     fn synthetic_repeated_montant_header_survives() {
@@ -3138,5 +3317,131 @@ mod regression_tests {
             texts.contains(&"ALPHA-COST") && texts.contains(&"BRAVO-COST"),
             "distinct overlapping strings must both survive: {texts:?}"
         );
+    }
+
+    /// An encrypted PDF the empty user password cannot open leaves an
+    /// `/Encrypt` trailer entry; that is an encryption failure, not a scanned
+    /// document.
+    #[test]
+    fn encrypted_document_without_pages_is_reported() {
+        let mut doc = lopdf::Document::with_version("1.4");
+        doc.trailer
+            .set("Encrypt", lopdf::Object::Dictionary(lopdf::Dictionary::new()));
+        assert!(encrypted_undecrypted(&doc));
+        assert_eq!(ENCRYPTED_PDF_ERROR, "encrypted PDF: password required");
+    }
+
+    #[test]
+    fn unencrypted_empty_document_is_not_encrypted() {
+        let doc = lopdf::Document::with_version("1.4");
+        assert!(!encrypted_undecrypted(&doc));
+    }
+
+    /// End-to-end: a serialized PDF with an `/Encrypt` entry and no pages must
+    /// come back as [`ENCRYPTED_PDF_ERROR`], so the gateway can report it
+    /// instead of paying for a vision rescue that cannot read it either.
+    #[test]
+    fn encrypted_pdf_bytes_are_reported_as_encrypted() {
+        let mut doc = lopdf::Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        doc.objects.insert(
+            pages_id,
+            lopdf::Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => lopdf::Object::Array(vec![]),
+                "Count" => 0,
+            }),
+        );
+        let catalog_id = doc.new_object_id();
+        doc.objects.insert(
+            catalog_id,
+            lopdf::Object::Dictionary(dictionary! {
+                "Type" => "Catalog", "Pages" => pages_id,
+            }),
+        );
+        doc.trailer.set("Root", catalog_id);
+        doc.trailer.set(
+            "Encrypt",
+            lopdf::Object::Dictionary(dictionary! {
+                "Filter" => "Standard", "V" => 1, "R" => 2,
+                "O" => lopdf::Object::String(vec![0u8; 32], lopdf::StringFormat::Literal),
+                "U" => lopdf::Object::String(vec![0u8; 32], lopdf::StringFormat::Literal),
+                "P" => -1,
+            }),
+        );
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).expect("serialize encrypted stub");
+        match load_pdf_document(&bytes) {
+            Err(e) => assert_eq!(e, ENCRYPTED_PDF_ERROR),
+            Ok(d) => panic!("expected an encryption error, got {} pages", d.get_pages().len()),
+        }
+    }
+
+    /// The public probe the CLI uses must agree with the load error for an
+    /// encrypted stub, and the stub must not look "digital" (otherwise the CLI
+    /// pre-gate would print the scanned-image message before ever checking).
+    #[test]
+    fn pdf_password_required_probe_matches_the_conversion_error() {
+        let mut doc = lopdf::Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        doc.objects.insert(
+            pages_id,
+            lopdf::Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => lopdf::Object::Array(vec![]),
+                "Count" => 0,
+            }),
+        );
+        let catalog_id = doc.new_object_id();
+        doc.objects.insert(
+            catalog_id,
+            lopdf::Object::Dictionary(dictionary! {
+                "Type" => "Catalog", "Pages" => pages_id,
+            }),
+        );
+        doc.trailer.set("Root", catalog_id);
+        doc.trailer.set(
+            "Encrypt",
+            lopdf::Object::Dictionary(dictionary! {
+                "Filter" => "Standard", "V" => 1, "R" => 2,
+                "O" => lopdf::Object::String(vec![0u8; 32], lopdf::StringFormat::Literal),
+                "U" => lopdf::Object::String(vec![0u8; 32], lopdf::StringFormat::Literal),
+                "P" => -1,
+            }),
+        );
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).expect("serialize encrypted stub");
+
+        assert!(pdf_password_required(&bytes));
+        assert!(!is_digital_pdf_bytes(&bytes));
+        let err = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
+            .expect_err("encrypted bytes must fail conversion");
+        assert_eq!(err, ENCRYPTED_PDF_ERROR);
+    }
+
+    /// A plain unencrypted document is never reported as password-protected.
+    #[test]
+    fn pdf_password_required_probe_is_false_for_a_plain_pdf() {
+        let mut doc = lopdf::Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        doc.objects.insert(
+            pages_id,
+            lopdf::Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => lopdf::Object::Array(vec![]),
+                "Count" => 0,
+            }),
+        );
+        let catalog_id = doc.new_object_id();
+        doc.objects.insert(
+            catalog_id,
+            lopdf::Object::Dictionary(dictionary! {
+                "Type" => "Catalog", "Pages" => pages_id,
+            }),
+        );
+        doc.trailer.set("Root", catalog_id);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).expect("serialize plain stub");
+        assert!(!pdf_password_required(&bytes));
     }
 }

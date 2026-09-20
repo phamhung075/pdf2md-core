@@ -118,6 +118,7 @@ pub(crate) fn string_bytes(o: &Object) -> Option<&[u8]> {
 // Font advance widths
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub(crate) enum Widths {
     /// Simple font: byte code -> width in 1/1000 em (`/Widths` + `/FirstChar`).
     Byte([f64; 256]),
@@ -608,6 +609,13 @@ fn fold_ligatures(s: &mut String) {
 
 /// Decode one string operand into a positioned span (or nothing if it decodes
 /// to no text). `em_offset` is a preceding TJ-array number in 1/1000 em units.
+///
+/// Returns the reading direction of a *vertical* span: `Some(1)` when the glyph
+/// advance runs upward (bottom-to-top), `Some(-1)` when it runs downward, and
+/// `None` for a horizontal span (or empty text). The caller uses this to decide
+/// whether a page whose text is dominantly vertical must be rotated upright;
+/// the sign is returned rather than stored on `Span` so the ~40 `Span` literals
+/// in the tree stay untouched.
 pub(crate) fn push_span(
     codec: &Codec,
     width: &Widths,
@@ -618,12 +626,15 @@ pub(crate) fn push_span(
     tfs: f64,
     style: (bool, bool),
     spans: &mut Vec<Span>,
-) {
+) -> Option<i8> {
     let mut text = String::new();
-    codec.decode(bytes, &mut text);
+    // Raw decode: keep private-use code points so the span geometry and table
+    // detection below see exactly the pre-mapping bytes. `normalize_decoded_text`
+    // maps them afterwards through the font-unknown union.
+    codec.decode_raw(bytes, &mut text);
     fold_ligatures(&mut text);
     if text.is_empty() {
-        return;
+        return None;
     }
     let hscale = tm.h_scale() * ctm.h_scale();
     let size = tfs * hscale;
@@ -651,6 +662,11 @@ pub(crate) fn push_span(
         is_underline: false,
         is_vertical,
     });
+    if is_vertical {
+        Some(if eff_b >= 0.0 { 1 } else { -1 })
+    } else {
+        None
+    }
 }
 
 /// Height of the page media box in device points (best effort), accounting for page rotation.
@@ -659,27 +675,44 @@ pub fn page_height_of(doc: &Document, page_id: ObjectId) -> Option<f64> {
     Some(h)
 }
 
+/// Resolve an inheritable page attribute (`/Rotate`, `/MediaBox`, `/CropBox`)
+/// by climbing the `/Pages` parent chain, cycle- and depth-bounded. PDF viewers
+/// inherit these from ancestors, but the glyph engine previously read only the
+/// page dictionary; a page that inherits its `/Rotate` or box from `/Pages`
+/// therefore got the wrong orientation/geometry.
+fn inherited_page_object<'a>(
+    doc: &'a Document,
+    page_id: ObjectId,
+    key: &[u8],
+) -> Option<&'a Object> {
+    let mut seen: Vec<ObjectId> = Vec::new();
+    let mut cur = Some(page_id);
+    while let Some(id) = cur {
+        if seen.len() >= 32 || seen.contains(&id) {
+            break;
+        }
+        seen.push(id);
+        let Ok(dict) = doc.get_dictionary(id) else { break };
+        if let Ok(o) = dict.get(key) {
+            return deref(doc, o);
+        }
+        cur = dict.get(b"Parent").ok().and_then(|o| o.as_reference().ok());
+    }
+    None
+}
+
 /// Initial coordinate transformation matrix and display height for a page,
 /// taking into account the page /Rotate attribute (0, 90, 180, 270 degrees clockwise)
-/// and /MediaBox / /CropBox boundaries.
+/// and /MediaBox / /CropBox boundaries. All three are inherited from the
+/// `/Pages` ancestors when absent on the page itself.
 pub(crate) fn page_initial_transform(doc: &Document, page_id: ObjectId) -> (Mtx, f64) {
-    let dict = match doc.get_dictionary(page_id) {
-        Ok(d) => d,
-        Err(_) => return (Mtx::ID, 842.0),
-    };
-    let rotate = dict
-        .get(b"Rotate")
-        .ok()
-        .and_then(|o| deref(doc, o))
+    let rotate = inherited_page_object(doc, page_id, b"Rotate")
         .and_then(|o| o.as_i64().ok())
         .unwrap_or(0);
     let rotate = ((rotate % 360) + 360) % 360;
 
-    let box_obj = dict
-        .get(b"CropBox")
-        .ok()
-        .or_else(|| dict.get(b"MediaBox").ok())
-        .and_then(|o| deref(doc, o))
+    let box_obj = inherited_page_object(doc, page_id, b"CropBox")
+        .or_else(|| inherited_page_object(doc, page_id, b"MediaBox"))
         .and_then(|o| o.as_array().ok());
 
     let (x0, y0, x1, y1) = if let Some(b) = box_obj {
@@ -986,30 +1019,25 @@ fn append_vertical_text(text: &mut String, vertical_text: &str, detect_layout: b
     text.push_str(vertical_text);
 }
 
-/// Extract text for a glyph-positioned page using geometry reconstruction.
-/// When `detect_tables` is false, returns the plain reading-order text with
-/// no table recovery (byte-identical to the table-less renderer).
-pub fn extract_page_glyphs(
-    doc: &Document,
-    page_id: ObjectId,
-    detect_tables: bool,
-    detect_layout: bool,
-    detect_math: bool,
-) -> Result<PageText, String> {
-    let fonts = crate::text_extract::page_fonts(doc, page_id);
-    let has_fonts = !fonts.is_empty();
+/// A font resolved for one content-stream resource chain: its resource name,
+/// decoder, advance widths, and bold/italic style bits.
+#[derive(Clone)]
+struct GlyphFontInfo {
+    name: Vec<u8>,
+    codec: Codec,
+    widths: Widths,
+    style: (bool, bool),
+}
 
-    struct FontInfo {
-        name: Vec<u8>,
-        codec: Codec,
-        widths: Widths,
-        style: (bool, bool),
-    }
-
-    let mut fonts_info: Vec<FontInfo> = Vec::new();
-    for (name, fd) in &fonts {
+/// Resolve every collected `/Font` into a [`GlyphFontInfo`].
+fn build_glyph_font_table<'a>(
+    doc: &'a Document,
+    fonts: &std::collections::BTreeMap<Vec<u8>, &'a Dictionary>,
+) -> Vec<GlyphFontInfo> {
+    let mut out: Vec<GlyphFontInfo> = Vec::new();
+    for (name, fd) in fonts {
         if let Some(c) = resolve_codec(doc, fd) {
-            fonts_info.push(FontInfo {
+            out.push(GlyphFontInfo {
                 name: name.clone(),
                 codec: c,
                 widths: resolve_widths(doc, fd),
@@ -1017,11 +1045,128 @@ pub fn extract_page_glyphs(
             });
         }
     }
+    out
+}
 
-    let content: Content<Vec<Operation>> = crate::text_extract::decode_page_content(doc, page_id)
-        .map_err(|e| e.to_string())?;
+/// Collect the `/Font` entries reachable from `chain` and resolve them.
+fn glyph_font_table_for_chain<'a>(
+    doc: &'a Document,
+    chain: &[&'a Dictionary],
+) -> Vec<GlyphFontInfo> {
+    let mut fonts: std::collections::BTreeMap<Vec<u8>, &Dictionary> =
+        std::collections::BTreeMap::new();
+    crate::text_extract::collect_fonts(doc, chain, &mut fonts);
+    build_glyph_font_table(doc, &fonts)
+}
 
-    let (init_ctm, page_height) = page_initial_transform(doc, page_id);
+/// Work / recursion bounds for Form XObject expansion in the glyph engine. A
+/// form graph is a DAG at best and can be a near-exponential tree; each bound
+/// below independently caps the blow-up. The decoded-byte and operator budgets
+/// are shared across the whole page, so a DAG of forms each issuing `Do` many
+/// times cannot multiply work.
+const MAX_FORM_DEPTH: usize = 8;
+/// Maximum number of `Do` invocations expanded for one page (16384 = 2^14).
+///
+/// Rationale: a per-page cost backstop, not a content limit. Every invocation
+/// is also charged `text_extract::FORM_INVOCATION_OPS` against the shared
+/// `MAX_FORM_OPS_TOTAL` (8 M-operator) budget and its decoded bytes against
+/// `MAX_FORM_BYTES_TOTAL` (64 MiB), so an op-heavy or byte-heavy fan-out is
+/// bounded by those budgets; a self-referential or exponentially expanding
+/// form DAG is bounded by `MAX_FORM_DEPTH` plus the per-path cycle check, and
+/// therefore never reaches this count. The cap only stops a pathological page
+/// of > 16384 trivial forms; when it (or any other bound) trips,
+/// [`GlyphBudget::exhausted`] is set so the truncation is reported as
+/// `budget_exhausted` instead of being silent.
+const MAX_FORM_DO_PER_PAGE: usize = 16384;
+const MAX_FORM_OPS_TOTAL: usize = 8_000_000;
+const MAX_FORM_BYTES_TOTAL: usize = 64 << 20;
+
+struct GlyphBudget {
+    do_left: usize,
+    ops_left: usize,
+    bytes_left: usize,
+    /// Set when any bound above tripped, so a truncated page is reported.
+    exhausted: bool,
+}
+
+impl GlyphBudget {
+    fn new() -> Self {
+        GlyphBudget {
+            do_left: MAX_FORM_DO_PER_PAGE,
+            ops_left: MAX_FORM_OPS_TOTAL,
+            bytes_left: MAX_FORM_BYTES_TOTAL,
+            exhausted: false,
+        }
+    }
+}
+
+/// The device-space bounding rectangle of a form's `/BBox` under `fctm`, used
+/// to drop spans the form paints outside its own clip (the spec makes `/BBox`
+/// clip the form's content). `None` when the form has no usable `/BBox`.
+fn form_device_bbox(doc: &Document, form: &Dictionary, fctm: &Mtx) -> Option<(f64, f64, f64, f64)> {
+    let b = form
+        .get(b"BBox")
+        .ok()
+        .and_then(|o| deref(doc, o))
+        .and_then(|o| o.as_array().ok())?;
+    let g = |i: usize| -> Option<f64> { b.get(i).and_then(|o| deref(doc, o)).and_then(num) };
+    let (llx, lly, urx, ury) = (g(0)?, g(1)?, g(2)?, g(3)?);
+    if ![llx, lly, urx, ury].iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let mut x0 = f64::INFINITY;
+    let mut x1 = f64::NEG_INFINITY;
+    let mut y0 = f64::INFINITY;
+    let mut y1 = f64::NEG_INFINITY;
+    for (x, y) in [(llx, lly), (urx, lly), (urx, ury), (llx, ury)] {
+        let (dx, dy) = fctm.apply(x, y);
+        x0 = x0.min(dx);
+        x1 = x1.max(dx);
+        y0 = y0.min(dy);
+        y1 = y1.max(dy);
+    }
+    Some((x0, y0, x1, y1))
+}
+
+/// One content-stream walk's output: positioned spans, underline rules, and the
+/// character counts of vertical runs by reading direction (upward / downward).
+/// The direction counts are what let the page-level caller detect a dominantly
+/// vertical page and rotate it upright.
+struct GlyphWalk {
+    spans: Vec<Span>,
+    underline_segs: Vec<(f64, f64, f64)>,
+    vertical_up_chars: usize,
+    vertical_down_chars: usize,
+}
+
+/// Recursively walk one content stream (page or Form XObject) into positioned
+/// spans, expanding `/Do` forms with their own `/Matrix`, `/Resources` font
+/// table and `/BBox`. Depth, `Do` count, decoded bytes and total operators are
+/// shared across the page (see [`GlyphBudget`]).
+#[allow(clippy::too_many_arguments)]
+fn walk_glyphs(
+    doc: &Document,
+    chain: &[&Dictionary],
+    ops: &[Operation],
+    init_ctm: Mtx,
+    form_path: &mut Vec<ObjectId>,
+    depth: usize,
+    text_ops_seen: &mut bool,
+    budget: &mut GlyphBudget,
+    font_cache: &mut HashMap<usize, Vec<GlyphFontInfo>>,
+) -> GlyphWalk {
+    // Font table for this frame, cached by the resource chain's head pointer so
+    // a repeated form does not re-resolve its codecs/widths on every `Do`.
+    let font_key = chain
+        .first()
+        .map(|d| *d as *const Dictionary as usize)
+        .unwrap_or(0);
+    if !font_cache.contains_key(&font_key) {
+        let table = glyph_font_table_for_chain(doc, chain);
+        font_cache.insert(font_key, table);
+    }
+    let fonts_info: Vec<GlyphFontInfo> = font_cache.get(&font_key).cloned().unwrap_or_default();
+
     let mut ctm = init_ctm;
     let mut ctm_stack: Vec<Mtx> = Vec::new();
     let mut tlm = Mtx::ID;
@@ -1032,8 +1177,9 @@ pub fn extract_page_glyphs(
     let mut tw = 0.0f64;
     let mut tz = 100.0f64;
     let mut cur_font: Option<usize> = None;
-    let mut text_ops_seen = false;
     let mut spans: Vec<Span> = Vec::new();
+    let mut vertical_up_chars = 0usize;
+    let mut vertical_down_chars = 0usize;
 
     // Underline detection: PDF fonts carry no underline bit, so an underline is
     // a thin horizontal stroke (or an equally thin filled rectangle) painted
@@ -1044,7 +1190,12 @@ pub fn extract_page_glyphs(
     let mut path_pts: Vec<(f64, f64)> = Vec::new();
     let mut path_start: Option<(f64, f64)> = None;
 
-    for op in &content.operations {
+    for op in ops {
+        if budget.ops_left == 0 {
+            budget.exhausted = true;
+            break;
+        }
+        budget.ops_left -= 1;
         match op.operator.as_str() {
             "q" => ctm_stack.push(ctm),
             "Q" => {
@@ -1111,7 +1262,7 @@ pub fn extract_page_glyphs(
                 }
             }
             "Tj" | "'" | "\"" => {
-                text_ops_seen = true;
+                *text_ops_seen = true;
                 let str_idx = if op.operator == "\"" { 2 } else { 0 };
                 if op.operator == "'" {
                     tlm.pre_mul(&Mtx::translate(0.0, -leading));
@@ -1122,7 +1273,16 @@ pub fn extract_page_glyphs(
                 {
                     let f = &fonts_info[ci];
                     let (codec, width, style) = (&f.codec, &f.widths, f.style);
-                    push_span(codec, width, bytes, 0.0, &tm, &ctm, tfs, style, &mut spans);
+                    if let Some(dir) =
+                        push_span(codec, width, bytes, 0.0, &tm, &ctm, tfs, style, &mut spans)
+                    {
+                        let n = spans.last().map(|s| s.text.chars().count()).unwrap_or(0);
+                        if dir > 0 {
+                            vertical_up_chars += n;
+                        } else {
+                            vertical_down_chars += n;
+                        }
+                    }
                     let w = width.width(bytes).unwrap_or(500.0 * bytes.len() as f64);
                     let adv = if tc != 0.0 || tw != 0.0 || (tz - 100.0).abs() >= 1e-4 {
                         let space_count = bytes.iter().filter(|&&b| b == b' ').count() as f64;
@@ -1135,7 +1295,7 @@ pub fn extract_page_glyphs(
                 }
             }
             "TJ" => {
-                text_ops_seen = true;
+                *text_ops_seen = true;
                 let Some(arr) = op.operands.first().and_then(|o| o.as_array().ok()) else {
                     continue;
                 };
@@ -1150,7 +1310,16 @@ pub fn extract_page_glyphs(
                 for item in arr {
                     match item {
                         Object::String(bytes, _) => {
-                            push_span(codec, width, bytes, offset, &tm, &ctm, tfs, style, &mut spans);
+                            if let Some(dir) = push_span(
+                                codec, width, bytes, offset, &tm, &ctm, tfs, style, &mut spans,
+                            ) {
+                                let n = spans.last().map(|s| s.text.chars().count()).unwrap_or(0);
+                                if dir > 0 {
+                                    vertical_up_chars += n;
+                                } else {
+                                    vertical_down_chars += n;
+                                }
+                            }
                             let w = width.width(bytes).unwrap_or(500.0);
                             let item_adv = if (tc != 0.0 || tw != 0.0) && tfs > 0.0 {
                                 let space_count = bytes.iter().filter(|&&b| b == b' ').count() as f64;
@@ -1240,8 +1409,315 @@ pub fn extract_page_glyphs(
                 flush_path_segs(&mut path_pts, path_start, &mut underline_segs, true);
             }
             "n" => path_pts.clear(),
+            // Form XObject text. Fonts come from the form's own resource chain
+            // (or the enclosing chain when it declares none); the form `/Matrix`
+            // is folded into the CTM exactly as the media walkers do.
+            "Do" => {
+                if budget.do_left == 0 || depth >= MAX_FORM_DEPTH {
+                    budget.exhausted = true;
+                    continue;
+                }
+                let Some(name) = op.operands.first().and_then(|o| o.as_name().ok()) else {
+                    continue;
+                };
+                let Some((id, form)) = crate::text_extract::lookup_form(doc, chain, name) else {
+                    continue;
+                };
+                // A form already on the current path draws itself (directly or
+                // through a chain); skip rather than re-walk.
+                if id.map_or(false, |id| form_path.contains(&id)) {
+                    continue;
+                }
+                let fchain = crate::text_extract::form_resource_chain(doc, &form.dict, chain);
+                let Ok(data) = form.get_plain_content_with_limit(16 << 20) else {
+                    continue;
+                };
+                if data.len() > budget.bytes_left {
+                    budget.exhausted = true;
+                    continue;
+                }
+                let Ok(fc) = Content::decode(&data) else {
+                    continue;
+                };
+                budget.bytes_left = budget.bytes_left.saturating_sub(data.len());
+                budget.ops_left = budget
+                    .ops_left
+                    .saturating_sub(crate::text_extract::FORM_INVOCATION_OPS);
+                if budget.ops_left == 0 {
+                    budget.exhausted = true;
+                }
+                let mut fctm = ctm;
+                if let Ok(m) = form.dict.get(b"Matrix") {
+                    if let Ok(arr) = m.as_array() {
+                        let g = |i: usize| -> f64 { arr.get(i).and_then(num).unwrap_or(0.0) };
+                        fctm.pre_mul(&Mtx::from_parts(g(0), g(1), g(2), g(3), g(4), g(5)));
+                    }
+                }
+                let clip = form_device_bbox(doc, &form.dict, &fctm);
+                budget.do_left -= 1;
+                if let Some(id) = id {
+                    form_path.push(id);
+                }
+                let sub = walk_glyphs(
+                    doc,
+                    &fchain,
+                    &fc.operations,
+                    fctm,
+                    form_path,
+                    depth + 1,
+                    text_ops_seen,
+                    budget,
+                    font_cache,
+                );
+                if id.is_some() {
+                    form_path.pop();
+                }
+                match clip {
+                    Some((x0, y0, x1, y1)) => {
+                        // `/BBox` clips the form's painted content; keep only
+                        // spans whose baseline falls inside it (1 pt slack).
+                        const SLACK: f64 = 1.0;
+                        for s in sub.spans {
+                            if s.x >= x0 - SLACK
+                                && s.x <= x1 + SLACK
+                                && s.y >= y0 - SLACK
+                                && s.y <= y1 + SLACK
+                            {
+                                spans.push(s);
+                            }
+                        }
+                    }
+                    None => spans.extend(sub.spans),
+                }
+                underline_segs.extend(sub.underline_segs);
+                vertical_up_chars += sub.vertical_up_chars;
+                vertical_down_chars += sub.vertical_down_chars;
+            }
             _ => {}
         }
+    }
+
+    GlyphWalk {
+        spans,
+        underline_segs,
+        vertical_up_chars,
+        vertical_down_chars,
+    }
+}
+
+/// Text-show / text-positioning operators seen on a page, including inside its
+/// Form XObjects.
+///
+/// `text_extract::extract_page`'s legacy routing inspects only the *page's own*
+/// content stream, so a page whose text lives entirely in a form
+/// (`/Fm0 Do`, e.g. a corpus file) is never routed to the glyph engine and
+/// gets no table recovery. Callers can OR these form-aware signals into that
+/// routing decision. The scan is bounded exactly like `walk_glyphs`.
+#[derive(Default, Clone, Copy, Debug)]
+#[allow(dead_code)]
+pub(crate) struct ContentSignals {
+    pub has_tj_array: bool,
+    pub has_tj_plain: bool,
+    pub has_quote: bool,
+    pub has_td_upper: bool,
+    pub has_tm: bool,
+    /// Number of `Td` operators seen anywhere.
+    pub td_total: usize,
+    /// Of `td_total`, how many carry a horizontal component.
+    pub td_horizontal: usize,
+    /// True when the bounded signal scan stopped early (operator, `Do` or byte
+    /// budget), so the routing decision may be based on incomplete signals.
+    pub budget_exhausted: bool,
+}
+
+#[allow(dead_code)]
+pub(crate) fn page_content_signals(doc: &Document, page_id: ObjectId) -> ContentSignals {
+    let mut sig = ContentSignals::default();
+    let Ok(content) = crate::text_extract::decode_page_content(doc, page_id) else {
+        return sig;
+    };
+    let chain = crate::text_extract::resource_dicts(doc, page_id);
+    let mut budget = GlyphBudget::new();
+    let mut form_path: Vec<ObjectId> = Vec::new();
+    scan_content_signals(
+        doc,
+        &chain,
+        &content.operations,
+        0,
+        &mut form_path,
+        &mut budget,
+        &mut sig,
+    );
+    sig.budget_exhausted = budget.exhausted;
+    sig
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_content_signals(
+    doc: &Document,
+    chain: &[&Dictionary],
+    ops: &[Operation],
+    depth: usize,
+    form_path: &mut Vec<ObjectId>,
+    budget: &mut GlyphBudget,
+    sig: &mut ContentSignals,
+) {
+    for op in ops {
+        if budget.ops_left == 0 {
+            budget.exhausted = true;
+            return;
+        }
+        budget.ops_left -= 1;
+        match op.operator.as_str() {
+            "TJ" => sig.has_tj_array = true,
+            "Tj" => sig.has_tj_plain = true,
+            "'" | "\"" => sig.has_quote = true,
+            "TD" => sig.has_td_upper = true,
+            "Tm" => sig.has_tm = true,
+            "Td" => {
+                sig.td_total += 1;
+                if let Some(tx) = op.operands.first().and_then(num) {
+                    if tx.abs() > 0.01 {
+                        sig.td_horizontal += 1;
+                    }
+                }
+            }
+            "Do" => {
+                if budget.do_left == 0 || depth >= MAX_FORM_DEPTH {
+                    budget.exhausted = true;
+                    continue;
+                }
+                let Some(name) = op.operands.first().and_then(|o| o.as_name().ok()) else {
+                    continue;
+                };
+                let Some((id, form)) = crate::text_extract::lookup_form(doc, chain, name) else {
+                    continue;
+                };
+                if id.map_or(false, |id| form_path.contains(&id)) {
+                    continue;
+                }
+                let fchain = crate::text_extract::form_resource_chain(doc, &form.dict, chain);
+                let Ok(data) = form.get_plain_content_with_limit(16 << 20) else {
+                    continue;
+                };
+                if data.len() > budget.bytes_left {
+                    budget.exhausted = true;
+                    continue;
+                }
+                let Ok(fc) = Content::decode(&data) else {
+                    continue;
+                };
+                budget.bytes_left = budget.bytes_left.saturating_sub(data.len());
+                budget.ops_left = budget
+                    .ops_left
+                    .saturating_sub(crate::text_extract::FORM_INVOCATION_OPS);
+                if budget.ops_left == 0 {
+                    budget.exhausted = true;
+                }
+                budget.do_left -= 1;
+                if let Some(id) = id {
+                    form_path.push(id);
+                }
+                scan_content_signals(doc, &fchain, &fc.operations, depth + 1, form_path, budget, sig);
+                if id.is_some() {
+                    form_path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Rotate every span of a dominantly vertical page upright so the ordinary
+/// horizontal pipeline can read it. `upward` selects the reading direction:
+/// `(x, y) -> (y, -x)` for text drawn bottom-to-top, `(-y, x)` for top-to-bottom.
+/// The rotated spans are translated to a `(0,0)` origin and `Span::is_vertical`
+/// is cleared; the returned value is the new display height.
+fn rotate_spans_upright(spans: &mut [Span], upward: bool) -> f64 {
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for s in spans.iter_mut() {
+        let (nx, ny) = if upward {
+            (s.y, -s.x)
+        } else {
+            (-s.y, s.x)
+        };
+        s.x = nx;
+        s.y = ny;
+        s.is_vertical = false;
+        min_x = min_x.min(nx);
+        min_y = min_y.min(ny);
+        max_y = max_y.max(ny);
+    }
+    if !min_x.is_finite() || !min_y.is_finite() {
+        return 0.0;
+    }
+    for s in spans.iter_mut() {
+        s.x -= min_x;
+        s.y -= min_y;
+    }
+    (max_y - min_y).max(1.0)
+}
+
+/// Extract text for a glyph-positioned page using geometry reconstruction.
+/// When `detect_tables` is false, returns the plain reading-order text with
+/// no table recovery (byte-identical to the table-less renderer).
+pub fn extract_page_glyphs(
+    doc: &Document,
+    page_id: ObjectId,
+    detect_tables: bool,
+    detect_layout: bool,
+    detect_math: bool,
+) -> Result<PageText, String> {
+    let chain = crate::text_extract::resource_dicts(doc, page_id);
+    let mut raw_fonts: std::collections::BTreeMap<Vec<u8>, &Dictionary> =
+        std::collections::BTreeMap::new();
+    crate::text_extract::collect_fonts(doc, &chain, &mut raw_fonts);
+    let has_fonts = !raw_fonts.is_empty();
+
+    let content: Content<Vec<Operation>> = crate::text_extract::decode_page_content(doc, page_id)
+        .map_err(|e| e.to_string())?;
+
+    let (init_ctm, mut page_height) = page_initial_transform(doc, page_id);
+
+    let font_key = chain
+        .first()
+        .map(|d| *d as *const Dictionary as usize)
+        .unwrap_or(0);
+    let mut font_cache: HashMap<usize, Vec<GlyphFontInfo>> = HashMap::new();
+    font_cache.insert(font_key, build_glyph_font_table(doc, &raw_fonts));
+    let mut text_ops_seen = false;
+    let mut budget = GlyphBudget::new();
+    let walk = walk_glyphs(
+        doc,
+        &chain,
+        &content.operations,
+        init_ctm,
+        &mut Vec::new(),
+        0,
+        &mut text_ops_seen,
+        &mut budget,
+        &mut font_cache,
+    );
+    let GlyphWalk {
+        mut spans,
+        underline_segs,
+        vertical_up_chars,
+        vertical_down_chars,
+    } = walk;
+
+    // A page whose text is dominantly vertical (a sideways OCR layer, or a
+    // producer that draws the whole page rotated 90° with a text matrix instead
+    // of `/Rotate`) is otherwise emptied: every run is classified vertical and
+    // dropped as margin furniture by `append_vertical_text`. Rotate such a page
+    // upright and run the normal horizontal pipeline. A horizontal-majority
+    // page keeps the existing margin behaviour for its minority vertical runs
+    // (side stamps, letterheads).
+    let total_chars: usize = spans.iter().map(|s| s.text.chars().count()).sum();
+    let vertical_chars = vertical_up_chars + vertical_down_chars;
+    if total_chars > 0 && vertical_chars * 5 >= total_chars * 3 {
+        page_height = rotate_spans_upright(&mut spans, vertical_up_chars >= vertical_down_chars);
     }
 
     let (horizontal_spans, vertical_spans): (Vec<Span>, Vec<Span>) =
@@ -1412,6 +1888,7 @@ pub fn extract_page_glyphs(
         render_cluster(&lines)
     };
 
+
     let mut blocks = if detect_layout {
         build_doc_blocks(&lines, page_height)
     } else {
@@ -1440,6 +1917,7 @@ pub fn extract_page_glyphs(
         has_fonts,
         tables: if table_rendered { hits.len() } else { 0 },
         blocks,
+        budget_exhausted: budget.exhausted,
     })
 }
 
@@ -2028,5 +2506,599 @@ mod tests {
         let mut s = "Num\u{FB01} scal \u{FB00}ort \u{FB03}cient \u{FB02}eur".to_string();
         fold_ligatures(&mut s);
         assert_eq!(s, "Numfi scal ffort fficient fleur");
+    }
+
+    // ------------------------------------------------------------------
+    // B1: Form XObject recursion in the glyph engine
+    // ------------------------------------------------------------------
+
+    use lopdf::{dictionary, Stream};
+
+    fn rl(v: f64) -> Object {
+        Object::Real(v as f32)
+    }
+
+    fn show_at(x: f64, y: f64, text: &str) -> Vec<Operation> {
+        vec![
+            Operation::new(
+                "Tm",
+                vec![rl(1.0), rl(0.0), rl(0.0), rl(1.0), rl(x), rl(y)],
+            ),
+            Operation::new("Tj", vec![Object::string_literal(text.to_string())]),
+        ]
+    }
+
+    fn form_dict(matrix: Option<[f64; 6]>, bbox: Option<[f64; 4]>) -> Dictionary {
+        let mut fd = Dictionary::new();
+        fd.set(b"Type", Object::Name(b"XObject".to_vec()));
+        fd.set(b"Subtype", Object::Name(b"Form".to_vec()));
+        if let Some(m) = matrix {
+            fd.set(
+                b"Matrix",
+                vec![rl(m[0]), rl(m[1]), rl(m[2]), rl(m[3]), rl(m[4]), rl(m[5])],
+            );
+        }
+        if let Some(b) = bbox {
+            fd.set(b"BBox", vec![rl(b[0]), rl(b[1]), rl(b[2]), rl(b[3])]);
+        }
+        fd
+    }
+
+    /// One-page document whose `/Resources/XObject` maps each name to a form.
+    /// Each form entry is `(name, form_ops, matrix, bbox, own_font_id)`.
+    fn pdf_with_named_forms(
+        page_ops: Vec<Operation>,
+        forms: &[(&[u8], Vec<Operation>, Option<[f64; 6]>, Option<[f64; 4]>, Option<ObjectId>)],
+    ) -> (Document, ObjectId) {
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let page_font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Courier",
+        });
+        let mut xobjects = Dictionary::new();
+        for (name, ops, matrix, bbox, own_font) in forms {
+            let mut fd = form_dict(*matrix, *bbox);
+            if let Some(fid) = own_font {
+                let res = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => *fid } });
+                fd.set(b"Resources", Object::Reference(res));
+            }
+            let sid = doc.add_object(Stream::new(
+                fd,
+                Content { operations: ops.clone() }.encode().unwrap(),
+            ));
+            xobjects.set(name.to_vec(), Object::Reference(sid));
+        }
+        let page_res = doc.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => page_font },
+            "XObject" => xobjects,
+        });
+        let content_id = doc.add_object(Stream::new(
+            Dictionary::new(),
+            Content { operations: page_ops }.encode().unwrap(),
+        ));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id, "Contents" => content_id,
+        });
+        let pages = dictionary! {
+            "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            "Resources" => page_res,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+        };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        (doc, page_id)
+    }
+
+    fn walk_page(doc: &Document, page_id: ObjectId) -> (Vec<Span>, GlyphBudget) {
+        let chain = crate::text_extract::resource_dicts(doc, page_id);
+        let content = crate::text_extract::decode_page_content(doc, page_id).expect("content");
+        let mut budget = GlyphBudget::new();
+        let mut cache: HashMap<usize, Vec<GlyphFontInfo>> = HashMap::new();
+        let mut seen = false;
+        let (spans, _) = {
+            let walk = walk_glyphs(
+                doc,
+                &chain,
+                &content.operations,
+                Mtx::ID,
+                &mut Vec::new(),
+                0,
+                &mut seen,
+                &mut budget,
+                &mut cache,
+            );
+            (walk.spans, walk.underline_segs)
+        };
+        (spans, budget)
+    }
+
+    #[test]
+    fn form_xobject_text_is_walked_with_page_resources() {
+        let form_ops = {
+            let mut v = vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), rl(10.0)]),
+            ];
+            v.extend(show_at(50.0, 700.0, "FORM"));
+            v.push(Operation::new("ET", vec![]));
+            v
+        };
+        let (doc, page_id) = pdf_with_named_forms(
+            vec![Operation::new("Do", vec![Object::Name(b"Fm0".to_vec())])],
+            &[(b"Fm0", form_ops, None, None, None)],
+        );
+        let (spans, _) = walk_page(&doc, page_id);
+        assert_eq!(spans.len(), 1, "form text must be extracted");
+        assert_eq!(spans[0].text, "FORM");
+        assert!((spans[0].x - 50.0).abs() < 0.01 && (spans[0].y - 700.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn form_matrix_and_page_cm_compose_correctly() {
+        // Page cm scales by 2 and translates (100,100); form /Matrix translates
+        // (10,20). A form-space origin must land at 2*(10,20)+(100,100).
+        let form_ops = {
+            let mut v = vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), rl(10.0)]),
+            ];
+            v.extend(show_at(0.0, 0.0, "X"));
+            v.push(Operation::new("ET", vec![]));
+            v
+        };
+        let page_ops = vec![
+            Operation::new("q", vec![]),
+            Operation::new("cm", vec![rl(2.0), rl(0.0), rl(0.0), rl(2.0), rl(100.0), rl(100.0)]),
+            Operation::new("Do", vec![Object::Name(b"Fm0".to_vec())]),
+            Operation::new("Q", vec![]),
+        ];
+        let (doc, page_id) = pdf_with_named_forms(
+            page_ops,
+            &[(b"Fm0", form_ops, Some([1.0, 0.0, 0.0, 1.0, 10.0, 20.0]), None, None)],
+        );
+        let (spans, _) = walk_page(&doc, page_id);
+        assert_eq!(spans.len(), 1);
+        assert!(
+            (spans[0].x - 120.0).abs() < 0.01 && (spans[0].y - 140.0).abs() < 0.01,
+            "composed device position wrong: ({}, {})",
+            spans[0].x,
+            spans[0].y
+        );
+        assert!((spans[0].size - 20.0).abs() < 0.01, "cm scale must apply to the size");
+    }
+
+    #[test]
+    fn form_local_font_overrides_the_page_font_of_the_same_name() {
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let page_font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Courier",
+        });
+        let cmap = doc.add_object(Stream::new(
+            Dictionary::new(),
+            b"begincmap\nbeginbfchar\n<41> <005A>\nendbfchar\nendcmap\n".to_vec(),
+        ));
+        let form_font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Courier", "ToUnicode" => cmap,
+        });
+        let res = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => form_font } });
+        let mut fd = form_dict(None, None);
+        fd.set(b"Resources", Object::Reference(res));
+        let form_ops = vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), rl(10.0)]),
+            Operation::new("Tj", vec![Object::string_literal("A".to_string())]),
+            Operation::new("ET", vec![]),
+        ];
+        let form_id = doc.add_object(Stream::new(
+            fd,
+            Content { operations: form_ops }.encode().unwrap(),
+        ));
+        let page_res = doc.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => page_font },
+            "XObject" => dictionary! { "Fm0" => form_id },
+        });
+        let page_ops = vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), rl(10.0)]),
+            Operation::new("Tj", vec![Object::string_literal("A".to_string())]),
+            Operation::new("Td", vec![rl(0.0), rl(-20.0)]),
+            Operation::new("Tj", vec![Object::string_literal("A".to_string())]),
+            Operation::new("ET", vec![]),
+            Operation::new("Do", vec![Object::Name(b"Fm0".to_vec())]),
+        ];
+        let content_id = doc.add_object(Stream::new(
+            Dictionary::new(),
+            Content { operations: page_ops }.encode().unwrap(),
+        ));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id, "Contents" => content_id,
+        });
+        let pages = dictionary! {
+            "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            "Resources" => page_res,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+        };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+
+        let (spans, _) = walk_page(&doc, page_id);
+        let page_a = spans.iter().filter(|s| s.text == "A").count();
+        let form_z = spans.iter().filter(|s| s.text == "Z").count();
+        assert_eq!(page_a, 2, "page /F1 must still decode to 'A'");
+        assert_eq!(form_z, 1, "the form's own /F1 must decode to 'Z'");
+    }
+
+    #[test]
+    fn form_bbox_clips_a_span_outside_it() {
+        // Two runs: one inside the BBox, one far to the right of it.
+        let form_ops = {
+            let mut v = vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), rl(10.0)]),
+            ];
+            v.extend(show_at(50.0, 700.0, "IN"));
+            v.extend(show_at(400.0, 700.0, "OUT"));
+            v.push(Operation::new("ET", vec![]));
+            v
+        };
+        let (doc, page_id) = pdf_with_named_forms(
+            vec![Operation::new("Do", vec![Object::Name(b"Fm0".to_vec())])],
+            &[(b"Fm0", form_ops, None, Some([40.0, 600.0, 120.0, 720.0]), None)],
+        );
+        let (spans, _) = walk_page(&doc, page_id);
+        assert_eq!(spans.len(), 1, "only the span inside the form /BBox survives: {spans:?}");
+        assert_eq!(spans[0].text, "IN");
+    }
+
+    #[test]
+    fn form_drawn_twice_yields_two_runs() {
+        let form_ops = {
+            let mut v = vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), rl(10.0)]),
+            ];
+            v.extend(show_at(50.0, 700.0, "AB"));
+            v.push(Operation::new("ET", vec![]));
+            v
+        };
+        let page_ops = vec![
+            Operation::new("Do", vec![Object::Name(b"Fm0".to_vec())]),
+            Operation::new("Do", vec![Object::Name(b"Fm0".to_vec())]),
+        ];
+        let (doc, page_id) =
+            pdf_with_named_forms(page_ops, &[(b"Fm0", form_ops, None, None, None)]);
+        let (spans, budget) = walk_page(&doc, page_id);
+        assert_eq!(spans.len(), 2, "a form drawn twice contributes two runs");
+        assert_eq!(budget.do_left, MAX_FORM_DO_PER_PAGE - 2);
+    }
+
+    #[test]
+    fn self_referential_form_terminates() {
+        // One form object exposed under two names; its content does `/B Do`,
+        // which resolves back to the same object and must be skipped.
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let page_font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Courier",
+        });
+        let form_ops = vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), rl(10.0)]),
+            Operation::new("Tj", vec![Object::string_literal("R".to_string())]),
+            Operation::new("ET", vec![]),
+            Operation::new("Do", vec![Object::Name(b"B".to_vec())]),
+        ];
+        let form_id = doc.add_object(Stream::new(
+            form_dict(None, None),
+            Content { operations: form_ops }.encode().unwrap(),
+        ));
+        let page_res = doc.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => page_font },
+            "XObject" => dictionary! { "A" => form_id, "B" => form_id },
+        });
+        let content_id = doc.add_object(Stream::new(
+            Dictionary::new(),
+            Content { operations: vec![Operation::new("Do", vec![Object::Name(b"A".to_vec())])] }
+                .encode()
+                .unwrap(),
+        ));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id, "Contents" => content_id,
+        });
+        let pages = dictionary! {
+            "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            "Resources" => page_res,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+        };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+
+        let (spans, _) = walk_page(&doc, page_id);
+        assert_eq!(spans.len(), 1, "a self-referential form must be walked once");
+    }
+
+    #[test]
+    fn wide_form_expansion_hits_the_do_budget_and_terminates() {
+        // One form issues far more `Do`s than the budget allows; without the
+        // shared budget the page would decode/process all of them.
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let page_font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Courier",
+        });
+        // Leaf form: draws one glyph.
+        let leaf_ops = {
+            let mut v = vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), rl(10.0)]),
+            ];
+            v.extend(show_at(10.0, 10.0, "L"));
+            v.push(Operation::new("ET", vec![]));
+            v
+        };
+        let mut leaf_fd = form_dict(None, None);
+        leaf_fd.set(
+            b"Resources",
+            Object::Dictionary(dictionary! { "Font" => dictionary! { "F1" => page_font } }),
+        );
+        let leaf_id = doc.add_object(Stream::new(
+            leaf_fd,
+            Content { operations: leaf_ops }.encode().unwrap(),
+        ));
+        // Parent form: `n` Do's of the leaf, more than the budget.
+        let n = MAX_FORM_DO_PER_PAGE + 88;
+        let mut parent_ops = Vec::new();
+        for _ in 0..n {
+            parent_ops.push(Operation::new("Do", vec![Object::Name(b"N".to_vec())]));
+        }
+        let mut parent_fd = form_dict(None, None);
+        parent_fd.set(
+            b"Resources",
+            Object::Dictionary(dictionary! {
+                "Font" => dictionary! { "F1" => page_font },
+                "XObject" => dictionary! { "N" => leaf_id },
+            }),
+        );
+        let parent_id = doc.add_object(Stream::new(
+            parent_fd,
+            Content { operations: parent_ops }.encode().unwrap(),
+        ));
+        let page_res = doc.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => page_font },
+            "XObject" => dictionary! { "Fm0" => parent_id },
+        });
+        let content_id = doc.add_object(Stream::new(
+            Dictionary::new(),
+            Content { operations: vec![Operation::new("Do", vec![Object::Name(b"Fm0".to_vec())])] }
+                .encode()
+                .unwrap(),
+        ));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id, "Contents" => content_id,
+        });
+        let pages = dictionary! {
+            "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            "Resources" => page_res,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+        };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+
+        let (spans, budget) = walk_page(&doc, page_id);
+        assert_eq!(budget.do_left, 0, "the shared Do budget must be exhausted");
+        assert!(
+            spans.len() <= MAX_FORM_DO_PER_PAGE,
+            "expansion must stop at the budget, got {} spans",
+            spans.len()
+        );
+    }
+
+    #[test]
+    fn many_distinct_forms_are_all_walked() {
+        // 1200 distinct one-word forms, each invoked once (the shape that the
+        // old 512 `Do`/page cap truncated): every form must contribute a span.
+        let n = 1200usize;
+        let names: Vec<Vec<u8>> = (0..n).map(|i| format!("Fm{i}").into_bytes()).collect();
+        let forms: Vec<(&[u8], Vec<Operation>, Option<[f64; 6]>, Option<[f64; 4]>, Option<ObjectId>)> =
+            names
+                .iter()
+                .map(|nm| {
+                    let mut ops = vec![
+                        Operation::new("BT", vec![]),
+                        Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), rl(10.0)]),
+                    ];
+                    ops.extend(show_at(10.0, 700.0, std::str::from_utf8(nm).unwrap()));
+                    ops.push(Operation::new("ET", vec![]));
+                    (nm.as_slice(), ops, None, None, None)
+                })
+                .collect();
+        let page_ops: Vec<Operation> = (0..n)
+            .map(|i| {
+                Operation::new("Do", vec![Object::Name(format!("Fm{i}").into_bytes())])
+            })
+            .collect();
+        let (doc, page_id) = pdf_with_named_forms(page_ops, &forms);
+        let (spans, budget) = walk_page(&doc, page_id);
+        assert_eq!(spans.len(), n, "all distinct forms must contribute a span");
+        assert_eq!(budget.do_left, MAX_FORM_DO_PER_PAGE - n);
+    }
+
+    #[test]
+    fn a_form_repeated_600_times_yields_600_runs() {
+        // The same form drawn 600 times at distinct positions is content, not
+        // overdraw; the old 512 cap silently dropped the last 88.
+        let form_ops = {
+            let mut v = vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), rl(10.0)]),
+            ];
+            v.extend(show_at(10.0, 700.0, "R"));
+            v.push(Operation::new("ET", vec![]));
+            v
+        };
+        let n = 600usize;
+        let mut page_ops = Vec::new();
+        for i in 0..n {
+            page_ops.push(Operation::new("q", vec![]));
+            page_ops.push(Operation::new(
+                "cm",
+                vec![
+                    rl(1.0), rl(0.0), rl(0.0), rl(1.0),
+                    rl(10.0 + i as f64 * 4.0), rl(700.0),
+                ],
+            ));
+            page_ops.push(Operation::new("Do", vec![Object::Name(b"Fm0".to_vec())]));
+            page_ops.push(Operation::new("Q", vec![]));
+        }
+        let (doc, page_id) =
+            pdf_with_named_forms(page_ops, &[(b"Fm0", form_ops, None, None, None)]);
+        let (spans, budget) = walk_page(&doc, page_id);
+        assert_eq!(spans.len(), n, "600 distinct placements must survive");
+        assert_eq!(budget.do_left, MAX_FORM_DO_PER_PAGE - n);
+    }
+
+    #[test]
+    fn form_text_feeds_table_detection() {
+        let mut form_ops = vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), rl(10.0)]),
+        ];
+        let header = ["Ref", "Qty", "Total"];
+        let rows = [
+            ["A1", "2", "10,00"],
+            ["B2", "1", "20,00"],
+            ["C3", "5", "30,00"],
+        ];
+        for (ri, row) in std::iter::once(&header).chain(rows.iter()).enumerate() {
+            let y = 700.0 - ri as f64 * 20.0;
+            for (ci, cell) in row.iter().enumerate() {
+                form_ops.extend(show_at(50.0 + ci as f64 * 100.0, y, cell));
+            }
+        }
+        form_ops.push(Operation::new("ET", vec![]));
+        let (doc, page_id) = pdf_with_named_forms(
+            vec![Operation::new("Do", vec![Object::Name(b"Fm0".to_vec())])],
+            &[(b"Fm0", form_ops, None, None, None)],
+        );
+        let pt = extract_page_glyphs(&doc, page_id, true, true, false).expect("page text");
+        assert!(pt.tables >= 1, "form grid must be recovered as a table");
+        assert!(pt.text.contains("---"), "GFM table separator missing:\n{}", pt.text);
+    }
+
+    // ------------------------------------------------------------------
+    // B2: inherited page geometry and dominantly-vertical pages
+    // ------------------------------------------------------------------
+
+    fn pdf_page_with(
+        page_ops: Vec<Operation>,
+        page_rotate: Option<i64>,
+        pages_rotate: Option<i64>,
+        media: [f64; 4],
+    ) -> (Document, ObjectId) {
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Courier",
+        });
+        let res = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font } });
+        let content = doc.add_object(Stream::new(
+            Dictionary::new(),
+            Content { operations: page_ops }.encode().unwrap(),
+        ));
+        let mut pd = dictionary! {
+            "Type" => "Page", "Parent" => pages_id, "Contents" => content, "Resources" => res,
+        };
+        if let Some(r) = page_rotate {
+            pd.set(b"Rotate", r);
+        }
+        let page_id = doc.add_object(pd);
+        let mut pages = dictionary! {
+            "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            "MediaBox" => vec![rl(media[0]), rl(media[1]), rl(media[2]), rl(media[3])],
+        };
+        if let Some(r) = pages_rotate {
+            pages.set(b"Rotate", r);
+        }
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let cat = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", cat);
+        (doc, page_id)
+    }
+
+    fn tm_at(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) -> Operation {
+        Operation::new(
+            "Tm",
+            vec![rl(a), rl(b), rl(c), rl(d), rl(e), rl(f)],
+        )
+    }
+
+    /// A page rotated 90° clockwise by `/Rotate` must apply the rotation matrix
+    /// (and report the swapped height), even when the attribute is inherited
+    /// from `/Pages` rather than set on the page.
+    #[test]
+    fn rotate_is_read_from_the_page_and_inherited_from_pages() {
+        let ops = vec![Operation::new("BT", vec![])];
+        let (doc, page_id) = pdf_page_with(ops.clone(), Some(90), None, [0.0, 0.0, 200.0, 100.0]);
+        let (m, h) = page_initial_transform(&doc, page_id);
+        assert!((m.a - 0.0).abs() < 1e-9 && (m.b + 1.0).abs() < 1e-9, "rotate 90 matrix wrong: {m:?}");
+        assert!((m.c - 1.0).abs() < 1e-9 && (m.d - 0.0).abs() < 1e-9);
+        assert!((h - 200.0).abs() < 1e-9, "rotated display height must swap to width");
+
+        // No page /Rotate, but 270° on the /Pages ancestor: inherited.
+        let (doc2, pid2) = pdf_page_with(ops, None, Some(270), [0.0, 0.0, 200.0, 100.0]);
+        let (m2, h2) = page_initial_transform(&doc2, pid2);
+        assert!((m2.a - 0.0).abs() < 1e-9 && (m2.b - 1.0).abs() < 1e-9, "inherited rotate wrong: {m2:?}");
+        assert!((m2.c + 1.0).abs() < 1e-9 && (m2.d - 0.0).abs() < 1e-9);
+        assert!((h2 - 200.0).abs() < 1e-9);
+    }
+
+    /// A page whose text is entirely vertical (a sideways OCR layer) must be
+    /// rotated upright and read, not dropped as margin furniture.
+    #[test]
+    fn dominantly_vertical_page_is_rotated_upright() {
+        let mut ops = vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), rl(10.0)]),
+        ];
+        // Bottom-to-top reading (upward): text x-axis maps to device +y.
+        for (i, ch) in ["S", "I", "D", "E"].iter().enumerate() {
+            ops.push(tm_at(0.0, 1.0, -1.0, 0.0, 100.0, 700.0 + i as f64 * 10.0));
+            ops.push(Operation::new("Tj", vec![Object::string_literal(ch.to_string())]));
+        }
+        ops.push(Operation::new("ET", vec![]));
+        let (doc, page_id) = pdf_page_with(ops, None, None, [0.0, 0.0, 595.0, 842.0]);
+        let pt = extract_page_glyphs(&doc, page_id, true, true, false).expect("page text");
+        let letters: String = pt.text.split_whitespace().collect();
+        assert!(letters.contains("SIDE"), "vertical page was not rotated upright: {:?}", pt.text);
+        assert!(pt.text_ops_seen);
+    }
+
+    /// A minority vertical run — a page stamp or letterhead — must still be
+    /// dropped from the body when layout analysis is on, and must not trigger
+    /// the dominant-vertical rotation.
+    #[test]
+    fn minority_vertical_stamp_stays_out_of_a_horizontal_body() {
+        let ops = vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), rl(10.0)]),
+            tm_at(1.0, 0.0, 0.0, 1.0, 50.0, 500.0),
+            Operation::new("Tj", vec![Object::string_literal("BODY TEXT".to_string())]),
+            tm_at(0.0, 1.0, -1.0, 0.0, 20.0, 100.0),
+            Operation::new("Tj", vec![Object::string_literal("STAMP".to_string())]),
+            Operation::new("ET", vec![]),
+        ];
+        let (doc, page_id) = pdf_page_with(ops, None, None, [0.0, 0.0, 595.0, 842.0]);
+        let pt = extract_page_glyphs(&doc, page_id, true, true, false).expect("page text");
+        assert!(pt.text.contains("BODY"), "horizontal body must survive: {:?}", pt.text);
+        assert!(!pt.text.contains("STAMP"), "minority stamp leaked into the body: {:?}", pt.text);
+        assert!(
+            pt.blocks.iter().any(|b| b.kind == "margin" && b.text.contains("STAMP")),
+            "the stamp must still be reported as a margin block"
+        );
     }
 }

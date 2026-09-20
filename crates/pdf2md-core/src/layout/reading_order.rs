@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use crate::layout::glyph_stream::Span;
+use crate::reflow::{classify_hyphen_join, HyphenJoin};
 
 /// One structured block (reading unit) with a semantic role.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1151,7 +1152,16 @@ pub(crate) fn push_band_lines(
                 for line in left {
                     push_line(out, line, prev_line_y, list_state, body_size);
                 }
-                if !out.is_empty() && !out.ends_with('\n') {
+                // Paragraph break between the two column streams. Without it
+                // the last line of the left column and the first line of the
+                // right column are emitted as consecutive lines, and the
+                // paragraph reflow (`reflow.rs`) can join them into one
+                // sentence when the left line has no terminator and the right
+                // line starts lowercase (WP-C residual: column weld).
+                if !right.is_empty() {
+                    if !out.ends_with('\n') {
+                        out.push('\n');
+                    }
                     out.push('\n');
                 }
                 *prev_line_y = None;
@@ -2084,24 +2094,24 @@ fn merge_paragraph_lines(blocks: Vec<DocBlock>) -> Vec<DocBlock> {
 }
 
 /// Joins `next` onto `text` as a paragraph continuation: de-hyphenates a
-/// genuine line-wrap break (a hyphen preceded by a letter, e.g. "infor-" +
-/// "mation" -> "information"), otherwise joins with a plain space.
+/// genuine line-wrap break (a hyphen preceded by a letter, followed by a
+/// lowercase *fragment* — not a French clitic / compound tail, e.g.
+/// "infor-" + "mation" -> "information"), otherwise joins with a plain space.
 fn join_paragraph_text(text: &mut String, next: &str) {
     let trimmed_len = text.trim_end().len();
-    let is_hyphenated_break = trimmed_len > 0
-        && text.as_bytes()[..trimmed_len].last() == Some(&b'-')
-        && text[..trimmed_len - 1]
-            .chars()
-            .last()
-            .map_or(false, |c| c.is_alphabetic());
-
     text.truncate(trimmed_len);
-    if is_hyphenated_break {
-        text.pop(); // drop the trailing '-'
-        text.push_str(next.trim_start());
-    } else {
-        text.push(' ');
-        text.push_str(next);
+    match classify_hyphen_join(text, next) {
+        HyphenJoin::Dehyphenate => {
+            text.pop(); // drop the trailing '-'
+            text.push_str(next.trim_start());
+        }
+        HyphenJoin::KeepHyphen => {
+            text.push_str(next.trim_start());
+        }
+        HyphenJoin::None => {
+            text.push(' ');
+            text.push_str(next);
+        }
     }
 }
 
@@ -3228,6 +3238,22 @@ mod paragraph_merge_tests {
         assert_eq!(text, "information");
     }
 
+    #[test]
+    fn real_compound_hyphen_is_kept_on_merge() {
+        // A clitic tail (inversion) is not a line-wrap fragment.
+        let mut text = "Comment va-".to_string();
+        join_paragraph_text(&mut text, "t-il ?");
+        assert_eq!(text, "Comment va-t-il ?");
+        // A hyphenated compound whose second element is a whole word.
+        let mut text = "un non-".to_string();
+        join_paragraph_text(&mut text, "professionnel ici");
+        assert_eq!(text, "un non-professionnel ici");
+        // A capitalised continuation is never a line-wrap fragment either.
+        let mut text = "la ville de".to_string();
+        join_paragraph_text(&mut text, "Paris");
+        assert_eq!(text, "la ville de Paris");
+    }
+
     // -- page_two_columns_rows: column membership of unpaired lines -----------
 
     fn col_span(text: &str, x: f64, y: f64) -> Span {
@@ -3453,6 +3479,32 @@ mod column_band_tests {
             ColumnBand::Full(rows) => assert_eq!(render_line_text(&rows[0]), "Heading"),
             ColumnBand::Columns { .. } => panic!("a full-width heading must not be a column"),
         }
+    }
+
+    #[test]
+    fn column_streams_keep_a_paragraph_break() {
+        // The left stream ends with an unterminated lowercase word; the right
+        // stream starts lowercase. Without a blank line between the streams the
+        // paragraph reflow joins them into one sentence (column weld).
+        let left = vec![
+            vec![sp("alpha", 50.0, 300.0), sp("beta", 80.0, 300.0)],
+            vec![sp("the", 50.0, 290.0)],
+        ];
+        let right = vec![vec![sp("gamma", 300.0, 300.0)]];
+        let bands = vec![ColumnBand::Columns { left, right }];
+        let mut out = String::new();
+        let mut prev = None;
+        let mut ls = ListRunState::default();
+        push_band_lines(&mut out, &bands, &mut prev, &mut ls, 10.0);
+        assert!(
+            out.contains("\n\n"),
+            "no blank line between column streams: {out:?}"
+        );
+        let reflowed = crate::reflow::reflow_markdown(&out);
+        assert!(
+            !reflowed.contains("the gamma"),
+            "left/right column streams were welded by reflow: {reflowed:?}"
+        );
     }
 
     #[test]

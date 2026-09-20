@@ -12,7 +12,9 @@ use std::path::PathBuf;
 use std::process;
 use clap::Parser;
 
-use pdf2md_core::{convert_pdf_bytes_to_markdown, is_digital_pdf_bytes, ConversionOptions};
+use pdf2md_core::{
+    convert_pdf_bytes_to_markdown, is_digital_pdf_bytes, pdf_password_required, ConversionOptions,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -70,6 +72,14 @@ fn main() {
     };
 
     if !is_digital_pdf_bytes(&bytes) {
+        // An encrypted PDF is not a scanned image: surface the library's
+        // distinct encryption error (the same text the conversion returns)
+        // instead of the generic "no digital text layer" hint, which would
+        // wrongly suggest an OCR rescue that cannot read the file either.
+        if pdf_password_required(&bytes) {
+            eprintln!("Conversion error: {}", pdf2md_core::ENCRYPTED_PDF_ERROR);
+            process::exit(3);
+        }
         eprintln!("Error: Document lacks a readable digital text layer or is a scanned image.");
         eprintln!("Tip: this CLI only runs the fast digital-text path; route the document through a vision/OCR rescue service for scanned pages.");
         process::exit(2);
