@@ -221,7 +221,44 @@ pub fn is_tabular_rows(rows: &[Vec<String>]) -> bool {
             }
         }
     }
-    if total_words_count >= 12 && stopword_count * 100 / total_words_count >= 20 {
+    // A column of bare numeric/currency amounts is a structural table signal
+    // no prose paragraph has. French account/amount grids carry stopword-dense
+    // labels ("Virement de la section …", "Dotations fonds divers réserve"),
+    // so the prose detector above discards genuine tables. When a column holds
+    // >= 2 values and is at least 3/4 numeric, the stopword share is not
+    // evidence of flowing prose.
+    let is_amount_cell = |c: &str| -> bool {
+        let t = c
+            .trim()
+            .trim_matches(|ch: char| matches!(ch, '€' | '$' | '£' | ' ' | '\u{00a0}'));
+        if t.is_empty() {
+            return false;
+        }
+        let mut digit = false;
+        for ch in t.chars() {
+            if ch.is_ascii_digit() {
+                digit = true;
+            } else if !matches!(ch, '.' | ',' | '-' | '+' | '%' | '/' | '\'' | ' ' | '\u{00a0}') {
+                return false;
+            }
+        }
+        digit
+    };
+    let numeric_col = (0..cols).any(|k| {
+        let cells: Vec<&str> = data
+            .iter()
+            .filter_map(|r| {
+                let c = r.get(k).map_or("", |c| c.as_str()).trim();
+                if c.is_empty() {
+                    None
+                } else {
+                    Some(c)
+                }
+            })
+            .collect();
+        cells.len() >= 2 && cells.iter().filter(|c| is_amount_cell(c)).count() * 4 >= cells.len() * 3
+    });
+    if !numeric_col && total_words_count >= 12 && stopword_count * 100 / total_words_count >= 20 {
         return false;
     }
 
@@ -261,4 +298,41 @@ pub fn is_tabular_rows(rows: &[Vec<String>]) -> bool {
 
     let overall = total_tokens as f64 / total_cells as f64;
     overall < 6.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A French account/amount grid's labels are stopword-dense ("Virement de
+    /// la section …", "Dotations fonds divers réserve"), so the prose stopword
+    /// detector used to discard it even though the amount column is a
+    /// structural table signal no paragraph has. A dedicated numeric column
+    /// must override the stopword veto and keep the grid.
+    #[test]
+    fn numeric_amount_column_overrides_french_stopwords() {
+        let rows: Vec<Vec<String>> = vec![
+            vec!["011".into(), "Charges à caractère général".into(), "35 799.00 €".into()],
+            vec!["12".into(), "Virement de la section de fon".into(), "7 100.00 €".into()],
+            vec!["20".into(), "Dotations fonds divers réserve".into(), "16 024.00 €".into()],
+            vec!["21".into(), "Immobilisations en cours".into(), "0.00 €".into()],
+        ];
+        assert!(
+            is_tabular_rows(&rows),
+            "a numeric amount column must override the stopword veto: {rows:?}"
+        );
+    }
+
+    /// The numeric-column escape must not accept prose: with no dedicated
+    /// amount column the stopword share still vetoes the grid.
+    #[test]
+    fn stopword_dense_grid_without_numeric_column_is_rejected() {
+        let rows: Vec<Vec<String>> = vec![
+            vec!["La commune de la".into(), "section des travaux".into()],
+            vec!["Le projet de la".into(), "ville et de la".into()],
+            vec!["Les élus de la".into(), "commune sont".into()],
+            vec!["Une partie de la".into(), "voie est".into()],
+        ];
+        assert!(!is_tabular_rows(&rows), "stopword-dense prose was accepted: {rows:?}");
+    }
 }

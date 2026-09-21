@@ -233,12 +233,97 @@ fn cluster_positions(mut points: Vec<(f64, usize)>, tol: f64) -> Vec<f64> {
         .collect()
 }
 
+/// Whether word `i` may testify that its own centre is a column position: it
+/// must be either the row's leading word or its own cell, separated from both
+/// neighbours by a column gutter. An interior word of a multi-word cell can
+/// never be a centred column on its own.
+fn word_may_define_center(row: &RowInfo, i: usize, min_gutter: f64) -> bool {
+    let words = &row.words;
+    let sep_left = i == 0 || words[i].x0 - words[i - 1].x1 >= min_gutter;
+    let sep_right = i + 1 >= words.len() || words[i + 1].x0 - words[i].x1 >= min_gutter;
+    sep_left && sep_right
+}
+
+/// Centres of words that are their own cell, clustered across rows, for
+/// columns that are neither left- nor right-aligned.
+///
+/// The start and end passes each need a shared edge; a column whose values are
+/// *centred* in their cell (a common layout for numeric totals: "34155",
+/// "1146" and "3,40 %" share neither a left nor a right edge, only a centre)
+/// produces no ruler from either, so the whole grid is silently dropped to
+/// plain text. A centre candidate is kept only when it spans >= 2 rows AND its
+/// words are not already anchored by a start or end ruler — a left/right
+/// aligned column whose values happen to be equal-width would otherwise gain a
+/// redundant ruler that splits the column.
+fn center_rulers(
+    info: &[RowInfo],
+    window_rows: &[usize],
+    tol: f64,
+    min_gutter: f64,
+    start_rulers: &[f64],
+    end_rulers: &[f64],
+) -> Vec<f64> {
+    let mut points: Vec<(f64, usize, f64, f64)> = Vec::new();
+    for &ri in window_rows {
+        let row = &info[ri];
+        for i in 0..row.words.len() {
+            if word_may_define_center(row, i, min_gutter) {
+                let w = &row.words[i];
+                points.push((0.5 * (w.x0 + w.x1), ri, w.x0, w.x1));
+            }
+        }
+    }
+    if points.len() < 2 {
+        return Vec::new();
+    }
+    points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    struct Clust {
+        sum_c: f64,
+        n: usize,
+        rows: std::collections::HashSet<usize>,
+        members: Vec<(f64, f64)>,
+    }
+    let mut clusters: Vec<Clust> = Vec::new();
+    for (c, ri, x0, x1) in points {
+        if let Some(last) = clusters.last_mut() {
+            let mean = last.sum_c / last.n as f64;
+            if (c - mean).abs() <= tol {
+                last.sum_c += c;
+                last.n += 1;
+                last.rows.insert(ri);
+                last.members.push((x0, x1));
+                continue;
+            }
+        }
+        let mut rows = std::collections::HashSet::new();
+        rows.insert(ri);
+        clusters.push(Clust { sum_c: c, n: 1, rows, members: vec![(x0, x1)] });
+    }
+
+    let near = |x: f64, rulers: &[f64]| rulers.iter().any(|&r| (r - x).abs() <= tol * 1.5);
+    clusters
+        .into_iter()
+        .filter(|c| c.rows.len() >= 2)
+        .filter(|c| {
+            let anchored = c
+                .members
+                .iter()
+                .filter(|(x0, x1)| near(*x0, start_rulers) || near(*x1, end_rulers))
+                .count();
+            anchored * 2 <= c.members.len()
+        })
+        .map(|c| c.sum_c / c.n as f64)
+        .collect()
+}
+
 /// Table column rulers in rows lo..=hi (inclusive): x positions that appear
 /// in at least 2 rows within tolerance, spaced by at least min_gutter.
 ///
-/// Two independent clustering passes feed the candidate list: word *starts*
-/// (left-aligned columns — descriptions, names, dates) and word *ends*
-/// (right-aligned columns — quantities, unit prices, Montant HT/TVA/TTC).
+/// Three independent clustering passes feed the candidate list: word *starts*
+/// (left-aligned columns — descriptions, names, dates), word *ends*
+/// (right-aligned columns — quantities, unit prices, Montant HT/TVA/TTC), and
+/// word *centres* (centred value columns — see `center_rulers`).
 /// A purely start-based scan misses financial tables entirely: "145,50 €",
 /// "9,20 €", and "1 200,00 €" have wildly different `x0` (their digit counts
 /// differ) but a common `x1` (they're right-aligned to the column edge), so
@@ -385,10 +470,30 @@ fn table_rulers_opts(
     // starts first and only *adding* end-derived rulers that are at least
     // `min_gutter` away preserves the right-aligned-column support that the
     // end pass exists for.
+    let center_candidates =
+        center_rulers(info, &window_rows, tol, min_gutter, &start_rulers, &end_rulers);
     let mut merged = start_rulers;
     for e in end_rulers {
         if merged.iter().all(|&r| (e - r).abs() >= min_gutter) {
             merged.push(e);
+        }
+    }
+    for c in center_candidates {
+        // A centre candidate is only as good as its weakest row: a word that
+        // spans the centre in *any* window row — e.g. a long label whose two
+        // word-spans happen to fall either side of the candidate — means the x
+        // is interior to a cell, not a column boundary. Start/end candidates
+        // already pass this veto above; centre candidates must too, or the
+        // recovered centre ruler fragments that row's label column.
+        let straddled = window_rows.iter().any(|&ri| {
+            if wide_ok {
+                row_straddles_wide_ok(&info, &col_starts, ri, c, tol, min_gutter)
+            } else {
+                row_straddles(&info[ri], c, tol, min_gutter)
+            }
+        });
+        if !straddled && merged.iter().all(|&r| (c - r).abs() >= min_gutter) {
+            merged.push(c);
         }
     }
     merged.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -403,7 +508,12 @@ fn table_rulers_opts(
 /// would reject every row of a financial table whose only reliable column
 /// signal is its aligned right edge.
 fn row_matches_ruler(row: &RowInfo, r: f64, tol: f64) -> bool {
-    row.starts.iter().any(|&s| (r - s).abs() <= tol) || row.ends.iter().any(|&e| (r - e).abs() <= tol)
+    row.starts.iter().any(|&s| (r - s).abs() <= tol)
+        || row.ends.iter().any(|&e| (r - e).abs() <= tol)
+        || row
+            .words
+            .iter()
+            .any(|w| (0.5 * (w.x0 + w.x1) - r).abs() <= tol)
 }
 
 /// Whether `words` (in left-to-right order) shows any column-like internal
@@ -491,7 +601,63 @@ fn row_straddles(row: &RowInfo, x: f64, tol: f64, min_gutter: f64) -> bool {
     if !row_has_internal_gutter(&row.words, min_gutter) {
         return false;
     }
-    row.words.iter().any(|w| w.x0 < x - tol && w.x1 > x + tol)
+    row.words.iter().enumerate().any(|(i, w)| {
+        if !(w.x0 < x - tol && w.x1 > x + tol) {
+            return false;
+        }
+        // A word that is its own cell and centred on `x` is the very evidence
+        // for a centre-alignment ruler; it must not veto the ruler it defines.
+        let centered = (0.5 * (w.x0 + w.x1) - x).abs() <= tol;
+        !(centered && word_may_define_center(row, i, min_gutter))
+    })
+}
+
+/// Whether the row at `row_idx` is a plausible table header that sits directly
+/// above a detected grid and may be annexed to it.
+///
+/// A wrapped/multi-line table header is often set immediately above the first
+/// data row yet contributes none of the `>= 2` shared rulers the seed needs —
+/// its cells are multi-word and their left edges fall between the data
+/// columns' rulers — so the seed starts at the first data row and the header
+/// is emitted as loose text above the table, failing every `top_heading`
+/// relation. Annexing it must not promote an unrelated caption or prose line,
+/// so the row is accepted only when:
+///   * it aligns with at least two of the table's own column rulers (a
+///     left-margin title matches only column 0);
+///   * no word straddles an interior ruler (a spanning cell would fragment the
+///     emitted cells);
+///   * it is a short label row, not a sentence: every bucketed cell holds
+///     fewer than five words and the row has at most eight words.
+fn header_like_row(
+    info: &[RowInfo],
+    row_idx: usize,
+    rulers: &[f64],
+    tol: f64,
+    min_gutter: f64,
+) -> bool {
+    if rulers.len() < 2 {
+        return false;
+    }
+    let row = &info[row_idx];
+    if row.words.is_empty() || row.words.len() > 8 {
+        return false;
+    }
+    let matched = rulers
+        .iter()
+        .filter(|&&r| row_matches_ruler(row, r, tol * 1.5))
+        .count();
+    if matched < 2 {
+        return false;
+    }
+    if rulers[1..]
+        .iter()
+        .any(|&r| row_straddles(row, r, tol, min_gutter))
+    {
+        return false;
+    }
+    bucket(info, row_idx, rulers)
+        .iter()
+        .all(|c| c.split_whitespace().count() < 5)
 }
 
 /// Start positions shared by at least two of `rows` (the column-start
@@ -536,9 +702,14 @@ fn row_straddles_wide_ok(
     // columns. A full header/data row (as many words as columns) that crosses
     // a boundary is a genuine fragmentation signal and keeps vetoing.
     let row_is_continuation = row.words.len() < col_starts.len();
-    row.words.iter().any(|w| {
+    row.words.iter().enumerate().any(|(i, w)| {
         let crosses = w.x0 < x - tol && w.x1 > x + tol;
         if !crosses {
+            return false;
+        }
+        // See `row_straddles`: a separate cell centred on `x` defines a
+        // centre-alignment ruler and does not veto it.
+        if (0.5 * (w.x0 + w.x1) - x).abs() <= tol && word_may_define_center(row, i, min_gutter) {
             return false;
         }
         let wide = (w.x1 - w.x0) > 4.0 * min_gutter;
@@ -856,10 +1027,29 @@ fn scan_aligned_grids_opts(
                 lo += 1;
                 continue;
             }
-            let win_rows: Vec<usize> = band[lo..=hi].to_vec();
+            // A wrapped/multi-line table header is often set immediately above
+            // the first data row but produced none of the seed's shared rulers
+            // (its multi-word cells left-align between the data columns), so it
+            // was emitted as loose text above the table and every `top_heading`
+            // relation failed. Annex up to two immediately-preceding header
+            // lines from the same band when each is provably header-like.
+            let mut win_lo = lo;
+            while win_lo > 0 && lo - win_lo < 2 {
+                let prev = band[win_lo - 1];
+                let gap = lines[prev][0].y - lines[band[win_lo]][0].y;
+                let size = info[prev].size.max(info[band[win_lo]].size).max(0.1);
+                if !(gap > 0.0 && gap <= 2.2 * size) {
+                    break;
+                }
+                if !header_like_row(&info, prev, &rulers, tol, min_gutter) {
+                    break;
+                }
+                win_lo -= 1;
+            }
+            let win_rows: Vec<usize> = band[win_lo..=hi].to_vec();
             t(&format!(
                 "  WINDOW lo={} (line {}, '{}') hi={} (line {}, '{}') rulers={:?}",
-                lo, band[lo], line_text(&lines[band[lo]]),
+                win_lo, band[win_lo], line_text(&lines[band[win_lo]]),
                 hi, band[hi], line_text(&lines[band[hi]]),
                 rulers
             ));
@@ -1732,6 +1922,70 @@ mod tests {
         assert!(
             hits.iter().all(|h| h.end < 1 || h.start > 2),
             "a gap hit bridged the covered rows: {hits:?}"
+        );
+    }
+
+    /// A numeric column whose values are *centred* in their cell shares neither
+    /// a left nor a right edge across rows ("34155", "1146" and "5679" all
+    /// differ in start and end), so the start and end ruler passes both see no
+    /// column and the grid was emitted as loose text. The centre pass must
+    /// recover it, keeping the left-aligned label column on its start ruler.
+    #[test]
+    fn centered_numeric_columns_are_recovered() {
+        let word = |t: &str, center: f64, width: f64, y: f64| sp_at(t, center - width / 2.0, y, width);
+        let row = |label: &str, v1: &str, v2: &str, v3: &str, y: f64| {
+            vec![
+                sp_at(label, 30.0, y, 40.0),
+                word(v1, 150.0, 30.0, y),
+                word(v2, 210.0, 30.0, y),
+                word(v3, 270.0, 30.0, y),
+            ]
+        };
+        let lines = vec![
+            row("Alpha", "34155", "43354", "60219", 200.0),
+            row("Beta", "1146", "2212", "3994", 186.0),
+            row("Gamma", "5679", "7697", "9484", 172.0),
+            row("Delta", "10335", "20335", "30335", 158.0),
+        ];
+        let hits = find_tables(&lines);
+        assert_eq!(hits.len(), 1, "centred grid not recovered: {hits:?}");
+        assert_eq!(hits[0].start, 0);
+        assert_eq!(hits[0].end, 3);
+        assert_eq!(
+            hits[0].rows[0].len(),
+            4,
+            "centred grid collapsed into one cell: {:?}",
+            hits[0].rows
+        );
+        assert!(
+            hits[0].rows.iter().any(|r| r.contains(&"5679".to_string())),
+            "centred value missing from cells: {:?}",
+            hits[0].rows
+        );
+    }
+
+    /// A left-aligned value column whose values happen to be equal-width also
+    /// has a consistent centre. The centre pass must not add a redundant ruler
+    /// beside the start ruler it already has, which would leave a phantom empty
+    /// column in the emitted grid.
+    #[test]
+    fn left_aligned_equal_width_values_gain_no_centre_ruler() {
+        let row = |label: &str, v: &str, y: f64| {
+            vec![sp_at(label, 30.0, y, 40.0), sp_at(v, 150.0, y, 30.0)]
+        };
+        let lines = vec![
+            row("Alpha", "34155", 200.0),
+            row("Beta", "11467", 186.0),
+            row("Gamma", "56790", 172.0),
+            row("Delta", "10335", 158.0),
+        ];
+        let hits = find_tables(&lines);
+        assert_eq!(hits.len(), 1, "left-aligned grid not recovered: {hits:?}");
+        assert_eq!(
+            hits[0].rows[0].len(),
+            2,
+            "a spurious centre ruler split the left-aligned column: {:?}",
+            hits[0].rows
         );
     }
 }

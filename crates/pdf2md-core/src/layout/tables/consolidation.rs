@@ -8,6 +8,41 @@ use crate::layout::glyph_stream::Span;
 use crate::layout::tables::rulers::{RowInfo, WordTok};
 use crate::layout::tables::validation::has_data_tokens;
 
+/// Assign every word of row `ri` to a column, using the ruler midpoints.
+///
+/// A word whose start lies within an ordinary word space of the previous
+/// word's end belongs to the *same cell*, so it inherits that word's column
+/// instead of being tested against the midpoint on its own. PDF producers
+/// routinely draw one multi-word cell as several runs whose starts straddle
+/// the midpoint boundary — the model-name-plus-version cell "WizardLM 13B
+/// v1.2", the benchmark annotation "6.84 ± 0.07", the header "MT-Bench" —
+/// and the pure per-word midpoint test then cuts that cell across two
+/// columns. A genuine column boundary is always at least a column gutter
+/// wide (`table_rulers_opts`'s `min_gutter`, ~1.1em), far wider than the
+/// `0.65em` word space tested here, so an intra-cell word space can only
+/// ever join two words of the same cell; it can never fuse two real columns.
+///
+/// This is deliberately used only for the *emitted* cells
+/// (`bucket_rows_content_aware`). The `flowing`/`multi_col` validation passes
+/// keep the plain per-word midpoint `bucket`/`bucket_words`, because
+/// collapsing a dense grid's tight columns there would disarm the `flowing`
+/// prose veto and annex whole pages of prose into a spurious table.
+fn assign_columns(info: &[RowInfo], ri: usize, rulers: &[f64]) -> Vec<usize> {
+    let ncol = rulers.len();
+    let bounds: Vec<f64> = rulers.windows(2).map(|p| (p[0] + p[1]) / 2.0).collect();
+    let words = &info[ri].words;
+    let size = info[ri].size.max(0.1);
+    let mut out = Vec::with_capacity(words.len());
+    for (wi, w) in words.iter().enumerate() {
+        let mut col = bounds.iter().position(|&b| w.x0 < b).unwrap_or(ncol - 1);
+        if wi > 0 && w.x0 - words[wi - 1].x1 < 0.65 * size {
+            col = out[wi - 1];
+        }
+        out.push(col);
+    }
+    out
+}
+
 /// Bucket words of row `ri` into columns separated by the ruler midpoints (as WordTok references).
 pub fn bucket_words<'a>(info: &'a [RowInfo], ri: usize, rulers: &[f64]) -> Vec<Vec<&'a WordTok>> {
     let ncol = rulers.len();
@@ -84,7 +119,9 @@ pub fn bucket_rows_content_aware(
         .iter()
         .map(|&ri| {
             let words = &info[ri].words;
-            let assigned: Vec<usize> = words.iter().map(assign).collect();
+            // Same word-space-aware assignment `bucket`/`bucket_words` use, so
+            // the emitted cells agree with the cells the validation passes saw.
+            let assigned: Vec<usize> = assign_columns(info, ri, rulers);
             let is_leading_unit = |wi: usize| {
                 let col = assigned[wi];
                 if has_digit(&words[wi].text) || assigned[..wi].contains(&col) {
@@ -264,7 +301,15 @@ pub fn consolidate_table_rows(
         let gap = lines[prev_line][0].y - lines[curr_line][0].y;
         let candidate_row = &table_rows[1];
         let filled = candidate_row.iter().filter(|c| !c.trim().is_empty()).count();
-        if gap <= row_break_threshold && !has_data_tokens(candidate_row) && filled >= 2 {
+        // A header split across two visual rows often has only one cell in the
+        // second row (e.g. "ELO Rating" under a "Model | MT-Bench" first row).
+        // Merge it when the two rows are *complementary* — no column carries a
+        // cell in both — so the header reads "Model | ELO Rating | MT-Bench"
+        // instead of the lone cell becoming the first data row.
+        let complementary = filled >= 1
+            && (0..num_cols)
+                .all(|c| table_rows[0][c].trim().is_empty() || candidate_row[c].trim().is_empty());
+        if gap <= row_break_threshold && !has_data_tokens(candidate_row) && (filled >= 2 || complementary) {
             header_rows_count = 2;
         }
     }
