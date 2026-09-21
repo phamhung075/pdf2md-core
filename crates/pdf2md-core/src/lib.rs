@@ -3285,6 +3285,81 @@ mod regression_tests {
         }
     }
 
+    /// A table header row immediately preceding data rows without a ruler
+    /// must be annexed into the markdown table header rather than emitted
+    /// as loose prose.
+    #[test]
+    fn synthetic_preceding_header_row_annexation() {
+        let page = [
+            tm_text(40.0, 500.0, "Code"),
+            tm_text(140.0, 500.0, "Description"),
+            tm_text(300.0, 500.0, "Montant"),
+            tm_text(40.0, 485.0, "A10"),
+            tm_text(140.0, 485.0, "Prestation de service"),
+            tm_text(300.0, 485.0, "150.00"),
+            tm_text(40.0, 470.0, "B20"),
+            tm_text(140.0, 470.0, "Fourniture materiel"),
+            tm_text(300.0, 470.0, "230.00"),
+            tm_text(40.0, 455.0, "C30"),
+            tm_text(140.0, 455.0, "Frais de deplacement"),
+            tm_text(300.0, 455.0, "45.00"),
+        ]
+        .join("\n");
+        let md = convert_synth(&[page]);
+        assert!(
+            md.contains("| Code | Description | Montant |") || md.contains("|Code|Description|Montant|"),
+            "header row was not annexed into markdown table; md was:\n{md}"
+        );
+        assert!(md.contains("| A10 |") || md.contains("|A10|"), "row A10 missing from table:\n{md}");
+    }
+
+    /// Multi-word cells across columns must bucket properly without cross-column corruption.
+    #[test]
+    fn synthetic_multi_word_cell_midpoint_bucketing() {
+        let page = [
+            tm_text(40.0, 500.0, "Compte principal"),
+            tm_text(180.0, 500.0, "Assistance sur site"),
+            tm_text(340.0, 500.0, "1 250,00 EUR"),
+            tm_text(40.0, 485.0, "Compte secondaire"),
+            tm_text(180.0, 485.0, "Formation utilisateurs"),
+            tm_text(340.0, 485.0, "840,00 EUR"),
+            tm_text(40.0, 470.0, "Compte tertiaire"),
+            tm_text(180.0, 470.0, "Support annuel"),
+            tm_text(340.0, 470.0, "3 100,00 EUR"),
+        ]
+        .join("\n");
+        let md = convert_synth(&[page]);
+        assert!(md.contains("Assistance sur site"), "missing Assistance sur site:\n{md}");
+        assert!(md.contains("1 250,00 EUR"), "missing amount 1 250,00 EUR:\n{md}");
+        assert!(!md.contains("Compte 1 250,00"), "cell bucket leaked across columns:\n{md}");
+    }
+
+    /// Stopword-dense French account labels beside numeric amount columns must survive
+    /// as a table and not be dropped as flowing prose.
+    #[test]
+    fn synthetic_numeric_stopword_bypass_on_invoice_grids() {
+        let page = [
+            tm_text(40.0, 500.0, "011"),
+            tm_text(90.0, 500.0, "Charges a caractere general"),
+            tm_text(320.0, 500.0, "35 799.00 EUR"),
+            tm_text(40.0, 485.0, "12"),
+            tm_text(90.0, 485.0, "Virement de la section de fonctionnement"),
+            tm_text(320.0, 485.0, "7 100.00 EUR"),
+            tm_text(40.0, 470.0, "20"),
+            tm_text(90.0, 470.0, "Dotations fonds divers et reserve"),
+            tm_text(320.0, 470.0, "16 024.00 EUR"),
+            tm_text(40.0, 455.0, "21"),
+            tm_text(90.0, 455.0, "Immobilisations en cours"),
+            tm_text(320.0, 455.0, "0.00 EUR"),
+        ]
+        .join("\n");
+        let md = convert_synth(&[page]);
+        assert!(
+            md.lines().any(|l| l.trim().starts_with('|') && l.contains("Virement de la section")),
+            "stopword-dense grid was collapsed into prose:\n{md}"
+        );
+    }
+
     /// The layout path's overdraw dedup is intentional: it folds only an exact
     /// overstrike (same text, same baseline) and must never merge two distinct
     /// strings that happen to overlap.
