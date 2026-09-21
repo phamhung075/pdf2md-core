@@ -1936,6 +1936,27 @@ fn detect_heading_level(line: &[Span], body_size: f64) -> Option<u8> {
         / total_chars.max(1.0);
     let is_bold = sized.iter().filter(|s| s.is_bold).count() * 2 > sized.len();
 
+    // Lowercase continuation guard: a heading in a Latin-script document starts
+    // with an uppercase letter or a digit. A line opening with lowercase text
+    // is a wrapped/indented continuation of the sentence above it (e.g. an
+    // emphasis run like "cliquez sur « Connexion »" inside a list item) and must
+    // never be promoted to H2/H3 just because it is bold or slightly larger.
+    // H1 (>= 1.4x body) is left untouched: a genuinely large lowercase title is
+    // rare, and the guard is scoped below that ratio per the classifier's ranges.
+    if avg_fs < 1.4 * body_size {
+        if let Some(first) = trimmed.chars().find(|c| c.is_alphabetic()) {
+            if first.is_lowercase() {
+                return None;
+            }
+        }
+    }
+    // Long complete-sentence guard: a 50+ character line that ends in a full
+    // stop and sits in the H3 size band (< 1.3x body) is an emphasized body
+    // sentence, not a section heading. Section headings are short labels.
+    if avg_fs < 1.3 * body_size && trimmed.ends_with('.') && trimmed.chars().count() > 50 {
+        return None;
+    }
+
     if avg_fs >= 1.6 * body_size || (avg_fs >= 1.4 * body_size && is_bold) {
         return Some(1);
     }
@@ -2874,6 +2895,41 @@ mod structural_tests {
     fn empty_line_is_not_a_heading() {
         let line = one_span_line("   ", BODY * 1.6, true);
         assert_eq!(detect_heading_level(&line, BODY), None);
+    }
+
+    #[test]
+    fn lowercase_continuation_is_not_a_heading() {
+        // Regression: a bold 12pt emphasis run that wraps list item 1
+        // ("cliquez sur « Connexion »") sits at ~1.15x body and must stay in
+        // the list item instead of being promoted to an H3.
+        let line = one_span_line("cliquez sur « Connexion »", BODY * 1.15, true);
+        assert_eq!(detect_heading_level(&line, BODY), None);
+    }
+
+    #[test]
+    fn lowercase_continuation_at_h2_size_is_not_a_heading() {
+        // The guard covers the whole sub-H1 band (< 1.4x body), not just H3.
+        let line = one_span_line("de la Caf au service", BODY * 1.3, true);
+        assert_eq!(detect_heading_level(&line, BODY), None);
+    }
+
+    #[test]
+    fn long_bold_sentence_ending_in_period_is_not_a_heading() {
+        // Regression: a 100%-bold 12pt prose sentence in the H3 size band is
+        // an emphasized body sentence, not a section heading.
+        let sentence =
+            "Il vous sera demandé d'utiliser une adresse mail différente pour chaque compte.";
+        assert!(sentence.chars().count() > 50);
+        let line = one_span_line(sentence, BODY * 1.15, true);
+        assert_eq!(detect_heading_level(&line, BODY), None);
+    }
+
+    #[test]
+    fn short_bold_heading_ending_in_period_is_still_a_heading() {
+        // The long-sentence guard must not swallow a short H3 label that
+        // merely happens to end in a full stop.
+        let line = one_span_line("Résumé.", BODY * 1.15, true);
+        assert_eq!(detect_heading_level(&line, BODY), Some(3));
     }
 
     #[test]

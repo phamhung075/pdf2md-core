@@ -1560,6 +1560,18 @@ pub fn convert_pdf_bytes_to_markdown(
                             let (t_start, t_end) = find_table_boundaries(&processed_text, pos);
                             if t_start != t_end {
                                 pos = t_end;
+                            } else if pos > 0 && !processed_text[..pos].ends_with("\n\n") {
+                                // The matched line is a wrapped continuation
+                                // inside an ongoing paragraph or list item: only
+                                // a single newline separates it from the
+                                // non-empty text above, so splicing `img_md` at
+                                // `pos` would cut the sentence/list item in half.
+                                // Walk back to the nearest preceding blank line
+                                // (or the string start) so the image lands
+                                // before the entire block, never inside it.
+                                pos = processed_text[..pos]
+                                    .rfind("\n\n")
+                                    .map_or(0, |i| i + 2);
                             }
                             let mut prefix = String::new();
                             if !processed_text[..pos].ends_with("\n\n") {

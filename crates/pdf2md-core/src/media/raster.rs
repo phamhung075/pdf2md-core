@@ -16,7 +16,6 @@ use crate::media::codecs::{
 use crate::media::{MediaItem, MediaKind};
 
 pub(crate) const BG_AREA_FRAC: f64 = 0.82;
-pub(crate) const TILE_PT: f64 = 7.0;
 
 pub(crate) fn obj_ref(o: &Object) -> Option<ObjectId> {
     match o {
@@ -1295,7 +1294,9 @@ pub fn classify_geometry(
             return (MediaKind::Decorative, true);
         }
     }
-    if w < TILE_PT && h < TILE_PT {
+    // Standalone icons, bullets, and badge glyphs under ~42pt (1.5cm) in both
+    // dimensions are decorative UI furniture, not document figures.
+    if w <= 42.0 && h <= 42.0 {
         return (MediaKind::Decorative, true);
     }
 

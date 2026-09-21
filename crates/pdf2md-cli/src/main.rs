@@ -48,6 +48,14 @@ struct Args {
     /// Detect pure-vector figure regions and cut them as clipped PDFs
     #[arg(long, default_value_t = false)]
     vectors: bool,
+
+    /// Disable media extraction and embedding
+    #[arg(long, default_value_t = false)]
+    no_media: bool,
+
+    /// Alias for --no-media
+    #[arg(long, default_value_t = false)]
+    no_images: bool,
 }
 
 fn main() {
@@ -85,9 +93,12 @@ fn main() {
         process::exit(2);
     }
 
+    let disable_media = args.no_media || args.no_images;
     let options = ConversionOptions {
         detect_tables: !args.no_tables,
         detect_vectors: args.vectors,
+        detect_media: !disable_media,
+        embed_media: !disable_media,
         ..Default::default()
     };
 
