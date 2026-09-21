@@ -507,6 +507,25 @@ pub fn page_read_order(lines: &[Vec<Span>]) -> Vec<Vec<Vec<Span>>> {
         }
         return streams;
     }
+    read_order_segmented(lines)
+}
+
+/// Segment a page — or the part of one left over after a `page_two_columns`
+/// decision — into column bands, recovering *every* multi-column region rather
+/// than only the single longest one.
+///
+/// `multi_column_projection` finds one 3+-column region and, previously, the
+/// rows above and below it were emitted as one full-width stream each. Real
+/// pages carry several such regions — a three-column deck at the top, a
+/// two-column quote box below, then a three-column footer block — so the
+/// leftovers are segmented recursively: the projection pass peels off the
+/// longest 3+-column region, the rows before and after it are segmented again,
+/// and a slice with no projection region falls through to
+/// `detect_column_bands` for its 2-column bands. `page_two_columns` is
+/// deliberately not re-run on the leftovers: it is a whole-page decision, and
+/// applying it to an arbitrary slice would let a partial layout masquerade as
+/// a page-wide one.
+fn read_order_segmented(lines: &[Vec<Span>]) -> Vec<Vec<Vec<Span>>> {
     // A 3+-column page whose narrow (~0.7em) gutters no single-gutter detector
     // can seed: `page_two_columns` needs one gutter across the whole page and
     // `detect_column_bands` splits a run at one gutter, leaving the remaining
@@ -515,11 +534,11 @@ pub fn page_read_order(lines: &[Vec<Span>]) -> Vec<Vec<Vec<Span>>> {
     if let Some(region) = multi_column_projection(lines) {
         let mut streams = Vec::new();
         if region.start > 0 {
-            streams.push(lines[..region.start].to_vec());
+            streams.extend(read_order_segmented(&lines[..region.start]));
         }
         streams.extend(region.columns);
         if region.end + 1 < lines.len() {
-            streams.push(lines[region.end + 1..].to_vec());
+            streams.extend(read_order_segmented(&lines[region.end + 1..]));
         }
         return streams;
     }
@@ -892,8 +911,10 @@ fn multi_column_projection(lines: &[Vec<Span>]) -> Option<MultiColumnRegion> {
         }
     }
 
-    // Longest contiguous window on which at least two gutters are compatible
-    // on every row and each has a real gap on most rows.
+    // Longest contiguous window on which at least two *distinct* gutters are
+    // compatible on every row and each has a real gap on most rows.
+    let body = body_size_for(lines);
+    let min_col_w = MIN_COL_WIDTH_EM * body;
     let mut best: Option<(usize, usize, Vec<usize>)> = None;
     for s in 0..n {
         let mut all_ok = vec![true; c];
@@ -912,9 +933,19 @@ fn multi_column_projection(lines: &[Vec<Span>]) -> Option<MultiColumnRegion> {
             let active: Vec<usize> = (0..c)
                 .filter(|&g| all_ok[g] && (gaps[g] as f64) >= 0.6 * len as f64)
                 .collect();
-            if active.len() >= 2
-                && best.as_ref().map_or(true, |b| len > b.1 - b.0 + 1)
-            {
+            // The window must actually separate three or more columns: its
+            // active gutters, collapsed against the minimum column width, must
+            // leave at least two distinct x positions. A two-column region
+            // (the territory of `page_two_columns` / `detect_column_bands`)
+            // can otherwise contribute two near-coincident candidate x's that
+            // collapse to a single physical gutter; counting them as a
+            // "multi-column" hit made this pass claim a region it could not
+            // split and then bail out, leaving the real 3-column region above
+            // it interleaved.
+            let mut distinct: Vec<f64> = active.iter().map(|&g| cands[g]).collect();
+            distinct.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            distinct.dedup_by(|a, b| (*a - *b).abs() < min_col_w);
+            if distinct.len() >= 2 && best.as_ref().map_or(true, |b| len > b.1 - b.0 + 1) {
                 best = Some((s, e, active));
             }
             if all_ok.iter().filter(|x| **x).count() < 2 {
@@ -928,8 +959,6 @@ fn multi_column_projection(lines: &[Vec<Span>]) -> Option<MultiColumnRegion> {
         return None;
     }
 
-    let body = body_size_for(lines);
-    let min_col_w = MIN_COL_WIDTH_EM * body;
     let mut left_edge = f64::INFINITY;
     let mut right_edge = f64::NEG_INFINITY;
     for line in &lines[start..=end] {
@@ -960,28 +989,58 @@ fn multi_column_projection(lines: &[Vec<Span>]) -> Option<MultiColumnRegion> {
         return None;
     }
 
-    let ncols = selected.len() + 1;
-    let mut columns: Vec<Vec<Vec<Span>>> = vec![Vec::new(); ncols];
-    for line in &lines[start..=end] {
-        let mut buckets: Vec<Vec<Span>> = vec![Vec::new(); ncols];
-        for sp in line {
-            let center = sp.x + 0.5 * sp.advance;
-            let mut col = 0usize;
-            while col < selected.len() && center >= selected[col] {
-                col += 1;
+    // Bucket the region's rows by a gutter set.
+    let bucket = |selected: &[f64]| -> Vec<Vec<Vec<Span>>> {
+        let ncols = selected.len() + 1;
+        let mut columns: Vec<Vec<Vec<Span>>> = vec![Vec::new(); ncols];
+        for line in &lines[start..=end] {
+            let mut buckets: Vec<Vec<Span>> = vec![Vec::new(); ncols];
+            for sp in line {
+                let center = sp.x + 0.5 * sp.advance;
+                let mut col = 0usize;
+                while col < selected.len() && center >= selected[col] {
+                    col += 1;
+                }
+                buckets[col].push(sp.clone());
             }
-            buckets[col].push(sp.clone());
-        }
-        for (ci, bucket) in buckets.into_iter().enumerate() {
-            if !bucket.is_empty() {
-                columns[ci].push(bucket);
+            for (ci, bucket) in buckets.into_iter().enumerate() {
+                if !bucket.is_empty() {
+                    columns[ci].push(bucket);
+                }
             }
         }
+        columns
+    };
+
+    // A wide inter-column corridor contributes two candidate x's, one at each
+    // edge of the white space. Both survive the minimum-column-width filter and
+    // bracket an empty "column" of pure white (e.g. a 57pt corridor whose two
+    // edges are 48pt apart — wider than `min_col_w`, so neither is dropped by
+    // the separation rule). Real columns carry several rows of text, so drop
+    // the boundary gutter of the emptiest failing column and re-bucket, until
+    // every column reads as a text column or too few gutters remain (then fall
+    // back exactly as before, leaving the page to the band pass).
+    let mut columns = bucket(&selected);
+    while selected.len() >= 2 {
+        // `avg_words_per_row` counts non-empty *spans*, not words: a narrow
+        // prose column whose lines are each drawn as one or two `Tj` runs
+        // averages well under the 2.5 the two-column detectors use, even
+        // though every row carries a clause of text. A phantom corridor column
+        // is separated by `len < 3` instead (it holds a row or two at most),
+        // so a lower span gate keeps genuine narrow columns without admitting
+        // white corridors.
+        let bad = columns
+            .iter()
+            .position(|c| c.len() < 3 || avg_words_per_row(c) < 2.0);
+        let Some(ci) = bad else {
+            break;
+        };
+        let drop_at = if ci == 0 { 0 } else { ci - 1 };
+        selected.remove(drop_at);
+        columns = bucket(&selected);
     }
-    for col in &columns {
-        if col.len() < 3 || avg_words_per_row(col) < 2.5 {
-            return None;
-        }
+    if selected.len() < 2 {
+        return None;
     }
     if !columns.iter().any(|col| wrapped_prose(col)) {
         return None;
