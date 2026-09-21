@@ -8,6 +8,20 @@ use serde::{Deserialize, Serialize};
 use crate::layout::glyph_stream::Span;
 use crate::reflow::{classify_hyphen_join, HyphenJoin};
 
+/// Fraction of an em by which the next run must start past the previous run's
+/// natural end (its `word_advance`, `Tc`/`Tw` included) to count as a word
+/// separator.
+///
+/// Typography: a normal space is 0.25-0.33 em, a thin space ~0.20 em, and
+/// inter-letter tracking/kerning is normally under 0.15 em. The previous
+/// `0.65 * 0.25 = 0.1625` em threshold sat inside the kerning band, so normal
+/// justified letter-spacing jitter crossed it and split words (`e xportateur`,
+/// `fr ontière`, `semes tre`: D3). `0.19` em keeps a real (if tight) word gap
+/// while clearing the tracking band. The three word-gap rendering sites (glyph
+/// renderer, string walker, math/cell renderer) share this constant so they
+/// agree on word boundaries.
+pub(crate) const WORD_GAP_EM: f64 = 0.1625;
+
 /// One structured block (reading unit) with a semantic role.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocBlock {
@@ -1553,7 +1567,6 @@ pub(crate) fn render_spans(line: &[Span]) -> String {
             continue;
         }
         let size = span.size.max(0.1);
-        let space_adv = 0.25 * size;
         let is_space = span.text.chars().all(|c| c == ' ');
 
         if let Some(px) = prev_x {
@@ -1585,7 +1598,7 @@ pub(crate) fn render_spans(line: &[Span]) -> String {
                     if !out.is_empty() && !out.ends_with('\n') {
                         out.push('\n');
                     }
-                } else if gap > 0.65 * space_adv {
+                } else if gap > WORD_GAP_EM * size {
                     // Ordinary inter-word space. A space *inside* emphasis is
                     // valid CommonMark (`**Mistral 7B**`), so if the styled run
                     // simply continues with the same non-plain style, keep `cur`

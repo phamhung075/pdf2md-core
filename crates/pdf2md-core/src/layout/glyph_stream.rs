@@ -664,8 +664,14 @@ pub(crate) fn push_span(
     // units as `span.x`. `Tc`/`Tw` are added after every code and are *not*
     // part of the glyph outline width, so a TJ run split mid-word would look
     // like it stops short of the next fragment and get a spurious space.
-    let nchars = bytes.len() as f64;
-    let nspaces = bytes.iter().filter(|&&b| b == b' ').count() as f64;
+    //
+    // Count *decoded characters*, not raw bytes: a 2-byte CID / Identity-H /
+    // UTF-16 font has `bytes.len() == 2 * glyphs`, and counting bytes inflated
+    // the `Tc` term by 2x. That made `word_advance` overshoot the run's true
+    // right edge, so the residual gap to the next run was under-measured and
+    // real inter-word spaces were dropped (`de`+`la` -> `dela`, D2).
+    let nchars = text.chars().count() as f64;
+    let nspaces = text.chars().filter(|c| *c == ' ').count() as f64;
     let word_advance = advance + (tc * nchars + tw * nspaces) * hscale;
     let eff_a = ctm.a * tm.a + ctm.c * tm.b;
     let eff_b = ctm.b * tm.a + ctm.d * tm.b;

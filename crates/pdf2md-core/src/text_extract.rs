@@ -38,6 +38,7 @@ use crate::glyph_data::{
     pua_family_for_base_font, pua_to_char_for_family, AGL_NAMES, MAC_ROMAN, WIN_ANSI, PuaFamily,
 };
 use crate::layout::glyph_stream::{resolve_widths, Widths};
+use crate::layout::reading_order::WORD_GAP_EM;
 
 // ---------------------------------------------------------------------------
 // Codecs
@@ -155,6 +156,76 @@ impl Codec {
             Codec::Byte8(t, _) => decode_byte_table(t, bytes, out, None),
             Codec::CMap(cm, fallback, _) => {
                 decode_cmap(cm, bytes, fallback.as_ref(), out, None);
+            }
+        }
+    }
+
+    /// Number of character *codes* in `bytes` and how many of them are a space,
+    /// mirroring [`Self::decode`]'s code consumption.
+    ///
+    /// `Tc` is added once per code and `Tw` once per space code, so the raw
+    /// byte length is the wrong unit for a 2-byte CID / Identity-H / UTF-16
+    /// font: there `bytes.len() == 2 * codes`, which doubled the `Tc` term in
+    /// `show_advance` and `glyph_stream::push_span`, over-measuring a run's
+    /// right edge and fusing the following word onto it (D2). The separate
+    /// space count keeps `Tw` correct for a multi-byte font (a raw `b' '` byte
+    /// can be the low byte of any code, not only a space).
+    pub(crate) fn code_metrics(&self, bytes: &[u8]) -> (usize, usize) {
+        match self {
+            Codec::Byte8(t, _) => {
+                let spaces = bytes.iter().filter(|&&b| t.0[b as usize] == 0x20).count();
+                (bytes.len(), spaces)
+            }
+            Codec::CMap(cm, fallback, _) => {
+                let mut codes = 0usize;
+                let mut spaces = 0usize;
+                let mut i = 0usize;
+                while i < bytes.len() {
+                    let mut matched = false;
+                    for len in 1u8..=4u8 {
+                        let n = len as usize;
+                        if i + n > bytes.len() {
+                            continue;
+                        }
+                        let mut code: u32 = 0;
+                        for k in 0..n {
+                            code = (code << 8) | bytes[i + k] as u32;
+                        }
+                        if let Some(units) = cm.exact.get(&(len, code)) {
+                            if units.first() == Some(&0x20) {
+                                spaces += 1;
+                            }
+                            codes += 1;
+                            i += n;
+                            matched = true;
+                            break;
+                        }
+                        if let Some(dst) = cm
+                            .ranges
+                            .iter()
+                            .find(|(rl, lo, hi, _)| *rl == len && code >= *lo && code <= *hi)
+                            .map(|(_, lo, _, dst_lo)| dst_lo + (code - lo))
+                        {
+                            if dst == 0x20 {
+                                spaces += 1;
+                            }
+                            codes += 1;
+                            i += n;
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if !matched {
+                        if let Some(t) = fallback {
+                            if t.0[bytes[i] as usize] == 0x20 {
+                                spaces += 1;
+                            }
+                        }
+                        codes += 1;
+                        i += 1;
+                    }
+                }
+                (codes, spaces)
             }
         }
     }
@@ -1006,11 +1077,6 @@ pub(crate) fn normalize_decoded_text(s: &str) -> String {
     out
 }
 
-/// Fraction of an em by which the next run must start past the previous run's
-/// natural end to count as a word separator. This is the geometry engine's own
-/// rule (`layout::reading_order::render_spans`: `gap > 0.65 * 0.25 em`), reused
-/// here so the string walker and the glyph engine agree on word boundaries.
-const WORD_GAP_EM: f64 = 0.65 * 0.25;
 /// Advance assumed for a glyph when the font has no usable `/Widths` (the
 /// geometry engine assumes the same typical letter advance).
 const FALLBACK_ADVANCE_EM: f64 = 0.5;
@@ -1108,6 +1174,7 @@ impl TextPos {
 /// [`FALLBACK_ADVANCE_EM`] per code.
 fn show_advance(
     widths: &Widths,
+    codec: &Codec,
     operands: &[Object],
     size: f64,
     char_sp: f64,
@@ -1119,28 +1186,33 @@ fn show_advance(
     let mut nspaces = 0usize;
     fn add_bytes(
         widths: &Widths,
+        codec: &Codec,
         bytes: &[u8],
         w1000: &mut f64,
         nchars: &mut usize,
         nspaces: &mut usize,
     ) {
+        // Count codes, not raw bytes: `Tc`/`Tw` are applied per character code,
+        // and a 2-byte CID/Identity-H font's byte length is twice its glyph
+        // count. The same number drives the no-metrics fallback advance.
+        let (codes, spaces) = codec.code_metrics(bytes);
         match widths.width(bytes) {
             Some(w) => *w1000 += w,
-            None => *w1000 += FALLBACK_ADVANCE_EM * 1000.0 * bytes.len() as f64,
+            None => *w1000 += FALLBACK_ADVANCE_EM * 1000.0 * codes as f64,
         }
-        *nchars += bytes.len();
-        *nspaces += bytes.iter().filter(|&&b| b == b' ').count();
+        *nchars += codes;
+        *nspaces += spaces;
     }
     for operand in operands {
         match operand {
             Object::String(bytes, _) => {
-                add_bytes(widths, bytes, &mut w1000, &mut nchars, &mut nspaces)
+                add_bytes(widths, codec, bytes, &mut w1000, &mut nchars, &mut nspaces)
             }
             Object::Array(items) => {
                 for item in items {
                     match item {
                         Object::String(bytes, _) => {
-                            add_bytes(widths, bytes, &mut w1000, &mut nchars, &mut nspaces)
+                            add_bytes(widths, codec, bytes, &mut w1000, &mut nchars, &mut nspaces)
                         }
                         // A `TJ` number is a manual kern in 1/1000 em.
                         Object::Integer(v) => w1000 -= *v as f64,
@@ -1178,11 +1250,13 @@ fn advance_after_show(
     tp: &mut TextPos,
     cur_width: Option<usize>,
     widths: &[(Vec<u8>, Widths)],
+    codec: &Codec,
     operands: &[Object],
 ) {
     if let Some(wi) = cur_width {
         let adv = show_advance(
             &widths[wi].1,
+            codec,
             operands,
             tp.size,
             tp.char_sp,
@@ -1548,7 +1622,7 @@ fn walk_content(
                         break_column_if_above(out, &tp);
                         show_text(out, &codecs[ci].1, &op.operands);
                         tp.last_show_y = Some(tp.cur_y); tp.last_line_x = tp.line_x;
-                        advance_after_show(&mut tp, cur_width, &widths, &op.operands);
+                        advance_after_show(&mut tp, cur_width, &widths, &codecs[ci].1, &op.operands);
                     }
                 }
             }
@@ -1564,7 +1638,7 @@ fn walk_content(
                     break_column_if_above(out, &tp);
                     show_text(out, &codecs[ci].1, &op.operands);
                     tp.last_show_y = Some(tp.cur_y); tp.last_line_x = tp.line_x;
-                    advance_after_show(&mut tp, cur_width, &widths, &op.operands);
+                    advance_after_show(&mut tp, cur_width, &widths, &codecs[ci].1, &op.operands);
                 }
             }
             "\"" => {
@@ -1588,7 +1662,7 @@ fn walk_content(
                         let one = std::slice::from_ref(s);
                         show_text(out, &codecs[ci].1, one);
                         tp.last_show_y = Some(tp.cur_y); tp.last_line_x = tp.line_x;
-                        advance_after_show(&mut tp, cur_width, &widths, one);
+                        advance_after_show(&mut tp, cur_width, &widths, &codecs[ci].1, one);
                     }
                 }
             }
@@ -3032,6 +3106,22 @@ mod tests {
         let mut s = String::new();
         codec.decode(&[0x41, 0x42], &mut s);
         assert_eq!(s, "AB");
+    }
+
+    #[test]
+    fn code_metrics_counts_codes_not_bytes_for_cid_fonts() {
+        // A 2-byte Identity-H run `A B` (with a space code between) is three
+        // character codes, not six bytes, and exactly one of them is a space.
+        // The old byte-length accounting doubled the `Tc` term and could
+        // mistake any 0x20 low byte for a space, fusing the next word (D2).
+        let cmap = b"beginbfchar\n<0041> <0041>\n<0020> <0020>\n<0042> <0042>\nendbfchar\n";
+        let cm = parse_cmap(cmap).expect("parse");
+        let codec = Codec::CMap(cm, None, PuaFamily::Unknown);
+        let bytes = [0x00, 0x41, 0x00, 0x20, 0x00, 0x42];
+        assert_eq!(codec.code_metrics(&bytes), (3, 1));
+        // A matching byte-oriented font counts every byte as one code.
+        let byte = Codec::Byte8(ByteTable(WIN_ANSI), PuaFamily::Unknown);
+        assert_eq!(byte.code_metrics(&[b'A', b' ', b'B']), (3, 1));
     }
 
     #[test]

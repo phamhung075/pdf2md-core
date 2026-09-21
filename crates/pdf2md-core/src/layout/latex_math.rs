@@ -21,7 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::layout::glyph_stream::Span;
-use crate::layout::reading_order::render_spans;
+use crate::layout::reading_order::{render_spans, WORD_GAP_EM};
 
 /// Recursive LaTeX math expression AST.
 ///
@@ -268,7 +268,7 @@ impl Cell {
 fn render_cell_plain(spans: &[Span]) -> String {
     let mut out = String::new();
     let mut prev_x: Option<f64> = None;
-    let mut prev_advance = 0.0f64;
+    let mut prev_word_advance = 0.0f64;
     for span in spans {
         if span.text.is_empty() {
             continue;
@@ -276,7 +276,7 @@ fn render_cell_plain(spans: &[Span]) -> String {
         let size = span.size.max(0.1);
         if let Some(px) = prev_x {
             let gap = span.x - px;
-            if gap - prev_advance > 0.65 * (0.25 * size) {
+            if gap - prev_word_advance > WORD_GAP_EM * size {
                 if !out.is_empty() && !out.ends_with(' ') {
                     out.push(' ');
                 }
@@ -284,7 +284,7 @@ fn render_cell_plain(spans: &[Span]) -> String {
         }
         out.push_str(&span.text);
         prev_x = Some(span.x);
-        prev_advance = span.advance;
+        prev_word_advance = span.word_advance;
     }
     out.trim_end().to_string()
 }
@@ -857,17 +857,17 @@ fn split_line_tokens(line: &[Span]) -> Vec<Vec<Span>> {
     let mut tokens: Vec<Vec<Span>> = Vec::new();
     let mut cur: Vec<Span> = Vec::new();
     let mut prev_x: Option<f64> = None;
-    let mut prev_advance = 0.0f64;
+    let mut prev_word_advance = 0.0f64;
     for s in line {
         if let Some(px) = prev_x {
             let gap = s.x - px;
             let size = s.size.max(0.1);
-            if gap - prev_advance > 0.65 * (0.25 * size) && !cur.is_empty() {
+            if gap - prev_word_advance > WORD_GAP_EM * size && !cur.is_empty() {
                 tokens.push(std::mem::take(&mut cur));
             }
         }
         prev_x = Some(s.x);
-        prev_advance = s.advance;
+        prev_word_advance = s.word_advance;
         cur.push(s.clone());
     }
     if !cur.is_empty() {
