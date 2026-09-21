@@ -4,6 +4,114 @@
 
 //! Table validation heuristics: TOC dot leader rejection, bullet markers, stopword flow, and data tokens.
 
+/// A cell or token that marks a table's data even though it carries no digit:
+/// a voting tick, a round marker, or a short status word. Checklist / voting
+/// matrices (`x` cells) and survey grids (`oui`/`non`) have no numbers at all,
+/// so `has_data_tokens` used to call them header/prose and the grid was dropped
+/// to loose text.
+pub(crate) fn is_marker_token(tok: &str) -> bool {
+    let t = tok.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if matches!(
+        t,
+        "x" | "X"
+            | "o"
+            | "O"
+            | "✓"
+            | "✗"
+            | "✘"
+            | "×"
+            | "✩"
+            | "★"
+            | "●"
+            | "○"
+            | "◀"
+            | "▶"
+            | "♦"
+            | "√"
+            | "₹"
+            | "â̜"
+    ) {
+        return true;
+    }
+    matches!(t.to_ascii_lowercase().as_str(), "oui" | "non" | "yes" | "ok")
+}
+
+/// Whether a cell carries a marker/validation glyph anywhere — e.g. the
+/// checklist cell `"✓ : validation rules"`.
+fn contains_marker_glyph(s: &str) -> bool {
+    s.contains("â̜")
+        || s.chars().any(|ch| {
+            matches!(ch, '✓' | '✗' | '✘' | '×' | '✩' | '★' | '●' | '○' | '◀' | '▶' | '♦' | '√' | '₹')
+        })
+}
+
+/// Whether a cell renders a measurement / numeric range with a unit, e.g.
+/// `"2 ÷ 10 bar"`, `"16 ÷ 100"`, `"- 20°C ÷ 80°C"`, `"230 V"`. Such cells are
+/// data columns even though they hold three or four whitespace tokens, so
+/// `is_tabular_rows`'s short-column test must accept them.
+fn looks_like_measurement(c: &str) -> bool {
+    if !c.chars().any(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    // Range/comparison glyphs are a strong measurement signal whenever the
+    // cell also holds a digit.
+    if c.chars().any(|ch| matches!(ch, '÷' | '±' | '×' | '≤' | '≥' | '~')) {
+        return true;
+    }
+    // A degree sign is a measurement only when it is attached to a digit
+    // ("35°", "20°C"). French prose abbreviates *numéro* as "n°": a producer
+    // that draws it as "n ° 101621" gives a standalone degree glyph far from
+    // any digit, which must not flag the bibliography cell as a measurement.
+    if c.char_indices().any(|(i, ch)| {
+        ch == '°'
+            && (c[..i].chars().last().map_or(false, |b| b.is_ascii_digit())
+                || c[i + ch.len_utf8()..]
+                    .chars()
+                    .next()
+                    .map_or(false, |a| a.is_ascii_digit()))
+    }) {
+        return true;
+    }
+    const UNITS: &[&str] = &[
+        "bar", "kpa", "mpa", "pa", "mbar", "rpm", "hz", "khz", "mhz", "ghz", "kw", "kva",
+        "m³", "cm³", "mm²", "cm²", "m²", "µm", "μm", "kg", "mg", "ml", "cl", "da", "dan",
+    ];
+    // Multi-character technical units may appear as standalone whitespace
+    // tokens ("2 ÷ 10 bar", "3000 rpm").
+    if c.split_whitespace().any(|t| {
+        let tl = t
+            .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '°' && ch != '/')
+            .to_lowercase();
+        UNITS.contains(&tl.as_str())
+    }) {
+        return true;
+    }
+    // Single-character units (v/w/a/m/l/g/s) must never match an isolated
+    // lowercase prose word ("a", "l", "m" are ordinary French words). Accept
+    // them only when they are attached directly to the digit ("230V", "10m",
+    // "5A") or are an uppercase V/W/A directly following a number ("230 V").
+    let attached = c
+        .to_lowercase()
+        .chars()
+        .collect::<Vec<char>>()
+        .windows(2)
+        .any(|w| w[0].is_ascii_digit() && matches!(w[1], 'v' | 'w' | 'a' | 'm' | 'l' | 'g' | 's'));
+    if attached {
+        return true;
+    }
+    c.split_whitespace().collect::<Vec<&str>>().windows(2).any(|w| {
+        matches!(w[1], "V" | "W" | "A")
+            && w[0]
+                .chars()
+                .last()
+                .map(|ch| ch.is_ascii_digit())
+                .unwrap_or(false)
+    })
+}
+
 /// Detects whether cell strings contain data tokens (numbers, currency, flight codes, dates, times)
 /// rather than generic column headers.
 pub fn has_data_tokens(cells: &[String]) -> bool {
@@ -12,7 +120,16 @@ pub fn has_data_tokens(cells: &[String]) -> bool {
         if s.is_empty() {
             return false;
         }
-        if s.contains('€') || s.contains('$') || s.contains('%') || s.contains("EUR") || s.contains("USD") {
+        if s.contains('€') || s.contains('$') || s.contains('%') || s.contains("EUR") || s.contains("USD") || s.contains('₹') {
+            return true;
+        }
+        // A marker/validation cell: a lone tick/round token, or a cell whose
+        // every token is one ("✓ : validation rules" is handled by the glyph
+        // test, "x x x" by the all-tokens test below).
+        if is_marker_token(s) || contains_marker_glyph(s) {
+            return true;
+        }
+        if s.split_whitespace().all(|t| is_marker_token(t)) {
             return true;
         }
         for tok in s.split_whitespace() {
@@ -154,7 +271,13 @@ pub fn is_tabular_rows(rows: &[Vec<String>]) -> bool {
         total_tokens += tokens;
         total_cells += cells.len();
         let mean = tokens as f64 / cells.len() as f64;
-        if mean <= 2.2 {
+        // Technical spec cells carry a value, its range and a unit in one cell
+        // ("2 ÷ 10 bar", "- 20°C ÷ 80°C"): three or four whitespace tokens, so
+        // the old 2.2-token threshold found no short column and rejected the
+        // whole grid as prose. Any column whose cells are measurement-like (a
+        // digit plus a unit/range glyph or unit word) is a data column, not
+        // prose, even when a few tokens long.
+        if mean <= 2.2 || (mean <= 4.5 && cells.iter().any(|c| looks_like_measurement(c))) {
             short_col = true;
         }
     }
@@ -234,6 +357,18 @@ pub fn is_tabular_rows(rows: &[Vec<String>]) -> bool {
         if t.is_empty() {
             return false;
         }
+        // Section / outline numbers like "4.2." or "1." are not amounts.
+        if t.ends_with('.') || t.ends_with(':') || t.ends_with(';') {
+            return false;
+        }
+        let dot_count = t.chars().filter(|&ch| ch == '.').count();
+        if dot_count > 1 {
+            let parts: Vec<&str> = t.split('.').collect();
+            let is_thousands = parts.iter().skip(1).all(|p| p.len() == 3 && p.chars().all(|ch| ch.is_ascii_digit()));
+            if !is_thousands {
+                return false;
+            }
+        }
         let mut digit = false;
         for ch in t.chars() {
             if ch.is_ascii_digit() {
@@ -258,7 +393,30 @@ pub fn is_tabular_rows(rows: &[Vec<String>]) -> bool {
             .collect();
         cells.len() >= 2 && cells.iter().filter(|c| is_amount_cell(c)).count() * 4 >= cells.len() * 3
     });
-    if !numeric_col && total_words_count >= 12 && stopword_count * 100 / total_words_count >= 20 {
+    // A column of measurement/range cells ("2 ÷ 10 bar", "- 20°C ÷ 80°C") is
+    // the same structural table signal as an amount column: a prose paragraph
+    // has no such column, so the stopword share of a technical specification's
+    // descriptive labels must not veto the grid.
+    let measurement_col = (0..cols).any(|k| {
+        let cells: Vec<&str> = data
+            .iter()
+            .filter_map(|r| {
+                let c = r.get(k).map_or("", |c| c.as_str()).trim();
+                if c.is_empty() {
+                    None
+                } else {
+                    Some(c)
+                }
+            })
+            .collect();
+        cells.len() >= 2
+            && cells.iter().filter(|c| looks_like_measurement(c)).count() * 2 >= cells.len()
+    });
+    if !numeric_col
+        && !measurement_col
+        && total_words_count >= 12
+        && stopword_count * 100 / total_words_count >= 20
+    {
         return false;
     }
 
@@ -267,31 +425,41 @@ pub fn is_tabular_rows(rows: &[Vec<String>]) -> bool {
         return false;
     }
 
-    // Multi-row grids (>= 3 rows) without any data token (numbers, codes, dates, currency)
-    // are flowing prose paragraphs unless all columns are very short (<= 2 words/cell).
+    // Multi-row grids (>= 3 rows) without any data token (numbers, codes, dates,
+    // currency, markers) are flowing prose paragraphs unless they carry at least
+    // one genuine data column. A descriptive leading column (a full name or
+    // label, mean > 2 words) no longer condemns the whole grid: a trailing
+    // column of marker tokens ("x"/"oui") or short values is a structural table
+    // signal no prose paragraph has. Only a grid whose every column is verbose
+    // prose is rejected.
     if data.len() >= 3 && !data.iter().any(|r| has_data_tokens(r)) {
-        let max_col_mean = (0..cols)
-            .map(|k| {
-                let cells: Vec<&str> = data
-                    .iter()
-                    .filter_map(|r| {
-                        let c = r.get(k).map_or("", |c| c.as_str()).trim();
-                        if c.is_empty() {
-                            None
-                        } else {
-                            Some(c)
-                        }
-                    })
-                    .collect();
-                if cells.is_empty() {
-                    0.0
-                } else {
-                    let tok: usize = cells.iter().map(|c| c.split_whitespace().count()).sum();
-                    tok as f64 / cells.len() as f64
-                }
-            })
-            .fold(0.0f64, f64::max);
-        if max_col_mean > 2.0 {
+        let mut has_short_data_col = false;
+        let mut max_col_mean = 0.0f64;
+        for &k in &eff {
+            let cells: Vec<&str> = data
+                .iter()
+                .filter_map(|r| {
+                    let c = r.get(k).map_or("", |c| c.as_str()).trim();
+                    if c.is_empty() {
+                        None
+                    } else {
+                        Some(c)
+                    }
+                })
+                .collect();
+            if cells.is_empty() {
+                continue;
+            }
+            let tok: usize = cells.iter().map(|c| c.split_whitespace().count()).sum();
+            let mean = tok as f64 / cells.len() as f64;
+            max_col_mean = max_col_mean.max(mean);
+            let marker_col = cells.iter().filter(|c| is_marker_token(c)).count() * 2 >= cells.len();
+            let numeric_col = cells.iter().filter(|c| is_amount_cell(c)).count() * 2 >= cells.len();
+            if k > 0 && (mean <= 2.0 || marker_col || numeric_col) {
+                has_short_data_col = true;
+            }
+        }
+        if !has_short_data_col && max_col_mean > 2.0 {
             return false;
         }
     }
@@ -334,5 +502,124 @@ mod tests {
             vec!["Une partie de la".into(), "voie est".into()],
         ];
         assert!(!is_tabular_rows(&rows), "stopword-dense prose was accepted: {rows:?}");
+    }
+
+    /// A municipal voting matrix (`03bb566c_PV-CM-11-06-2020_3`): a descriptive
+    /// first column of full names and seven `x` marker columns. It carries no
+    /// digit, date or currency, so `has_data_tokens` used to be false and
+    /// `is_tabular_rows` rejected the grid solely because the name column's
+    /// mean exceeded 2 words/cell. Marker columns are a structural table signal
+    /// and must keep the grid.
+    #[test]
+    fn voting_matrix_with_marker_columns_and_names_is_tabular() {
+        let rows: Vec<Vec<String>> = vec![
+            vec![
+                "Membre".into(), "Point 1".into(), "Point 2".into(), "Point 3".into(),
+                "Point 4".into(), "Point 5".into(), "Point 6".into(), "Point 7".into(),
+            ],
+            vec![
+                "Isabelle Cazaubon (Adjointe)".into(), "x".into(), "x".into(), "x".into(),
+                "".into(), "x".into(), "x".into(), "x".into(),
+            ],
+            vec![
+                "Bertrand Caubraque".into(), "x".into(), "".into(), "x".into(),
+                "x".into(), "".into(), "x".into(), "x".into(),
+            ],
+            vec![
+                "Marie Dupont (Maire)".into(), "x".into(), "x".into(), "".into(),
+                "x".into(), "x".into(), "".into(), "x".into(),
+            ],
+        ];
+        assert!(
+            has_data_tokens(&rows[1]),
+            "an 'x' marker row must count as data: {:?}",
+            rows[1]
+        );
+        assert!(
+            is_tabular_rows(&rows),
+            "a voting matrix with marker columns must be tabular: {rows:?}"
+        );
+    }
+
+    /// A technical specification grid (`175bfc79_8155_pim_0`): range+unit cells
+    /// like "2 ÷ 10 bar" or "- 20°C ÷ 80°C" hold three or four whitespace
+    /// tokens, so no column passed the old 2.2-token short-column test and the
+    /// grid was rejected as prose. Measurement-like columns are data columns.
+    #[test]
+    fn technical_spec_range_and_unit_column_is_tabular() {
+        let rows: Vec<Vec<String>> = vec![
+            vec!["Pression maximale de travail".into(), "2 ÷ 10 bar".into()],
+            vec!["Température minimale de service".into(), "- 20°C ÷ 80°C".into()],
+            vec!["Débit nominal de la pompe".into(), "16 ÷ 100".into()],
+            vec!["Tension d'alimentation électrique".into(), "230 V".into()],
+        ];
+        assert!(
+            is_tabular_rows(&rows),
+            "a range/unit specification grid must be tabular: {rows:?}"
+        );
+    }
+
+    /// Short status words ("oui", "non") and lone symbols are data markers too.
+    /// A bare hyphen / plus, or the French abbreviation "no", is not a marker:
+    /// ordinary prose lines carry them, so they must not flag a whole column.
+    #[test]
+    fn short_status_words_are_data_markers() {
+        assert!(has_data_tokens(&["oui".to_string()]));
+        assert!(has_data_tokens(&["Non".to_string()]));
+        assert!(has_data_tokens(&["✓ : validation rules".to_string()]));
+        assert!(has_data_tokens(&["x x x".to_string()]));
+        assert!(!is_marker_token("-"));
+        assert!(!is_marker_token("+"));
+        assert!(!is_marker_token("no"));
+        assert!(!has_data_tokens(&["-".to_string()]));
+        assert!(!has_data_tokens(&["+".to_string()]));
+        assert!(!has_data_tokens(&["Nom du membre".to_string()]));
+        // A prose cell that merely contains a status word is not a marker.
+        assert!(!has_data_tokens(&["Note non applicable".to_string()]));
+    }
+
+    /// A French bibliography / prose column ("Paris, 1994, 182 p.", "no 6",
+    /// "à la ville") holds digits but no technical unit. The old `UNITS` list
+    /// contained single-letter words ("a", "l", "m") and short words ("min"),
+    /// so ordinary prose tokens matched, the whole column was flagged as a
+    /// `measurement_col`, and the stopword veto was bypassed. Only attached
+    /// single-character units or an uppercase V/W/A after a number may match.
+    #[test]
+    fn french_prose_words_are_not_measurements() {
+        assert!(!looks_like_measurement("Paris, 1994, 182 p. à la ville"));
+        assert!(!looks_like_measurement("no 6"));
+        assert!(!looks_like_measurement("min"));
+        assert!(looks_like_measurement("230 V"));
+        assert!(looks_like_measurement("10m"));
+        assert!(looks_like_measurement("2 ÷ 10 bar"));
+    }
+
+    /// `00094916_Addictionssansdrogues_13`: a 3-column bibliography of running
+    /// prose. The cell "Document Toxibase n ° 101621" carries the French
+    /// *numéro* abbreviation with a standalone degree glyph; treating any `°`
+    /// as a measurement flagged the column as `measurement_col`, bypassed the
+    /// prose rejection, and emitted the bibliography as a GFM table. A degree
+    /// sign only counts when a digit abuts it.
+    #[test]
+    fn french_bibliography_with_numero_degree_is_not_tabular() {
+        let rows: Vec<Vec<String>> = vec![
+            vec![
+                "Réduction des risques, Paris, 1997, 8 p.".into(),
+                "".into(),
+                "net http://www.redpsy.com/infopsy/cyberdepen-".into(),
+            ],
+            vec!["".into(), "Psychologues, 1997, (144), 45-48".into(), "".into()],
+            vec!["".into(), "".into(), "dance2.html, 10 p.".into()],
+            vec![
+                "GRÉCO ; GROUPE RECHERCHES ÉTUDES".into(),
+                "Document Toxibase n ° 101621".into(),
+                "".into(),
+            ],
+        ];
+        assert!(!looks_like_measurement("Document Toxibase n ° 101621"));
+        assert!(
+            !is_tabular_rows(&rows),
+            "a running bibliography was accepted as a table: {rows:?}"
+        );
     }
 }

@@ -257,6 +257,19 @@ pub fn merge_complementary_columns(
     (table_rows, current_rulers)
 }
 
+/// Whether a first-column cell is a compact row anchor — a single date/code
+/// token such as "28MAR" or "08DEC" — rather than a descriptive label
+/// ("Nombre de tests réalisés"). A multi-line record whose first-column anchor
+/// sits on its second visual line is joined on this signal; a new logical data
+/// row, which carries a fresh and typically multi-word first-column label, is
+/// not.
+fn is_compact_row_anchor(cell: &str) -> bool {
+    let t = cell.trim();
+    !t.is_empty()
+        && t.split_whitespace().count() == 1
+        && t.chars().any(|ch| ch.is_ascii_digit())
+}
+
 /// Consolidates multi-line table rows and multi-line headers into single logical rows.
 /// Uses the table's own natural line pitch (median baseline difference) to cleanly distinguish
 /// intra-row continuation lines from inter-row paragraph / row margins.
@@ -366,7 +379,16 @@ pub fn consolidate_table_rows(
                         true
                     } else if curr_has_col0 && !row_has_col0 {
                         true
-                    } else if !curr_has_col0 && row_has_col0 {
+                    } else if !curr_has_col0 && row_has_col0 && is_compact_row_anchor(&row_cells[0]) {
+                        // A multi-line record may carry its first-column anchor
+                        // on the *second* visual line: the itinerary's times
+                        // line ("10:05 11:30", no first-column value) sits above
+                        // its date/leg line ("28MAR …", which starts column 0).
+                        // Joining is only safe when that fresh first cell is a
+                        // compact date/code, not a descriptive label — a new
+                        // logical data row ("Nombre de tests réalisés") must
+                        // never be folded into the sparse anchorless line above
+                        // it (C2 `036c761a`).
                         true
                     } else if first_col_curr == first_col_row && filled_count >= 2 && filled_count >= curr_filled {
                         false
@@ -413,4 +435,107 @@ pub fn consolidate_table_rows(
     }
 
     consolidated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sp(text: &str, y: f64) -> Span {
+        Span {
+            text: text.to_string(),
+            x: 10.0,
+            y,
+            size: 10.0,
+            advance: 5.0,
+            word_advance: 5.0,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_vertical: false,
+        }
+    }
+
+    /// C2 `036c761a_lettre_no100_informations_covid-19_du_30_decembre_2021_0`:
+    /// a sparse date row with no first column ("15/11") was followed by a new
+    /// data row that *does* carry a first column ("Nombre de tests réalisés").
+    /// The unconditional `!curr_has_col0 && row_has_col0 => continuation`
+    /// branch fused the two into "15/11<br>34155". A row whose first-column
+    /// cell is a descriptive label starts a new logical row.
+    #[test]
+    fn new_row_with_col0_is_not_merged_into_a_row_without_col0() {
+        let lines: Vec<Vec<Span>> = vec![
+            vec![sp("Date", 300.0)],
+            vec![sp("15/11", 288.0)],
+            vec![sp("Nombre de tests réalisés", 276.0)],
+        ];
+        let info: Vec<RowInfo> = lines
+            .iter()
+            .map(|_| RowInfo {
+                words: Vec::new(),
+                starts: Vec::new(),
+                ends: Vec::new(),
+                size: 10.0,
+            })
+            .collect();
+        let win_rows: Vec<usize> = (0..3).collect();
+        let rows = vec![
+            vec!["Date".to_string(), "Cas".to_string()],
+            vec!["".to_string(), "15/11".to_string()],
+            vec!["Nombre de tests réalisés".to_string(), "34155".to_string()],
+        ];
+        let out = consolidate_table_rows(rows, &win_rows, &lines, &info);
+        assert_eq!(
+            out.len(),
+            3,
+            "the new data row was folded into the sparse row: {out:?}"
+        );
+        let data = out
+            .iter()
+            .find(|r| r[0].contains("Nombre de tests"))
+            .expect("data row missing");
+        assert_eq!(data[1], "34155", "value was fused: {out:?}");
+        assert!(
+            !data[1].contains("15/11"),
+            "date header leaked into the data row: {out:?}"
+        );
+    }
+
+    /// The counterpart to the test above: a multi-line record whose
+    /// first-column anchor sits on its *second* visual line (the electronic
+    /// ticket's times line over its "28MAR …" date/leg line) must still be
+    /// joined, or every flight leg splits into two GFM rows.
+    #[test]
+    fn compact_date_anchor_on_second_line_joins_its_record() {
+        let lines: Vec<Vec<Span>> = vec![
+            vec![sp("Date", 300.0)],
+            vec![sp("10:05", 288.0)],
+            vec![sp("28MAR", 276.0)],
+        ];
+        let info: Vec<RowInfo> = lines
+            .iter()
+            .map(|_| RowInfo {
+                words: Vec::new(),
+                starts: Vec::new(),
+                ends: Vec::new(),
+                size: 10.0,
+            })
+            .collect();
+        let win_rows: Vec<usize> = (0..3).collect();
+        let rows = vec![
+            vec!["Date".to_string(), "Departure".to_string()],
+            vec!["".to_string(), "10:05".to_string()],
+            vec!["28MAR".to_string(), "Marseille".to_string()],
+        ];
+        let out = consolidate_table_rows(rows, &win_rows, &lines, &info);
+        assert_eq!(
+            out.len(),
+            2,
+            "the times line and its date/leg line were not joined: {out:?}"
+        );
+        assert!(
+            out[1].iter().any(|c| c.contains("10:05")) && out[1][0] == "28MAR",
+            "joined record is missing its parts: {out:?}"
+        );
+    }
 }

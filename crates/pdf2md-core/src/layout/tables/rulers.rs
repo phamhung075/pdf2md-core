@@ -7,7 +7,7 @@
 use crate::layout::glyph_stream::Span;
 use crate::layout::reading_order::{detect_column_bands, ColumnBand};
 use crate::layout::tables::consolidation::{bucket, bucket_rows_content_aware, bucket_words, consolidate_table_rows, merge_complementary_columns};
-use crate::layout::tables::validation::is_tabular_rows;
+use crate::layout::tables::validation::{has_data_tokens, is_tabular_rows};
 use crate::models::BoundingBox;
 
 /// A detected table: line range [start, end] (inclusive) plus cell rows.
@@ -408,6 +408,55 @@ fn table_rulers_opts(
 
     let window_rows: Vec<usize> = (lo..=hi).collect();
     let col_starts = start_candidates.clone();
+
+    // Every distinct candidate position, used to count how many column rulers
+    // an isolated wide cell spans (see `classify_straddle`).
+    let mut all_rulers: Vec<f64> = Vec::new();
+    for &r in start_candidates.iter().chain(end_candidates.iter()) {
+        if all_rulers.iter().all(|&p| (r - p).abs() > tol) {
+            all_rulers.push(r);
+        }
+    }
+    all_rulers.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let strong_support = |x: f64| -> bool {
+        let n = window_rows
+            .iter()
+            .filter(|&&ri| row_matches_ruler(&info[ri], x, tol))
+            .count();
+        if window_rows.len() <= 2 {
+            n >= 1
+        } else {
+            n >= 2
+        }
+    };
+    // Straddle veto with isolated-cell tolerance: a cell that merely contains
+    // `x` is tolerated only in the table's header row (row 0 of the window),
+    // where a wide header label ("Dossard" 74..119) legitimately sits over a
+    // narrower numeric column (bibs 90..108 in 12ac87e6). In data or trailing
+    // rows, a crossing word indicates an interior word, not a column boundary.
+    let straddle_ok = |ri: usize, x: f64| -> bool {
+        match classify_straddle(&info[ri], &col_starts, x, tol, min_gutter) {
+            Straddle::None => true,
+            Straddle::Contained => ri == window_rows[0] && strong_support(x),
+            Straddle::Spanning | Straddle::Veto => false,
+        }
+    };
+    // An end-derived ruler is a value column's own *right edge*: any word
+    // crossing it is a fragmentation signal, not a wide cell that merely
+    // contains a start ruler. Only a clean crossing (`Straddle::None`) may
+    // pass, exactly as before the `classify_straddle` relaxation. The
+    // `Contained` tolerance belongs to *start* rulers, where a wide header
+    // cell legitimately sits over a narrower value column ("Dossard" over the
+    // bib ruler); applying it to end candidates admitted spurious word-right-
+    // edge rulers a few points past a real column start (the pressure table in
+    // `0225173d`), which then tripped the window gutter check and collapsed the
+    // whole grid.
+    let straddle_none = |ri: usize, x: f64| -> bool {
+        matches!(
+            classify_straddle(&info[ri], &all_rulers, x, tol, min_gutter),
+            Straddle::None
+        )
+    };
     let start_rulers = dedup(
         start_candidates
             .into_iter()
@@ -416,7 +465,7 @@ fn table_rulers_opts(
                     if wide_ok {
                         !row_straddles_wide_ok(&info, &col_starts, ri, x, tol, min_gutter)
                     } else {
-                        !row_straddles(&info[ri], x, tol, min_gutter)
+                        straddle_ok(ri, x)
                     }
                 })
             })
@@ -435,7 +484,7 @@ fn table_rulers_opts(
         end_candidates
             .into_iter()
             .filter(|&x| {
-                window_rows.iter().all(|&ri| !row_straddles(&info[ri], x, tol, min_gutter))
+                window_rows.iter().all(|&ri| straddle_none(ri, x))
                     // The end pass exists for a *right-aligned value column*
                     // whose values are their own cells. A left-aligned text
                     // column whose two longest cells merely share a rendered
@@ -489,7 +538,7 @@ fn table_rulers_opts(
             if wide_ok {
                 row_straddles_wide_ok(&info, &col_starts, ri, c, tol, min_gutter)
             } else {
-                row_straddles(&info[ri], c, tol, min_gutter)
+                !straddle_ok(ri, c)
             }
         });
         if !straddled && merged.iter().all(|&r| (c - r).abs() >= min_gutter) {
@@ -589,27 +638,86 @@ fn start_ruler_is_separate_cell(row: &RowInfo, x: f64, tol: f64, min_gutter: f64
     false
 }
 
-/// Whether row `row` straddles ruler `x` (a word starts strictly left of it
-/// and ends strictly right of it) in a way that should veto `x` as a column
-/// boundary. A row with no column-like spacing of its own (see
-/// `row_has_internal_gutter`) is exempt: it is typically a wrapped
-/// continuation line of a multi-line description with no aligned cells of
-/// its own, so it cannot testify about where the table's real columns are —
-/// letting it veto rulers that every numeric row agrees on would silently
-/// drop the whole table to plain text.
-fn row_straddles(row: &RowInfo, x: f64, tol: f64, min_gutter: f64) -> bool {
+/// How a row's words relate to a candidate ruler `x` — see
+/// [`classify_straddle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Straddle {
+    /// No word crosses `x`.
+    None,
+    /// Only isolated single-cell words cross `x`, and each merely *contains*
+    /// this one ruler (it does not span a second candidate). The cell is that
+    /// column's own content, however wide, so it is not a fragmentation signal.
+    Contained,
+    /// Only isolated single-cell words cross `x`, but at least one spans two or
+    /// more candidate rulers — a merged/spanning cell that does threaten to
+    /// fragment the grid.
+    Spanning,
+    /// At least one crossing word is an interior token of a multi-word cell:
+    /// the ruler is an interior word position, not a column boundary.
+    Veto,
+}
+
+/// Classify whether row `row` straddles ruler `x`.
+///
+/// A row with no column-like spacing of its own (see `row_has_internal_gutter`)
+/// is exempt: it is typically a wrapped continuation line of a multi-line
+/// description with no aligned cells of its own, so it cannot testify about
+/// where the table's real columns are — letting it veto rulers that every
+/// numeric row agrees on would silently drop the whole table to plain text.
+///
+/// A word that is its own cell (separated from both neighbours by a column
+/// gutter: `word_may_define_center`) and merely *encompasses* `x` is that
+/// column's content, not a boundary straddle — the wide header "Dossard"
+/// drawn over the narrower bib values "263" must not delete the bib ruler.
+/// Only when such a cell genuinely spans multiple candidate rulers is it a
+/// fragmentation signal.
+fn classify_straddle(
+    row: &RowInfo,
+    rulers: &[f64],
+    x: f64,
+    tol: f64,
+    min_gutter: f64,
+) -> Straddle {
     if !row_has_internal_gutter(&row.words, min_gutter) {
-        return false;
+        return Straddle::None;
     }
-    row.words.iter().enumerate().any(|(i, w)| {
+    let mut kind = Straddle::None;
+    for (i, w) in row.words.iter().enumerate() {
         if !(w.x0 < x - tol && w.x1 > x + tol) {
-            return false;
+            continue;
         }
         // A word that is its own cell and centred on `x` is the very evidence
         // for a centre-alignment ruler; it must not veto the ruler it defines.
         let centered = (0.5 * (w.x0 + w.x1) - x).abs() <= tol;
-        !(centered && word_may_define_center(row, i, min_gutter))
-    })
+        if centered && word_may_define_center(row, i, min_gutter) {
+            continue;
+        }
+        if word_may_define_center(row, i, min_gutter) {
+            let crossed = rulers
+                .iter()
+                .filter(|&&r| w.x0 < r - tol && w.x1 > r + tol)
+                .count();
+            kind = kind.max(if crossed >= 2 {
+                Straddle::Spanning
+            } else {
+                Straddle::Contained
+            });
+            continue;
+        }
+        return Straddle::Veto;
+    }
+    kind
+}
+
+/// Whether row `row` straddles ruler `x` in a way that should veto `x` as a
+/// column boundary. An isolated cell that merely contains the ruler
+/// ([`Straddle::Contained`]) does not veto; one spanning several rulers, or an
+/// interior word of a multi-word cell, does.
+fn row_straddles(row: &RowInfo, rulers: &[f64], x: f64, tol: f64, min_gutter: f64) -> bool {
+    matches!(
+        classify_straddle(row, rulers, x, tol, min_gutter),
+        Straddle::Spanning | Straddle::Veto
+    )
 }
 
 /// Whether the row at `row_idx` is a plausible table header that sits directly
@@ -627,7 +735,8 @@ fn row_straddles(row: &RowInfo, x: f64, tol: f64, min_gutter: f64) -> bool {
 ///   * no word straddles an interior ruler (a spanning cell would fragment the
 ///     emitted cells);
 ///   * it is a short label row, not a sentence: every bucketed cell holds
-///     fewer than five words and the row has at most eight words.
+///     fewer than five words and the row does not exceed a column-proportional
+///     word budget (a 10- or 15-column grid necessarily has 10+ header words).
 fn header_like_row(
     info: &[RowInfo],
     row_idx: usize,
@@ -639,7 +748,18 @@ fn header_like_row(
         return false;
     }
     let row = &info[row_idx];
-    if row.words.is_empty() || row.words.len() > 8 {
+    if row.words.is_empty() {
+        return false;
+    }
+    // NOTE: no `row_has_internal_gutter` gate here. Many real multi-column
+    // headers use compact spacing or short column labels whose consecutive
+    // words are separated by less than `min_gutter`; the `matched >= 2`
+    // test below already guarantees alignment with at least two columns.
+    // The previous hard cap of eight words rejected every wide grid's header
+    // out of hand (a 10- or 15-column table has at least that many header
+    // tokens). Scale the budget with the detected column count instead.
+    let max_header_words = (3 * rulers.len()).max(12);
+    if row.words.len() > max_header_words {
         return false;
     }
     let matched = rulers
@@ -649,10 +769,11 @@ fn header_like_row(
     if matched < 2 {
         return false;
     }
-    if rulers[1..]
-        .iter()
-        .any(|&r| row_straddles(row, r, tol, min_gutter))
-    {
+    // A header row may legitimately carry a wide merged cell that spans
+    // several columns ("ClGlt Dossard" over the rank/bib rulers), so a
+    // `Spanning` crossing is tolerated here; only an interior word of a
+    // multi-word cell (`Veto`) would truly fragment the emitted cells.
+    if rulers[1..].iter().any(|&r| row_straddles(row, rulers, r, tol, min_gutter)) {
         return false;
     }
     bucket(info, row_idx, rulers)
@@ -1031,10 +1152,11 @@ fn scan_aligned_grids_opts(
             // the first data row but produced none of the seed's shared rulers
             // (its multi-word cells left-align between the data columns), so it
             // was emitted as loose text above the table and every `top_heading`
-            // relation failed. Annex up to two immediately-preceding header
-            // lines from the same band when each is provably header-like.
+            // relation failed. Annex up to four immediately-preceding header
+            // lines from the same band when each is provably header-like (a
+            // complex 3-line bilingual header is common in the French corpus).
             let mut win_lo = lo;
-            while win_lo > 0 && lo - win_lo < 2 {
+            while win_lo > 0 && lo - win_lo < 4 {
                 let prev = band[win_lo - 1];
                 let gap = lines[prev][0].y - lines[band[win_lo]][0].y;
                 let size = info[prev].size.max(info[band[win_lo]].size).max(0.1);
@@ -1057,15 +1179,26 @@ fn scan_aligned_grids_opts(
             // No indivisible word can straddle an interior column ruler,
             // except in a prose-only continuation row (see `row_straddles`)
             // or when the crossing word is a wide merged/spanning cell
-            // (`row_straddles_wide_ok`).
+            // (`row_straddles_wide_ok`). As in `table_rulers_opts`, a crossing
+            // only vetoes a ruler the window genuinely agrees on; a spurious
+            // candidate crossed by a header's edge cell must not reject the
+            // whole window.
             let win_starts: Vec<f64> = supported_starts(&info, &win_rows, tol);
+            let win_support = |x: f64| -> bool {
+                let n = win_rows
+                    .iter()
+                    .filter(|&&ri| row_matches_ruler(&info[ri], x, tol))
+                    .count();
+                n >= 2
+            };
             let has_straddling_word = win_rows.iter().any(|&ri| {
                 rulers[1..].iter().any(|&r| {
-                    if wide_ok {
+                    let straddled = if wide_ok {
                         row_straddles_wide_ok(&info, &win_starts, ri, r, tol, min_gutter)
                     } else {
-                        row_straddles(&info[ri], r, tol, min_gutter)
-                    }
+                        row_straddles(&info[ri], &rulers, r, tol, min_gutter)
+                    };
+                    straddled && win_support(r)
                 })
             });
             if has_straddling_word {
@@ -1146,7 +1279,52 @@ fn scan_aligned_grids_opts(
                                 false
                             })
                             .count();
-                        if flowing_rows >= 2 && flowing_rows * 2 >= multi_col_rows {
+                        // The per-row `flowing` test fires on ANY tight
+                        // adjacent pair, so a compact description cell or one
+                        // overflowing word can mark a row "flowing" even in a
+                        // clearly tabular grid (the 60-row, 16-column
+                        // itinerary). A numeric/currency/time column is a
+                        // structural table signal no paragraph has, and a grid
+                        // whose adjacent columns are mostly separated by wide
+                        // gutters is tabular too; either overrides the veto.
+                        let table_has_data_tokens = win_rows
+                            .iter()
+                            .any(|&ri| has_data_tokens(&bucket(&info, ri, &rulers)));
+                        let wide_column_majority = rulers.len() >= 3 && {
+                            let mut wide_boundaries = 0usize;
+                            let mut measured_boundaries = 0usize;
+                            for c in 0..rulers.len().saturating_sub(1) {
+                                let mut wide = 0usize;
+                                let mut total = 0usize;
+                                for &ri in &win_rows {
+                                    let cells = bucket_words(&info, ri, &rulers);
+                                    if c + 1 < cells.len()
+                                        && !cells[c].is_empty()
+                                        && !cells[c + 1].is_empty()
+                                    {
+                                        let gap = cells[c + 1].first().unwrap().x0
+                                            - cells[c].last().unwrap().x1;
+                                        total += 1;
+                                        if gap >= 0.65 * info[ri].size {
+                                            wide += 1;
+                                        }
+                                    }
+                                }
+                                if total > 0 {
+                                    measured_boundaries += 1;
+                                    if wide * 2 >= total {
+                                        wide_boundaries += 1;
+                                    }
+                                }
+                            }
+                            measured_boundaries > 0
+                                && wide_boundaries * 2 >= measured_boundaries
+                        };
+                        if flowing_rows >= 2
+                            && flowing_rows * 2 >= multi_col_rows
+                            && !table_has_data_tokens
+                            && !wide_column_majority
+                        {
                             t(&format!(
                                 "  REJECT window [{}-{}]: flowing_rows={} multi_col_rows={} [flowing]",
                                 band[lo], band[hi], flowing_rows, multi_col_rows
@@ -1989,6 +2167,91 @@ mod tests {
             2,
             "a spurious centre ruler split the left-aligned column: {:?}",
             hits[0].rows
+        );
+    }
+
+    /// C4 `12ac87e6_FM17-Scratch_GR_0`: the header cell "Dossard" (74..119) is
+    /// wider than the bib numbers beneath it ("263" at 90..108). It therefore
+    /// straddles the bib start ruler at 90 and the old `row_straddles` vetoed
+    /// that ruler for the whole table, fusing every row's bib and name into
+    /// "| 22 494 PUYMEGE |". A cell that is its own cell and merely contains
+    /// the ruler (it does not span a second ruler) must not delete the boundary
+    /// 52 rows agree on.
+    #[test]
+    fn wide_header_cell_does_not_veto_the_numeric_ruler() {
+        let cell = |t: &str, x: f64, y: f64, adv: f64| sp_at(t, x, y, adv);
+        let mut lines: Vec<Vec<Span>> = Vec::new();
+        lines.push(vec![
+            cell("Dossard", 74.0, 300.0, 45.0),
+            cell("NOM", 130.0, 300.0, 30.0),
+            cell("Prénom", 230.0, 300.0, 45.0),
+        ]);
+        let bibs = ["494", "478", "512", "333", "201"];
+        let names = ["PUYMEGE", "LELIEVRE", "MARTIN", "DUPONT", "DURAND"];
+        let firsts = ["Jérome", "Warren", "Alice", "Bob", "Carol"];
+        for i in 0..5 {
+            let y = 288.0 - 12.0 * i as f64;
+            lines.push(vec![
+                cell(bibs[i], 90.0, y, 18.0),
+                cell(names[i], 130.0, y, 55.0),
+                cell(firsts[i], 230.0, y, 40.0),
+            ]);
+        }
+        let hits = find_tables(&lines);
+        let hit = hits
+            .iter()
+            .find(|h| h.rows.iter().any(|r| r.iter().any(|c| c.contains("PUYMEGE"))))
+            .unwrap_or_else(|| panic!("Dossard table not detected: {hits:?}"));
+        let joined = hit.rows.iter().flatten().cloned().collect::<Vec<_>>().join(" | ");
+        assert!(
+            !joined.contains("494 PUYMEGE"),
+            "bib and name were fused into one cell: {joined}"
+        );
+        assert!(
+            hit.rows
+                .iter()
+                .any(|r| r.iter().any(|c| c.trim() == "494")),
+            "the bib must be its own cell: {joined}"
+        );
+    }
+
+    /// C3 `1c060490_Annexe_2012-I-13_fr_10`: a 10-column grid's header row has
+    /// ten words, so the old hard `row.words.len() > 8` cap refused to annex it
+    /// and the header was emitted as loose text. The cap must scale with the
+    /// detected column count. The header is offset a fraction of a point from
+    /// the data rulers so it cannot seed the grid itself and annexation is what
+    /// recovers it.
+    #[test]
+    fn multi_column_header_over_eight_words_is_annexed() {
+        let ncol = 10usize;
+        let x_of = |c: usize| 50.0 + 62.0 * c as f64;
+        let mut lines: Vec<Vec<Span>> = Vec::new();
+        let header: Vec<Span> = (0..ncol)
+            .map(|c| sp_at(&format!("Col{c}"), x_of(c) + 0.8, 300.0, 30.0))
+            .collect();
+        lines.push(header);
+        for r in 0..4 {
+            let y = 288.0 - 12.0 * r as f64;
+            let row: Vec<Span> = (0..ncol)
+                .map(|c| sp_at(&format!("{}", r * ncol + c + 1), x_of(c), y, 14.0))
+                .collect();
+            lines.push(row);
+        }
+        let hits = find_tables(&lines);
+        let hit = hits
+            .iter()
+            .find(|h| h.rows.iter().any(|r| r.iter().any(|c| c.contains("Col1"))))
+            .unwrap_or_else(|| panic!("wide table was not detected: {hits:?}"));
+        assert!(
+            hit.rows.len() >= 5,
+            "the 10-word header row was not annexed: {:?}",
+            hit.rows
+        );
+        assert!(
+            hit.rows[0].iter().any(|c| c.contains("Col1"))
+                && hit.rows[0].iter().any(|c| c.contains("Col9")),
+            "wide header cells missing from row 0: {:?}",
+            hit.rows[0]
         );
     }
 }
