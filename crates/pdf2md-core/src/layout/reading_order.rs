@@ -1486,7 +1486,7 @@ fn next_visible_style(line: &[Span], after: usize) -> Option<InlineStyle> {
 pub(crate) fn render_spans(line: &[Span]) -> String {
     let mut out = String::new();
     let mut prev_x: Option<f64> = None;
-    let mut prev_advance = 0.0f64;
+    let mut prev_word_advance = 0.0f64;
     let mut cur = InlineStyle::default();
 
     for (i, span) in line.iter().enumerate() {
@@ -1504,7 +1504,19 @@ pub(crate) fn render_spans(line: &[Span]) -> String {
             // raw start-to-start distance against a size threshold (as the
             // hard-break branch used to) makes any word run wider than ~2.5 em
             // look like a new column and emits a spurious newline mid-sentence.
-            let gap = gap - prev_advance;
+            let gap = gap - prev_word_advance;
+            if is_space {
+                // A whitespace-only run whose origin sits behind the previous
+                // run's right edge adds no visible whitespace. Producers draw
+                // such zero-advance "spacer" spaces (often with a huge negative
+                // `TJ` kern) purely to position the next run, and the spacer
+                // then overlaps the following word at the same x. Treating it
+                // as a separator split `Env`+`elo` at the spacer's own x; skip
+                // it so the next run measures its gap against the real word end.
+                if gap < -0.05 * size {
+                    continue;
+                }
+            }
             if !is_space {
                 if gap > 2.5 * size {
                     // A distinct column / element on the same row: break the
@@ -1571,7 +1583,7 @@ pub(crate) fn render_spans(line: &[Span]) -> String {
         }
 
         prev_x = Some(span.x);
-        prev_advance = span.advance;
+        prev_word_advance = span.word_advance;
     }
 
     close_style(&mut out, cur);
@@ -2331,6 +2343,7 @@ mod tests {
             y: 700.0,
             size: 10.0,
             advance: text.len() as f64 * 6.0,
+            word_advance: text.len() as f64 * 6.0,
             is_bold: style.0,
             is_italic: style.1,
             is_underline: style.2,
@@ -2553,6 +2566,7 @@ mod tests {
                 y,
                 size: 10.0,
                 advance: adv,
+                word_advance: adv,
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
@@ -2615,6 +2629,7 @@ mod tests {
                 y,
                 size: 10.0,
                 advance: adv,
+                word_advance: adv,
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
@@ -2668,6 +2683,7 @@ mod tests {
                 y,
                 size: 10.0,
                 advance: adv,
+                word_advance: adv,
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
@@ -2718,6 +2734,7 @@ mod structural_tests {
             y: 700.0,
             size,
             advance: text.len() as f64 * size * 0.6,
+            word_advance: text.len() as f64 * size * 0.6,
             is_bold: bold,
             is_italic: false,
             is_underline: false,
@@ -3266,6 +3283,7 @@ mod paragraph_merge_tests {
                 y,
                 size: 10.0,
                 advance: text.len() as f64 * 6.0,
+                word_advance: text.len() as f64 * 6.0,
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
@@ -3295,6 +3313,7 @@ mod paragraph_merge_tests {
                 y,
                 size: 10.0,
                 advance: text.len() as f64 * 6.0,
+                word_advance: text.len() as f64 * 6.0,
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
@@ -3467,6 +3486,7 @@ mod paragraph_merge_tests {
             y,
             size: 10.0,
             advance: text.len() as f64 * 6.0,
+            word_advance: text.len() as f64 * 6.0,
             is_bold: false,
             is_italic: false,
             is_underline: false,
@@ -3608,6 +3628,7 @@ mod column_band_tests {
             y,
             size: 10.0,
             advance: text.len() as f64 * 6.0,
+            word_advance: text.len() as f64 * 6.0,
             is_bold: false,
             is_italic: false,
             is_underline: false,
@@ -4065,6 +4086,7 @@ mod column_band_tests {
             y,
             size: 10.0,
             advance: text.len() as f64 * 6.0,
+            word_advance: text.len() as f64 * 6.0,
             is_bold: false,
             is_italic: false,
             is_underline: false,

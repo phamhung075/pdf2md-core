@@ -373,6 +373,16 @@ pub struct Span {
     pub size: f64,
     /// Total natural advance width of the decoded run, in device points.
     pub advance: f64,
+    /// Advance a word-gap test must subtract to find the *whitespace* after this
+    /// run: `advance` plus the character/word spacing (`Tc`/`Tw`) the content
+    /// stream adds after every code. The text matrix advances by a run's glyph
+    /// widths *plus* its tracking, but a producer's `Tc` (letter-spacing) is
+    /// deliberately applied after each code; measuring the residual gap against
+    /// the bare `advance` therefore turns the accumulated tracking of a long
+    /// run into a phantom word space when the next run continues the same word
+    /// at a `TJ` kerning point. Geometry (columns, tables) keeps the bare
+    /// `advance`; only word-gap rendering uses this field.
+    pub word_advance: f64,
     pub is_bold: bool,
     pub is_italic: bool,
     pub is_underline: bool,
@@ -624,6 +634,8 @@ pub(crate) fn push_span(
     tm: &Mtx,
     ctm: &Mtx,
     tfs: f64,
+    tc: f64,
+    tw: f64,
     style: (bool, bool),
     spans: &mut Vec<Span>,
 ) -> Option<i8> {
@@ -648,6 +660,13 @@ pub(crate) fn push_span(
             // gap detector still separates words reasonably.
             0.5 * size
         });
+    // Text-matrix advance of this run including `Tc`/`Tw`, in the same device
+    // units as `span.x`. `Tc`/`Tw` are added after every code and are *not*
+    // part of the glyph outline width, so a TJ run split mid-word would look
+    // like it stops short of the next fragment and get a spurious space.
+    let nchars = bytes.len() as f64;
+    let nspaces = bytes.iter().filter(|&&b| b == b' ').count() as f64;
+    let word_advance = advance + (tc * nchars + tw * nspaces) * hscale;
     let eff_a = ctm.a * tm.a + ctm.c * tm.b;
     let eff_b = ctm.b * tm.a + ctm.d * tm.b;
     let is_vertical = eff_b.abs() > 0.7 * hscale && eff_a.abs() < 0.3 * hscale;
@@ -657,6 +676,7 @@ pub(crate) fn push_span(
         y,
         size,
         advance,
+        word_advance,
         is_bold: style.0,
         is_italic: style.1,
         is_underline: false,
@@ -1274,7 +1294,7 @@ fn walk_glyphs(
                     let f = &fonts_info[ci];
                     let (codec, width, style) = (&f.codec, &f.widths, f.style);
                     if let Some(dir) =
-                        push_span(codec, width, bytes, 0.0, &tm, &ctm, tfs, style, &mut spans)
+                        push_span(codec, width, bytes, 0.0, &tm, &ctm, tfs, tc, tw, style, &mut spans)
                     {
                         let n = spans.last().map(|s| s.text.chars().count()).unwrap_or(0);
                         if dir > 0 {
@@ -1311,7 +1331,8 @@ fn walk_glyphs(
                     match item {
                         Object::String(bytes, _) => {
                             if let Some(dir) = push_span(
-                                codec, width, bytes, offset, &tm, &ctm, tfs, style, &mut spans,
+                                codec, width, bytes, offset, &tm, &ctm, tfs, tc, tw, style,
+                                &mut spans,
                             ) {
                                 let n = spans.last().map(|s| s.text.chars().count()).unwrap_or(0);
                                 if dir > 0 {
@@ -2181,6 +2202,7 @@ mod tests {
                 y: 200.0,
                 size: 12.0,
                 advance: 8.0,
+                word_advance: 8.0,
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
@@ -2192,6 +2214,7 @@ mod tests {
                 y: 200.0,
                 size: 12.0,
                 advance: 8.0,
+                word_advance: 8.0,
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
@@ -2203,6 +2226,7 @@ mod tests {
                 y: 200.0,
                 size: 12.0,
                 advance: 8.0,
+                word_advance: 8.0,
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
@@ -2214,6 +2238,7 @@ mod tests {
                 y: 200.0,
                 size: 12.0,
                 advance: 8.0,
+                word_advance: 8.0,
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
@@ -2225,6 +2250,7 @@ mod tests {
                 y: 200.0,
                 size: 12.0,
                 advance: 8.0,
+                word_advance: 8.0,
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
@@ -2236,6 +2262,7 @@ mod tests {
                 y: 200.0,
                 size: 12.0,
                 advance: 8.0,
+                word_advance: 8.0,
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
@@ -2248,6 +2275,7 @@ mod tests {
                 y: 200.0,
                 size: 12.0,
                 advance: 8.0,
+                word_advance: 8.0,
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
@@ -2259,6 +2287,7 @@ mod tests {
                 y: 200.0,
                 size: 12.0,
                 advance: 8.0,
+                word_advance: 8.0,
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
@@ -2307,6 +2336,7 @@ mod tests {
             y: 700.0,
             size: 12.0,
             advance: 60.0,
+            word_advance: 60.0,
             is_bold: false,
             is_italic: false,
             is_underline: false,
@@ -2326,6 +2356,7 @@ mod tests {
             y: 700.0,
             size: 12.0,
             advance: 20.0,
+            word_advance: 20.0,
             is_bold: false,
             is_italic: false,
             is_underline: false,
@@ -2346,6 +2377,7 @@ mod tests {
             y: 700.0,
             size: 12.0,
             advance: 30.0,
+            word_advance: 30.0,
             is_bold: false,
             is_italic: false,
             is_underline: false,

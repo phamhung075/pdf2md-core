@@ -3297,6 +3297,7 @@ mod regression_tests {
             y,
             size: 10.0,
             advance: 20.0,
+            word_advance: 20.0,
             is_bold: false,
             is_italic: false,
             is_underline: false,

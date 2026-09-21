@@ -387,7 +387,7 @@ fn emit_show(
         match operand {
             Object::String(bytes, _) => {
                 let mut spans = Vec::new();
-                push_span(codec, width, bytes, 0.0, tm, ctm, tfs, *style, &mut spans);
+                push_span(codec, width, bytes, 0.0, tm, ctm, tfs, tc, tw, *style, &mut spans);
                 for s in spans {
                     emit(&s);
                 }
@@ -398,7 +398,7 @@ fn emit_show(
                     match item {
                         Object::String(bytes, _) => {
                             let mut spans = Vec::new();
-                            push_span(codec, width, bytes, offset, tm, ctm, tfs, *style, &mut spans);
+                            push_span(codec, width, bytes, offset, tm, ctm, tfs, tc, tw, *style, &mut spans);
                             for s in spans {
                                 emit(&s);
                             }

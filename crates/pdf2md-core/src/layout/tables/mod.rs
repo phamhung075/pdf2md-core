@@ -150,6 +150,7 @@ mod tests {
             y,
             size,
             advance,
+            word_advance: advance,
             is_bold: false,
             is_italic: false,
             is_underline: false,
