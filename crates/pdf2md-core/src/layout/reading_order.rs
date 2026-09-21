@@ -507,6 +507,22 @@ pub fn page_read_order(lines: &[Vec<Span>]) -> Vec<Vec<Vec<Span>>> {
         }
         return streams;
     }
+    // A 3+-column page whose narrow (~0.7em) gutters no single-gutter detector
+    // can seed: `page_two_columns` needs one gutter across the whole page and
+    // `detect_column_bands` splits a run at one gutter, leaving the remaining
+    // columns of the split half welded. Recover every column at once by
+    // vertical projection before the band pass.
+    if let Some(region) = multi_column_projection(lines) {
+        let mut streams = Vec::new();
+        if region.start > 0 {
+            streams.push(lines[..region.start].to_vec());
+        }
+        streams.extend(region.columns);
+        if region.end + 1 < lines.len() {
+            streams.push(lines[region.end + 1..].to_vec());
+        }
+        return streams;
+    }
     // `page_two_columns` only recognizes a page that is two-column under ONE
     // consistent gutter for its entire height. Real business documents often
     // change layout partway down (e.g. a seller/buyer two-column header block,
@@ -785,6 +801,194 @@ fn projection_columns_region(
     best
 }
 
+/// A page region recovered as 3+ independent vertical columns by
+/// [`multi_column_projection`].
+struct MultiColumnRegion {
+    /// First and last line index (into the page's `lines`) of the region.
+    start: usize,
+    end: usize,
+    /// One line-stream per column, left to right.
+    columns: Vec<Vec<Vec<Span>>>,
+}
+
+/// Recover a page region of 3+ narrow columns.
+///
+/// Every other reading-order detector models a *single* gutter
+/// (`page_two_columns`, `detect_column_bands`) or a prose-vs-grid pair
+/// (`projection_columns_region`). A magazine/newsletter page of three or more
+/// prose columns separated by only ~0.7em of white defeats all of them: the
+/// line builder fuses each row's columns into one visual line (word spaces are
+/// ~0.25em, so a 0.7em gutter is far below any hard-break threshold) and the
+/// whole page then weaves column-by-column row-by-row. This works from the
+/// vertical projection instead: a gutter is an x covered by no span on any row
+/// of the region, wide enough to be real white and narrow enough to sit between
+/// columns. Rows above/below the region are left in place as full-width
+/// streams, so a page header/footer keeps its order.
+///
+/// Deliberately conservative: it requires its own set of at least 2 gutters
+/// (>=3 columns), each column to read as wrapped multi-word prose, and the
+/// region to span several rows. A page it cannot read this way returns `None`
+/// and falls back to the single linear stream exactly as before.
+fn multi_column_projection(lines: &[Vec<Span>]) -> Option<MultiColumnRegion> {
+    const MIN_REGION_ROWS: usize = 8;
+    const MIN_GAP_EM: f64 = 0.4;
+    const MIN_COL_WIDTH_EM: f64 = 3.0;
+    if lines.len() < MIN_REGION_ROWS {
+        return None;
+    }
+
+    // Candidate gutters: the midpoint of every inter-span gap at least
+    // `MIN_GAP_EM` wide. A word space (~0.25em) never seeds one.
+    let mut cands: Vec<f64> = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        for w in line.windows(2) {
+            let a_end = w[0].x + w[0].advance;
+            let gap = w[1].x - a_end;
+            let size = w[1].size.max(w[0].size).max(0.1);
+            if gap >= MIN_GAP_EM * size {
+                cands.push(0.5 * (a_end + w[1].x));
+            }
+        }
+    }
+    cands.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    cands.dedup_by(|a, b| (*a - *b).abs() < 3.0);
+    if cands.len() < 2 {
+        return None;
+    }
+
+    let n = lines.len();
+    let c = cands.len();
+    // For each candidate: is no span on this row *covering* it (so the row is
+    // compatible with a column split there), and does a real gap sit on it.
+    let mut compat: Vec<Vec<bool>> = vec![vec![false; n]; c];
+    let mut has_gap: Vec<Vec<bool>> = vec![vec![false; n]; c];
+    for (g, &gx) in cands.iter().enumerate() {
+        for (i, line) in lines.iter().enumerate() {
+            if line.is_empty() {
+                compat[g][i] = true;
+                continue;
+            }
+            let mut covered = false;
+            let mut gap_here = false;
+            for (k, s) in line.iter().enumerate() {
+                if s.x + 0.5 < gx && s.x + s.advance - 0.5 > gx {
+                    covered = true;
+                    break;
+                }
+                if let Some(t) = line.get(k + 1) {
+                    let a_end = s.x + s.advance;
+                    let gap = t.x - a_end;
+                    let size = t.size.max(s.size).max(0.1);
+                    if gap >= MIN_GAP_EM * size && a_end < gx && t.x > gx {
+                        gap_here = true;
+                    }
+                }
+            }
+            compat[g][i] = !covered;
+            has_gap[g][i] = gap_here;
+        }
+    }
+
+    // Longest contiguous window on which at least two gutters are compatible
+    // on every row and each has a real gap on most rows.
+    let mut best: Option<(usize, usize, Vec<usize>)> = None;
+    for s in 0..n {
+        let mut all_ok = vec![true; c];
+        let mut gaps = vec![0usize; c];
+        let mut e = s;
+        while e < n {
+            for g in 0..c {
+                if all_ok[g] && !compat[g][e] {
+                    all_ok[g] = false;
+                }
+                if has_gap[g][e] {
+                    gaps[g] += 1;
+                }
+            }
+            let len = e - s + 1;
+            let active: Vec<usize> = (0..c)
+                .filter(|&g| all_ok[g] && (gaps[g] as f64) >= 0.6 * len as f64)
+                .collect();
+            if active.len() >= 2
+                && best.as_ref().map_or(true, |b| len > b.1 - b.0 + 1)
+            {
+                best = Some((s, e, active));
+            }
+            if all_ok.iter().filter(|x| **x).count() < 2 {
+                break;
+            }
+            e += 1;
+        }
+    }
+    let (start, end, active) = best?;
+    if end - start + 1 < MIN_REGION_ROWS {
+        return None;
+    }
+
+    let body = body_size_for(lines);
+    let min_col_w = MIN_COL_WIDTH_EM * body;
+    let mut left_edge = f64::INFINITY;
+    let mut right_edge = f64::NEG_INFINITY;
+    for line in &lines[start..=end] {
+        for sp in line {
+            left_edge = left_edge.min(sp.x);
+            right_edge = right_edge.max(sp.x + sp.advance);
+        }
+    }
+    if !left_edge.is_finite() || right_edge - left_edge < 3.0 * min_col_w {
+        return None;
+    }
+
+    // Keep the widest set of gutters that each leaves a real column on either
+    // side and is separated from the next by at least one column width.
+    let mut gutters: Vec<f64> = active.iter().map(|&g| cands[g]).collect();
+    gutters.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    gutters.dedup_by(|a, b| (*a - *b).abs() < min_col_w);
+    let mut selected: Vec<f64> = Vec::new();
+    for gx in gutters {
+        if gx - left_edge < min_col_w || right_edge - gx < min_col_w {
+            continue;
+        }
+        if selected.last().map_or(true, |&last| gx - last >= min_col_w) {
+            selected.push(gx);
+        }
+    }
+    if selected.len() < 2 {
+        return None;
+    }
+
+    let ncols = selected.len() + 1;
+    let mut columns: Vec<Vec<Vec<Span>>> = vec![Vec::new(); ncols];
+    for line in &lines[start..=end] {
+        let mut buckets: Vec<Vec<Span>> = vec![Vec::new(); ncols];
+        for sp in line {
+            let center = sp.x + 0.5 * sp.advance;
+            let mut col = 0usize;
+            while col < selected.len() && center >= selected[col] {
+                col += 1;
+            }
+            buckets[col].push(sp.clone());
+        }
+        for (ci, bucket) in buckets.into_iter().enumerate() {
+            if !bucket.is_empty() {
+                columns[ci].push(bucket);
+            }
+        }
+    }
+    for col in &columns {
+        if col.len() < 3 || avg_words_per_row(col) < 2.5 {
+            return None;
+        }
+    }
+    if !columns.iter().any(|col| wrapped_prose(col)) {
+        return None;
+    }
+    Some(MultiColumnRegion { start, end, columns })
+}
+
 /// Segment `lines` into a sequence of column bands. Unlike `page_two_columns`
 /// (which needs ONE gutter consistent across the *entire* page), this walks
 /// the page top-to-bottom and detects each contiguous two-column region on
@@ -1042,7 +1246,7 @@ pub fn detect_column_bands(lines: &[Vec<Span>]) -> Vec<ColumnBand> {
 /// lone `-`) looks like a fresh line start and gets misread as a list marker.
 /// Matching the threshold exactly means this only pre-splits what would
 /// otherwise have broken *mid-render* anyway.
-fn split_hard_breaks(line: &[Span]) -> Vec<Vec<Span>> {
+pub(crate) fn split_hard_breaks(line: &[Span]) -> Vec<Vec<Span>> {
     let mut segments = Vec::new();
     let mut cur: Vec<Span> = Vec::new();
     let mut prev_x: Option<f64> = None;
@@ -3850,5 +4054,88 @@ mod column_band_tests {
             "crossings separated by one-sided rows must not form a column band: {} bands",
             bands.len()
         );
+    }
+
+    // -- multi_column_projection (3+ narrow columns) --------------------------
+
+    fn mc_span(text: &str, x: f64, y: f64) -> Span {
+        Span {
+            text: text.to_string(),
+            x,
+            y,
+            size: 10.0,
+            advance: text.len() as f64 * 6.0,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_vertical: false,
+        }
+    }
+
+    /// Lay `words` left-to-right from `x` with 3pt inter-word gaps, returning
+    /// the spans and the x just past the last word.
+    fn mc_fragment(words: &[&str], mut x: f64, y: f64) -> (Vec<Span>, f64) {
+        let mut v = Vec::new();
+        for w in words {
+            v.push(mc_span(w, x, y));
+            x += w.len() as f64 * 6.0 + 3.0;
+        }
+        (v, x)
+    }
+
+    /// One fused visual row of a 3-column page: three prose fragments sharing a
+    /// baseline, separated by ~7pt gutters (well below the 2.5em hard break and
+    /// the 1.2em `split_row_columns` seed). Every fragment starts lowercase and
+    /// ends without a terminator, so each column reads as wrapped prose.
+    fn mc_three_col_row(y: f64) -> Vec<Span> {
+        let (mut l, x1) = mc_fragment(&["mot", "deux", "trois"], 50.0, y);
+        let (mut m, x2) = mc_fragment(&["autre", "texte", "ici"], x1 + 7.0, y);
+        let (mut r, _) = mc_fragment(&["encore", "des", "mots"], x2 + 7.0, y);
+        l.append(&mut m);
+        l.append(&mut r);
+        l
+    }
+
+    #[test]
+    fn three_narrow_columns_are_recovered_not_woven() {
+        // A full-width header whose single span covers both gutters must stay
+        // its own stream and must not be absorbed into the column region.
+        let mut lines = vec![vec![mc_span("HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH", 50.0, 800.0)]];
+        for i in 0..10 {
+            lines.push(mc_three_col_row(780.0 - i as f64 * 12.0));
+        }
+        // The projection finds the two gutters directly.
+        let region = multi_column_projection(&lines).expect("3 columns recovered");
+        assert_eq!(region.columns.len(), 3, "must recover three columns");
+        // Each column is a single column's text, in reading order.
+        let first: String = region.columns[0]
+            .iter()
+            .flat_map(|l| l.iter().map(|s| s.text.as_str()))
+            .collect();
+        assert!(first.starts_with("mot"), "left column leads: {first}");
+        assert!(!first.contains("autre"), "no middle column text leaks in: {first}");
+        let middle: String = region.columns[1]
+            .iter()
+            .flat_map(|l| l.iter().map(|s| s.text.as_str()))
+            .collect();
+        assert!(middle.starts_with("autre"), "middle column follows: {middle}");
+        // The region excludes the full-width header.
+        assert_eq!(region.start, 1, "header must not join the column region");
+    }
+
+    /// A single-column page of ordinary prose must not be carved into columns
+    /// by the projection: there is no recurring 0.4em+ gutter to find.
+    #[test]
+    fn single_column_prose_is_not_split_by_projection() {
+        let mut lines = Vec::new();
+        for i in 0..12 {
+            let (v, _) = mc_fragment(&["une", "ligne", "de", "prose", "ordinaire"], 50.0, 780.0 - i as f64 * 12.0);
+            lines.push(v);
+        }
+        assert!(
+            multi_column_projection(&lines).is_none(),
+            "single-column prose must not project into columns"
+        );
+        assert_eq!(page_read_order(&lines).len(), 1);
     }
 }

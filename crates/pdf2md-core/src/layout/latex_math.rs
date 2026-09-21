@@ -364,6 +364,19 @@ fn is_math_base(base: &str) -> bool {
     !trimmed.chars().any(|c| c.is_alphabetic())
 }
 
+/// Whether a candidate script cell is a plausible super/subscript rather than a
+/// stretch of body text. A real script is a short, single-token run — an
+/// exponent (`x^{2}`), an ordinal suffix (`1^{er}`), or a footnote mark
+/// (`note^{1}`); a long or multi-word run on an offset baseline is prose
+/// (typically a neighbouring column that `page_read_order` failed to separate)
+/// and must stay plain text, never `$_{...}$`.
+fn is_plausible_script(cell: &Cell) -> bool {
+    const MAX_SCRIPT_CHARS: usize = 3;
+    let text = cell.text();
+    let n = text.chars().count();
+    n > 0 && n <= MAX_SCRIPT_CHARS && !text.chars().any(|c| c.is_whitespace())
+}
+
 /// Rebuild a single visual line's spans into a [`LatexExpr`], recognising simple
 /// super/subscripts. When nothing looks like a script the result is a plain
 /// `Text` node whose string is byte-identical to the legacy line renderer.
@@ -385,6 +398,7 @@ pub fn synthesize_line_expr(line: &[Span]) -> LatexExpr {
         let is_base_like =
             (cell.size - base_size).abs() <= size_tol && (cell.baseline - base_baseline).abs() <= size_tol;
         let is_script = !is_base_like
+            && is_plausible_script(&cell)
             && cell.size < base_size
             && (cell.baseline - base_baseline).abs() >= 0.12 * base_size.max(0.1);
 
@@ -710,7 +724,9 @@ fn render_math_stream(
         skip[s.script_line] = true;
     }
 
-    use crate::layout::reading_order::{classify_line, format_structured_line, ListRunState};
+    use crate::layout::reading_order::{
+        classify_line, format_structured_line, split_hard_breaks, ListRunState,
+    };
 
     let mut out = String::new();
     let mut prev_y: Option<f64> = None;
@@ -730,15 +746,30 @@ fn render_math_stream(
                 out.push('\n');
             }
         }
-        // Classification runs on the original line geometry regardless of a
-        // fraction/script replacement — those substitutions target formula
-        // content, which is never itself a heading or list marker.
-        let (role, render_slice) = classify_line(line, body_size, &mut list_state);
-        let text = replacement[i]
-            .take()
-            .unwrap_or_else(|| render_math_line(render_slice));
-        out.push_str(&format_structured_line(&role, text.trim_end()));
-        out.push('\n');
+        if let Some(text) = replacement[i].take() {
+            // Classification runs on the original line geometry for a
+            // fraction/script replacement — those substitutions target formula
+            // content, which is never itself a heading or list marker.
+            let (role, _) = classify_line(line, body_size, &mut list_state);
+            out.push_str(&format_structured_line(&role, text.trim_end()));
+            out.push('\n');
+        } else {
+            // Split a row that jams two unrelated regions onto one baseline at
+            // the same >2.5em hard break the plain renderer uses
+            // (`push_line`), and synthesise math per segment. Without this the
+            // within-line script renderer re-welded such a row into one line —
+            // `render_math_line` does not apply `render_spans`'s hard break — so
+            // a page whose columns `page_read_order` left fused stayed fused.
+            for seg in split_hard_breaks(line) {
+                if seg.is_empty() {
+                    continue;
+                }
+                let (role, render_slice) = classify_line(&seg, body_size, &mut list_state);
+                let text = render_math_line(render_slice);
+                out.push_str(&format_structured_line(&role, text.trim_end()));
+                out.push('\n');
+            }
+        }
         prev_y = Some(line.first().map(|s| s.y).unwrap_or(0.0));
     }
     out.trim_end().to_string()
@@ -1225,6 +1256,48 @@ mod tests {
             "a whitespace spacer must not synthesize math, got {rendered}"
         );
         assert!(rendered.contains("identifiant"), "got {rendered}");
+    }
+
+    /// A long, multi-word run that merely sits on an offset baseline is body
+    /// text, not a super/subscript: a neighbouring column serialised onto the
+    /// same visual line used to be wrapped whole as `$_{...}$`, corrupting the
+    /// prose and defeating text search. A real script is short (an exponent,
+    /// an ordinal suffix, a footnote mark); anything longer must stay plain.
+    #[test]
+    fn long_offset_run_is_not_wrapped_as_a_script() {
+        let line = vec![
+            span("Sandrine brient-", 100.0, 700.0, 12.0, 90.0),
+            // A phrase from the adjacent column: smaller face, lower baseline.
+            span(
+                "a aussi remporté le « prix cœur » du concours",
+                300.0,
+                694.0,
+                9.0,
+                200.0,
+            ),
+        ];
+        let rendered = render_math_line(&line);
+        assert!(
+            !rendered.contains('$'),
+            "a long offset run must not synthesize math, got {rendered}"
+        );
+        assert!(
+            rendered.contains("prix cœur"),
+            "the offset run's text must survive, got {rendered}"
+        );
+    }
+
+    /// A short ordinal suffix on a numeric base is still recognised: the length
+    /// cap only rejects runs too long to be a script, not legitimate ones
+    /// (`x^{2}`, `1^{er}`, `1^{ère}`, `note^{1}`).
+    #[test]
+    fn short_ordinal_suffix_is_still_a_script() {
+        // Three characters (`ère`) is exactly at the cap and must still pass.
+        let line = vec![
+            span("1", 100.0, 700.0, 12.0, 8.0),
+            span("ère", 108.0, 712.0, 8.0, 12.0),
+        ];
+        assert_eq!(render_math_line(&line), r"$1^{ère}$");
     }
 
     /// Plain body text must remain byte-identical (no false positives).
