@@ -659,7 +659,14 @@ fn classify_role(role: &[u8]) -> (&'static str, Option<u8>) {
     match role {
         b"H" | b"H1" | b"H2" | b"H3" | b"H4" | b"H5" | b"H6" => ("heading", heading_level(role)),
         b"L" | b"LI" | b"UL" | b"OL" | b"LBody" => ("list", None),
-        b"Table" | b"THead" | b"TBody" | b"TFoot" | b"TR" | b"TD" | b"TH" => ("table", None),
+        // Only the `Table` role is a table marker. `THead`/`TBody`/`TFoot`/
+        // `TR`/`TD`/`TH` are children *within* a table subtree; encountered as
+        // the role of a leaf outside a `Table` ancestor they are ordinary
+        // content, not independent tables (F7/R4). The `walk` container arm
+        // applies the single-column / flowing-prose layout heuristic before
+        // rendering a `Table` node.
+        b"Table" => ("table", None),
+        b"THead" | b"TBody" | b"TFoot" | b"TR" | b"TD" | b"TH" => ("body", None),
         b"Figure" | b"Fig" => ("figure", None),
         b"Header" | b"Head" => ("header", None),
         b"Footer" | b"Foot" => ("footer", None),
@@ -747,6 +754,51 @@ impl Node {
     }
 }
 
+/// True when a single cell holds flowing prose rather than a short tabular
+/// token: a paragraph-length cell (>= 20 words) or multi-sentence text.
+fn is_flowing_prose(cell: &str) -> bool {
+    let t = cell.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let words = t.split_whitespace().count();
+    if words >= 20 {
+        return true;
+    }
+    let terminators = t
+        .chars()
+        .filter(|c| matches!(c, '.' | '!' | '?'))
+        .count();
+    terminators >= 2 && words >= 8
+}
+
+/// A `Table` structure element is frequently used purely for page layout by
+/// invoice/letter generators: its cells hold ordinary flowing prose, or it has
+/// a single column so its "rows" are just stacked blocks. Rendering such a
+/// node as a GFM pipe table both inflates the customer-visible table count and
+/// hides the real paragraphs. Returns `true` when the node should instead be
+/// walked as a plain container (F7/R4).
+fn is_layout_table(node: &Node, map: &HashMap<usize, McidText>, detect_math: bool) -> bool {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut heads: Option<Vec<String>> = None;
+    let mut is_head = false;
+    collect_table_rows(node, map, &mut rows, &mut heads, &mut is_head, detect_math);
+    if let Some(h) = heads.take() {
+        rows.insert(0, h);
+    }
+    let rows: Vec<Vec<String>> = rows
+        .into_iter()
+        .filter(|r| r.iter().any(|c| !c.trim().is_empty()))
+        .collect();
+    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    // No tabular geometry, or a single-column wrapper: children stack
+    // vertically, so recurse into them as ordinary blocks.
+    if cols < 2 {
+        return true;
+    }
+    rows.iter().flatten().any(|c| is_flowing_prose(c))
+}
+
 /// Recursively emit blocks from the node tree in structure (reading) order.
 fn walk(node: &Node, map: &HashMap<usize, McidText>, blocks: &mut Vec<Block>, detect_math: bool) {
     match node {
@@ -813,8 +865,15 @@ fn walk(node: &Node, map: &HashMap<usize, McidText>, blocks: &mut Vec<Block>, de
                         });
                     }
                 }
-                b"Table" | b"THead" | b"TBody" | b"TFoot" => {
-                    if let Some(md) = table_from_node(node, map, detect_math) {
+                b"Table" => {
+                    if is_layout_table(node, map, detect_math) {
+                        // Layout table (single column and/or prose cells): walk
+                        // it as a plain container so its paragraphs survive as
+                        // ordinary blocks instead of a fake table zone.
+                        for c in children {
+                            walk(c, map, blocks, detect_math);
+                        }
+                    } else if let Some(md) = table_from_node(node, map, detect_math) {
                         blocks.push(Block {
                             kind: "table".to_string(),
                             level: None,
@@ -826,6 +885,13 @@ fn walk(node: &Node, map: &HashMap<usize, McidText>, blocks: &mut Vec<Block>, de
                         for c in children {
                             walk(c, map, blocks, detect_math);
                         }
+                    }
+                }
+                // Table-section and cell roles reached outside a `Table` node
+                // are not independent tables: recurse into them as containers.
+                b"THead" | b"TBody" | b"TFoot" | b"TR" | b"TD" | b"TH" => {
+                    for c in children {
+                        walk(c, map, blocks, detect_math);
                     }
                 }
                 b"Figure" | b"Fig" => {
@@ -1246,6 +1312,92 @@ BT\n/F1 12 Tf\n72 720 Td\nBDC /Span << /MCID 1 >>\n(First paragraph sentence one
             res.markdown.contains("Second line keeps right on going."),
             "paragraph line 2 must be present: {}",
             res.markdown
+        );
+    }
+
+    #[test]
+    fn layout_table_walk_emits_paragraphs_not_table() {
+        use std::collections::HashMap as Map;
+        // R4/F7: a single-column `Table` used purely for layout
+        // (`Table > TR > TD` with each `TD` marking a prose run) must be walked
+        // as a container. Before the fix `table_from_node` rendered it as a
+        // one-column GFM pipe table, inflating the table count and replacing
+        // the paragraphs with a table block.
+        let cell = |mcid: usize, text: &str| Node::Elem {
+            role: b"TD".to_vec(),
+            actual_text: Some(text.to_string()),
+            children: vec![Node::Mcid {
+                role: b"TD".to_vec(),
+                mcid,
+                actual_text: Some(text.to_string()),
+            }],
+        };
+        let row = |mcid: usize, text: &str| Node::Elem {
+            role: b"TR".to_vec(),
+            actual_text: None,
+            children: vec![cell(mcid, text)],
+        };
+        let para_a = "Le présent document décrit les conditions générales et s'applique à compter de sa date de signature.";
+        let para_b = "Une seconde phrase de paragraphe ordinaire.";
+        let table = Node::Elem {
+            role: b"Table".to_vec(),
+            actual_text: None,
+            children: vec![row(0, para_a), row(1, para_b)],
+        };
+        let mut blocks = Vec::new();
+        walk(&table, &Map::new(), &mut blocks, false);
+        assert!(
+            blocks.iter().all(|b| b.kind != "table"),
+            "layout table must not yield a table block: {:?}",
+            blocks
+                .iter()
+                .map(|b| (b.kind.clone(), b.text.clone()))
+                .collect::<Vec<_>>()
+        );
+        let body: Vec<&str> = blocks
+            .iter()
+            .filter(|b| b.kind == "body")
+            .map(|b| b.text.as_str())
+            .collect();
+        assert_eq!(body.len(), 2, "both paragraphs must be emitted as body blocks: {body:?}");
+        assert!(body.contains(&para_a));
+        assert!(body.contains(&para_b));
+    }
+
+    #[test]
+    fn genuine_multicolumn_table_walk_still_emits_table() {
+        use std::collections::HashMap as Map;
+        // The layout heuristic must not disarm a real multi-column, short-cell
+        // `Table`: it must still render as one GFM table block.
+        let cell = |mcid: usize, text: &str| Node::Elem {
+            role: b"TD".to_vec(),
+            actual_text: Some(text.to_string()),
+            children: vec![Node::Mcid {
+                role: b"TD".to_vec(),
+                mcid,
+                actual_text: Some(text.to_string()),
+            }],
+        };
+        let row = |r: usize, a: &str, b: &str| Node::Elem {
+            role: b"TR".to_vec(),
+            actual_text: None,
+            children: vec![cell(r * 2, a), cell(r * 2 + 1, b)],
+        };
+        let table = Node::Elem {
+            role: b"Table".to_vec(),
+            actual_text: None,
+            children: vec![row(0, "Désignation", "Montant"), row(1, "Prestation", "1 200,00")],
+        };
+        let mut blocks = Vec::new();
+        walk(&table, &Map::new(), &mut blocks, false);
+        assert_eq!(
+            blocks.iter().filter(|b| b.kind == "table").count(),
+            1,
+            "genuine 2x2 table must still be emitted as a table: {:?}",
+            blocks
+                .iter()
+                .map(|b| (b.kind.clone(), b.text.clone()))
+                .collect::<Vec<_>>()
         );
     }
 }

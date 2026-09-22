@@ -854,12 +854,19 @@ fn append_table_zones(blocks: &mut Vec<crate::layout::reading_order::DocBlock>, 
     let mut contained = vec![false; original_len];
 
     for hit in hits {
+        let rows = hit.rows.len();
+        let cols = hit.rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        // Only a genuine grid (>= 2 columns and >= 2 rows) rendered as a pipe
+        // table. A single-column / single-row Hit is a layout wrapper whose
+        // cells are ordinary flowing text; suppressing the blocks it contains
+        // would delete real paragraphs and emit a fake `table` zone (F7/R4).
+        if cols < 2 || rows < 2 {
+            continue;
+        }
         let tx0 = hit.bbox.x0.min(hit.bbox.x1);
         let tx1 = hit.bbox.x0.max(hit.bbox.x1);
         let ty0 = hit.bbox.y0.min(hit.bbox.y1);
         let ty1 = hit.bbox.y0.max(hit.bbox.y1);
-        let rows = hit.rows.len();
-        let cols = hit.rows.iter().map(|r| r.len()).max().unwrap_or(0);
         let label = hit
             .rows
             .first()
@@ -2197,6 +2204,59 @@ mod tests {
             "prose outside the table bbox must survive: {:?}",
             blocks.iter().map(|b| b.text.clone()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_append_table_zones_single_column_layout_wrapper_keeps_prose() {
+        // R4/F7: a single-column layout wrapper (a `Table`/`TR`/`TD` structure
+        // holding stacked prose rather than tabular data) carries one cell per
+        // row. It must neither emit a fake `table` zone nor suppress the
+        // paragraph blocks inside its bbox.
+        use crate::layout::reading_order::DocBlock;
+        use crate::layout::tables::TableHit;
+        use crate::models::BoundingBox;
+
+        fn frag(kind: &str, x0: f64, y0: f64, x1: f64, y1: f64, t: &str) -> DocBlock {
+            DocBlock {
+                page: 1,
+                kind: kind.into(),
+                x0,
+                y0,
+                x1,
+                y1,
+                text: t.into(),
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+            }
+        }
+
+        let para_a = "Le présent document décrit les conditions générales et s'applique à compter de sa date de signature.";
+        let para_b = "Une seconde phrase de paragraphe ordinaire.";
+        let mut blocks = vec![
+            frag("body", 50.0, 400.0, 300.0, 420.0, para_a),
+            frag("body", 50.0, 360.0, 300.0, 380.0, para_b),
+        ];
+        let hit = TableHit {
+            start: 0,
+            end: 1,
+            rows: vec![vec![para_a.to_string()], vec![para_b.to_string()]],
+            bbox: BoundingBox::new(45.0, 350.0, 305.0, 425.0),
+        };
+        append_table_zones(&mut blocks, &[hit]);
+
+        assert!(
+            !blocks.iter().any(|b| b.kind == "table"),
+            "single-column layout wrapper must not emit a table zone: {:?}",
+            blocks.iter().map(|b| (b.kind.clone(), b.text.clone())).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            blocks.iter().filter(|b| b.kind == "body").count(),
+            2,
+            "both prose paragraphs must survive: {:?}",
+            blocks.iter().map(|b| b.text.clone()).collect::<Vec<_>>()
+        );
+        assert!(blocks.iter().any(|b| b.text == para_a));
     }
 
     #[test]
