@@ -29,7 +29,7 @@ pub(crate) fn cstring_into_raw(s: String) -> *mut c_char {
 ///   { "ok": false, "error": "..." }
 #[no_mangle]
 pub extern "C" fn pdf2md_convert(pdf_ptr: *const u8, pdf_len: usize) -> *mut c_char {
-    pdf2md_convert_impl(pdf_ptr, pdf_len, None)
+    pdf2md_convert_impl(pdf_ptr, pdf_len, None, None)
 }
 
 /// Same as `pdf2md_convert`, but with an explicit `detect_vectors` flag
@@ -41,13 +41,36 @@ pub extern "C" fn pdf2md_convert_ex(
     pdf_len: usize,
     detect_vectors: i32,
 ) -> *mut c_char {
-    pdf2md_convert_impl(pdf_ptr, pdf_len, Some(detect_vectors != 0))
+    pdf2md_convert_impl(pdf_ptr, pdf_len, Some(detect_vectors != 0), None)
+}
+
+/// Same as `pdf2md_convert_ex`, but with an additional explicit `no_media`
+/// flag (0 = off/default, nonzero = on) so per-request FFI consumers (a
+/// long-lived server process, where the P2M_* env-var hatches below cannot
+/// vary per request) can request text-only extraction — equivalent to the
+/// CLI's `--no-media`: both `detect_media` and `embed_media` are set to
+/// false, so the `media` JSON array is empty and no data-URI images are
+/// embedded in the returned markdown.
+#[no_mangle]
+pub extern "C" fn pdf2md_convert_ex2(
+    pdf_ptr: *const u8,
+    pdf_len: usize,
+    detect_vectors: i32,
+    no_media: i32,
+) -> *mut c_char {
+    pdf2md_convert_impl(
+        pdf_ptr,
+        pdf_len,
+        Some(detect_vectors != 0),
+        Some(no_media != 0),
+    )
 }
 
 fn pdf2md_convert_impl(
     pdf_ptr: *const u8,
     pdf_len: usize,
     vectors_override: Option<bool>,
+    no_media_override: Option<bool>,
 ) -> *mut c_char {
     let json = if pdf_ptr.is_null() {
         serde_json::json!({ "ok": false, "error": "null input pointer" })
@@ -70,6 +93,15 @@ fn pdf2md_convert_impl(
                 "0" | "false" | "False" | "FALSE" => opts.detect_math = false,
                 _ => opts.detect_math = true,
             }
+        }
+        // Explicit per-request text-only switch (the CLI's `--no-media`):
+        // disable both media detection and embedding so the `media` JSON
+        // array stays empty and no data-URI images are inlined into the
+        // markdown. This cannot ride the P2M_* env hatches above because
+        // those are process-wide, not per call.
+        if no_media_override.unwrap_or(false) {
+            opts.detect_media = false;
+            opts.embed_media = false;
         }
         // Optional overrides for the media-embed size guardrails (R1): cap the
         // pixel dimension a raster is downscaled to, and the total base64
@@ -185,4 +217,189 @@ pub extern "C" fn pdf2md_vision_signature(
         Err(_) => String::new(),
     };
     cstring_into_raw(sig)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CStr;
+
+    /// Build a one-page PDF with a single uncompressed `DeviceRGB` image
+    /// XObject (deterministic pseudo-random noise) painted at 250x200 pt on a
+    /// 400x400 page, plus a minimal Helvetica text layer so the synthetic page
+    /// is not rejected as a scan. Mirrors `lib.rs`'s
+    /// `synthetic_noise_image_pdf` so these FFI tests are self-contained and
+    /// never depend on external fixtures.
+    fn synthetic_noise_image_pdf(width: u32, height: u32) -> Vec<u8> {
+        let mut samples = Vec::with_capacity(width as usize * height as usize * 3);
+        let mut state: u32 = 0x1234_5678;
+        for _ in 0..(width as usize * height as usize * 3) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            samples.push((state & 0xff) as u8);
+        }
+
+        let mut doc = lopdf::Document::new();
+        let mut img_dict = lopdf::Dictionary::new();
+        img_dict.set(b"Type", lopdf::Object::Name(b"XObject".to_vec()));
+        img_dict.set(b"Subtype", lopdf::Object::Name(b"Image".to_vec()));
+        img_dict.set(b"Width", lopdf::Object::Integer(width as i64));
+        img_dict.set(b"Height", lopdf::Object::Integer(height as i64));
+        img_dict.set(b"ColorSpace", lopdf::Object::Name(b"DeviceRGB".to_vec()));
+        img_dict.set(b"BitsPerComponent", lopdf::Object::Integer(8));
+        let img_id = doc.add_object(lopdf::Object::Stream(lopdf::Stream::new(img_dict, samples)));
+
+        let mut font_dict = lopdf::Dictionary::new();
+        font_dict.set(b"Type", lopdf::Object::Name(b"Font".to_vec()));
+        font_dict.set(b"Subtype", lopdf::Object::Name(b"Type1".to_vec()));
+        font_dict.set(b"BaseFont", lopdf::Object::Name(b"Helvetica".to_vec()));
+        font_dict.set(b"Encoding", lopdf::Object::Name(b"WinAnsiEncoding".to_vec()));
+        let font_id = doc.add_object(lopdf::Object::Dictionary(font_dict));
+
+        let content = "BT /F1 12 Tf 60 360 Td (Synthetic sample text for the FFI test) Tj ET\n\
+                       q 250 0 0 200 75 100 cm /Im0 Do Q\n";
+        let content_id = doc.add_object(lopdf::Object::Stream(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            content.as_bytes().to_vec(),
+        )));
+
+        let mut page_dict = lopdf::Dictionary::new();
+        page_dict.set(b"Type", lopdf::Object::Name(b"Page".to_vec()));
+        page_dict.set(
+            b"MediaBox",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(400),
+                lopdf::Object::Integer(400),
+            ]),
+        );
+        let mut xobj = lopdf::Dictionary::new();
+        xobj.set(b"Im0", lopdf::Object::Reference(img_id));
+        let mut font_res = lopdf::Dictionary::new();
+        font_res.set(b"F1", lopdf::Object::Reference(font_id));
+        let mut res_dict = lopdf::Dictionary::new();
+        res_dict.set(b"XObject", lopdf::Object::Dictionary(xobj));
+        res_dict.set(b"Font", lopdf::Object::Dictionary(font_res));
+        page_dict.set(b"Resources", lopdf::Object::Dictionary(res_dict));
+        page_dict.set(b"Contents", lopdf::Object::Reference(content_id));
+        let page_id = doc.add_object(lopdf::Object::Dictionary(page_dict));
+
+        let mut pages_dict = lopdf::Dictionary::new();
+        pages_dict.set(b"Type", lopdf::Object::Name(b"Pages".to_vec()));
+        pages_dict.set(
+            b"Kids",
+            lopdf::Object::Array(vec![lopdf::Object::Reference(page_id)]),
+        );
+        pages_dict.set(b"Count", lopdf::Object::Integer(1));
+        let pages_id = doc.add_object(lopdf::Object::Dictionary(pages_dict));
+
+        let mut catalog_dict = lopdf::Dictionary::new();
+        catalog_dict.set(b"Type", lopdf::Object::Name(b"Catalog".to_vec()));
+        catalog_dict.set(b"Pages", lopdf::Object::Reference(pages_id));
+        let catalog_id = doc.add_object(lopdf::Object::Dictionary(catalog_dict));
+        doc.trailer.set(b"Root", lopdf::Object::Reference(catalog_id));
+
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).expect("save synthetic image pdf");
+        bytes
+    }
+
+    /// Call an FFI entry point, copy its JSON, and free the C string.
+    fn call_json(bytes: &[u8], f: impl FnOnce(*const u8, usize) -> *mut c_char) -> String {
+        let ptr = f(bytes.as_ptr(), bytes.len());
+        assert!(!ptr.is_null(), "FFI entry point returned a null pointer");
+        let out = unsafe { CStr::from_ptr(ptr) }
+            .to_str()
+            .expect("FFI output must be UTF-8")
+            .to_owned();
+        pdf2md_free_string(ptr);
+        out
+    }
+
+    /// The parsed JSON with the wall-clock `duration_us` removed: it is
+    /// inherently nondeterministic between calls, so behavioral equality of
+    /// two conversions is asserted over every field except the timer.
+    fn comparable(json: &str) -> serde_json::Value {
+        let mut v: serde_json::Value = serde_json::from_str(json).expect("valid JSON");
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("duration_us");
+        }
+        v
+    }
+
+    #[test]
+    fn ex2_no_media_empties_media_array_and_embeds_nothing() {
+        let bytes = synthetic_noise_image_pdf(300, 240);
+
+        // Sanity: the fixture really does carry embeddable media, so the
+        // `no_media = 1` result below is meaningful.
+        let baseline: serde_json::Value =
+            serde_json::from_str(&call_json(&bytes, |p, l| pdf2md_convert(p, l))).unwrap();
+        assert!(
+            !baseline["media"].as_array().unwrap().is_empty(),
+            "fixture must contain at least one media item; got {baseline}"
+        );
+        assert!(
+            baseline["markdown"].as_str().unwrap().contains("data:image"),
+            "fixture must embed a data-URI image by default; got {baseline}"
+        );
+
+        let json = call_json(&bytes, |p, l| pdf2md_convert_ex2(p, l, 0, 1));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["ok"], true, "conversion must succeed: {v}");
+        assert!(
+            v["media"].as_array().unwrap().is_empty(),
+            "no_media=1 must yield an empty media array; got {v}"
+        );
+        assert!(
+            !v["markdown"].as_str().unwrap().contains("data:image"),
+            "no_media=1 markdown must contain no data:image; got {v}"
+        );
+    }
+
+    #[test]
+    fn ex2_default_matches_existing_convert_entry_points() {
+        let bytes = synthetic_noise_image_pdf(300, 240);
+
+        let legacy = call_json(&bytes, |p, l| pdf2md_convert(p, l));
+        let legacy_ex = call_json(&bytes, |p, l| pdf2md_convert_ex(p, l, 0));
+        let new_default = call_json(&bytes, |p, l| pdf2md_convert_ex2(p, l, 0, 0));
+
+        assert_eq!(
+            comparable(&new_default),
+            comparable(&legacy),
+            "pdf2md_convert_ex2(..., 0, 0) must match pdf2md_convert on every field except duration_us"
+        );
+        assert_eq!(
+            comparable(&new_default),
+            comparable(&legacy_ex),
+            "pdf2md_convert_ex2(..., 0, 0) must match pdf2md_convert_ex(..., 0) on every field except duration_us"
+        );
+        assert_eq!(
+            comparable(&legacy),
+            comparable(&legacy_ex),
+            "pdf2md_convert and pdf2md_convert_ex(..., 0) must agree as before"
+        );
+    }
+
+    #[test]
+    fn ex2_no_media_off_is_byte_identical_to_legacy_convert() {
+        let bytes = synthetic_noise_image_pdf(300, 240);
+
+        let legacy = call_json(&bytes, |p, l| pdf2md_convert(p, l));
+        let new_default = call_json(&bytes, |p, l| pdf2md_convert_ex2(p, l, 0, 0));
+
+        // `duration_us` is a wall-clock timer and cannot be equal run to run,
+        // so the byte-identity proof is taken over every other field: the
+        // canonical re-serialization of the parsed JSON (with `duration_us`
+        // removed) is exactly equal, which is the strongest deterministic
+        // equivalence available.
+        assert_eq!(
+            comparable(&new_default).to_string(),
+            comparable(&legacy).to_string(),
+            "default-off path must be byte-identical to pdf2md_convert except for duration_us"
+        );
+    }
 }

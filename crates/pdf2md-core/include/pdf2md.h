@@ -26,6 +26,12 @@ char *pdf2md_convert(const uint8_t *pdf_bytes, size_t pdf_len);
 /* Same as pdf2md_convert, but with explicit vector figure detection flag. */
 char *pdf2md_convert_ex(const uint8_t *pdf_bytes, size_t pdf_len, int detect_vectors);
 
+/* Same as pdf2md_convert_ex, but with an additional explicit no_media flag
+ * (0 = off, nonzero = on): when set, media detection and embedding are both
+ * disabled, so the "media" array is empty and no data-URI images are inlined
+ * in the returned markdown. */
+char *pdf2md_convert_ex2(const uint8_t *pdf_bytes, size_t pdf_len, int detect_vectors, int no_media);
+
 /* Returns 1 when the PDF has a digital text layer, 0 otherwise. */
 int pdf2md_is_digital(const uint8_t *pdf_bytes, size_t pdf_len);
 
