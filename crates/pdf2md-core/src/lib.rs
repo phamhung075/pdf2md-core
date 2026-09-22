@@ -22,7 +22,8 @@ pub use cpdf_textpage::{
     TextWord,
 };
 pub use ffi::{
-    pdf2md_convert, pdf2md_convert_ex, pdf2md_free_string, pdf2md_is_digital, pdf2md_version,
+    pdf2md_convert, pdf2md_convert_ex, pdf2md_convert_ex2, pdf2md_convert_ex3,
+    pdf2md_free_string, pdf2md_is_digital, pdf2md_version,
 };
 pub use layout::{
     analyze_char_stream, analyze_layout, analyze_pages_parallel, correct_skew, deskew_lines,
@@ -33,7 +34,8 @@ pub use layout::{
 };
 pub use media::{extract_page_media, extract_page_vector_figures, MediaItem, MediaKind};
 pub use models::{
-    BoundingBox, CanvasTable, ColumnAlignment, ConversionOptions, ConversionResult, TextSpan,
+    BoundingBox, CanvasTable, ColumnAlignment, ConversionOptions, ConversionResult, MediaMode,
+    RescueReason, TextSpan,
 };
 
 use crate::time::MonoClock;
@@ -980,6 +982,228 @@ fn strip_running_lines(page_md: &mut [(u32, String)]) {
     }
 }
 
+/// Page-number aware variant of [`furniture_line_key`] used for cross-page
+/// *block* furniture. The line-level key masks only a page token immediately
+/// following `page`/`p`; a footer such as `| … | Page : 12/17 |` has a
+/// separator (`:`) between the marker and the number, so the number would
+/// otherwise survive as data and the two blocks would not compare equal. This
+/// variant additionally masks a bare `N` / `N/M` page token adjacent to a page
+/// marker (skipping at most one separator token) and any `N/M` fraction on a
+/// line that carries a page marker. Everything else defers to
+/// [`furniture_line_key`], so amounts, dates and long identifiers still make
+/// two blocks distinct.
+fn furniture_block_line_key(line: &str) -> String {
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    let strip = |t: &str| -> String {
+        t.chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase()
+    };
+    let is_marker = |t: &str| {
+        let s = strip(t);
+        s == "page" || s == "p"
+    };
+    let has_marker = toks.iter().any(|t| is_marker(t));
+    let is_page_run = |t: &str| -> bool {
+        let core = t.trim_matches(|c: char| !c.is_alphanumeric());
+        if core.is_empty() {
+            return false;
+        }
+        let parts: Vec<&str> = core.split('/').collect();
+        parts.len() <= 2
+            && parts.iter().all(|p| {
+                !p.is_empty() && p.len() <= 3 && p.chars().all(|c| c.is_ascii_digit())
+            })
+    };
+    let is_sep = |t: &str| t.chars().all(|c| !c.is_alphanumeric());
+    let masked: Vec<String> = toks
+        .iter()
+        .enumerate()
+        .map(|(i, tok)| {
+            if !has_marker || !is_page_run(tok) {
+                return (*tok).to_string();
+            }
+            if tok.contains('/') {
+                return "#/#".to_string();
+            }
+            let prev_marker = i > 0 && is_marker(toks[i - 1]);
+            let sep_then_marker = i > 1 && is_sep(toks[i - 1]) && is_marker(toks[i - 2]);
+            if prev_marker || sep_then_marker {
+                "#".to_string()
+            } else {
+                (*tok).to_string()
+            }
+        })
+        .collect();
+    furniture_line_key(&masked.join(" "))
+}
+
+/// Collapse cross-page running furniture expressed as *multi-line blocks* — the
+/// case the line-based passes cannot see because a letterhead or footer is a
+/// running title plus a status table (`| Enedis-NOI-CF_110E | Page : 1/17 |`,
+/// `| 4.0 | 08/08/2024 |`, then the document title).
+///
+/// Operates on the assembled per-page markdown before reflow. It is
+/// deliberately conservative:
+///  * only a page's first/last `BLOCK_BAND` blocks are candidates, so repeated
+///    body prose in the middle of a page is never touched;
+///  * a page with too few blocks to have a real body (`<= 2 * BLOCK_BAND`) is
+///    skipped entirely, so a wholly-repeated sparse page keeps its content;
+///  * a candidate block must recur on at least `BLOCK_MIN_PAGES` distinct pages
+///    under a key that normalizes whitespace/punctuation and masks only
+///    page-number tokens, so a per-page amount, date, identifier or body value
+///    keeps two blocks distinct;
+///  * the block is bounded in size and must carry running-title text, so large
+///    data tables and image lines are never candidates;
+///  * only the first occurrence survives, and a page is never emptied.
+fn collapse_repeated_furniture_blocks(page_md: &mut [(u32, String)]) {
+    use std::collections::{HashMap, HashSet};
+    const BLOCK_BAND: usize = 2;
+    const BLOCK_MIN_PAGES: u32 = 3;
+    const BLOCK_MAX_LINES: usize = 12;
+    const BLOCK_MAX_CHARS: usize = 600;
+
+    if page_md.len() < BLOCK_MIN_PAGES as usize {
+        return;
+    }
+
+    // Split a chunk into blank-line-separated blocks; whitespace-only lines
+    // separate, they do not form a block.
+    let split_blocks = |chunk: &str| -> Vec<String> {
+        let mut blocks: Vec<String> = Vec::new();
+        let mut cur: Vec<&str> = Vec::new();
+        for line in chunk.lines() {
+            if line.trim().is_empty() {
+                if !cur.is_empty() {
+                    blocks.push(cur.join("\n"));
+                    cur.clear();
+                }
+            } else {
+                cur.push(line);
+            }
+        }
+        if !cur.is_empty() {
+            blocks.push(cur.join("\n"));
+        }
+        blocks
+    };
+
+    let is_candidate = |b: &str| -> bool {
+        if b.lines().count() > BLOCK_MAX_LINES || b.len() > BLOCK_MAX_CHARS {
+            return false;
+        }
+        if b.trim_start().starts_with("![") || b.trim_start().starts_with("<img") {
+            return false;
+        }
+        // Require at least one line with two or more alphabetic words, so a
+        // pure numeric table cannot be collapsed as running furniture.
+        b.lines().any(|l| {
+            l.split_whitespace()
+                .filter(|w| w.chars().any(|c| c.is_alphabetic()))
+                .count()
+                >= 2
+        })
+    };
+
+    let key_of = |b: &str| -> String {
+        b.lines()
+            .map(furniture_block_line_key)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let pages: Vec<Vec<String>> = page_md.iter().map(|(_, c)| split_blocks(c)).collect();
+
+    let mut first_page: HashMap<String, u32> = HashMap::new();
+    let mut page_count: HashMap<String, u32> = HashMap::new();
+    for (i, blocks) in pages.iter().enumerate() {
+        // A page with too few blocks to carry a body is content, not furniture.
+        if blocks.len() <= 2 * BLOCK_BAND {
+            continue;
+        }
+        let page = page_md[i].0;
+        let n = blocks.len();
+        let mut seen_here: HashSet<String> = HashSet::new();
+        for (bi, b) in blocks.iter().enumerate() {
+            if !is_candidate(b) || !(bi < BLOCK_BAND || bi + BLOCK_BAND >= n) {
+                continue;
+            }
+            let key = key_of(b);
+            if key.chars().filter(|c| c.is_alphanumeric()).count() < 8 {
+                continue;
+            }
+            first_page.entry(key.clone()).or_insert(page);
+            if seen_here.insert(key.clone()) {
+                *page_count.entry(key).or_insert(0) += 1;
+            }
+        }
+    }
+    let repeated: HashSet<String> = page_count
+        .into_iter()
+        .filter(|(_, c)| *c >= BLOCK_MIN_PAGES)
+        .map(|(k, _)| k)
+        .collect();
+    if repeated.is_empty() {
+        return;
+    }
+
+    for (i, (page, chunk)) in page_md.iter_mut().enumerate() {
+        let blocks = &pages[i];
+        if blocks.len() <= 2 * BLOCK_BAND {
+            continue;
+        }
+        let n = blocks.len();
+        let page_no = *page;
+        let mut kept: Vec<&str> = Vec::with_capacity(n);
+        let (mut dropped_any, mut dropped_first, mut dropped_last) = (false, false, false);
+        for (bi, b) in blocks.iter().enumerate() {
+            let in_band = bi < BLOCK_BAND || bi + BLOCK_BAND >= n;
+            let drop = in_band && is_candidate(b) && {
+                let key = key_of(b);
+                repeated.contains(&key)
+                    && first_page.get(&key).copied().unwrap_or(page_no) < page_no
+            };
+            if drop {
+                dropped_any = true;
+                dropped_first |= bi == 0;
+                dropped_last |= bi + 1 == n;
+            } else {
+                kept.push(b.as_str());
+            }
+        }
+        // Never empty a page: if every block was furniture, keep the page as-is.
+        if dropped_any && !kept.is_empty() {
+            // `split_blocks` discards blank lines, so rebuilding from `kept`
+            // alone loses the trailing separator page assembly always appends
+            // (pages are concatenated with no separator). Capture it so a
+            // retained last block keeps its page boundary.
+            let trail = {
+                let t = chunk.trim_end_matches(|c: char| c == '\n' || c == '\r');
+                chunk[t.len()..].to_string()
+            };
+            let mut rebuilt = kept.join("\n\n");
+            // Keep a leading boundary when the header was dropped, so this
+            // page's first block is not welded onto the previous page.
+            if dropped_first {
+                rebuilt.insert_str(0, "\n\n");
+            }
+            if dropped_last {
+                // The trailing footer itself was furniture: restore the
+                // blank-line boundary it used to provide.
+                rebuilt.push_str("\n\n");
+            } else {
+                // Otherwise preserve exactly the separator the chunk had, so a
+                // retained last block (e.g. a lone `# 8`) is not welded onto
+                // the next page's first block (e.g. a table row) with zero
+                // characters between them.
+                rebuilt.push_str(&trail);
+            }
+            *chunk = rebuilt;
+        }
+    }
+}
+
 /// Tag blocks whose text repeats near the top/bottom of >= 3 pages as running
 /// headers/footers. Operates purely on the structured block list.
 fn tag_running_furniture(blocks: &mut [layout::DocBlock]) {
@@ -1205,6 +1429,12 @@ pub fn convert_pdf_bytes_to_markdown(
     let mut pages_below_word_floor = 0usize;
     let mut any_text_ops = false;
     let mut any_fonts = false;
+    // True when any page's own content stream could not be decoded at all
+    // (e.g. an over-cap decompression bomb). Such a page looks like
+    // "text-show operators present, zero words" once the fallback fills in
+    // `text_ops_seen: true`, so this flag keeps a genuine decode failure on
+    // the explicit-error path instead of the glyph-encoded status path.
+    let mut any_decode_failure = false;
     let mut tables_detected = 0usize;
     // True when any page's extraction hit a work bound and truncated.
     let mut budget_exhausted = false;
@@ -1212,7 +1442,7 @@ pub fn convert_pdf_bytes_to_markdown(
     // Running total of base64 bytes inlined into the markdown as `data:`
     // URIs so far, across every page. Once `options.max_media_bytes_per_doc`
     // is reached, further images are replaced with a text placeholder
-    // instead of another data URI (see the `embed_media` loop below) — this
+    // instead of another data URI (see the `MediaMode::Embed` loop below) — this
     // is what actually bounds the emitted markdown size for scan-heavy
     // documents; the per-image downscale in `media::extract_page_media`
     // only shrinks the common case.
@@ -1230,14 +1460,15 @@ pub fn convert_pdf_bytes_to_markdown(
         // ToUnicode handling — see text_extract.rs) and only fall back to
         // lopdf's extractor when the page content cannot be parsed at all.
         let (page_text, marker_hint) = {
-            let geo = text_extract::extract_page_text_report_with_marker(
+            let geo_result = text_extract::extract_page_text_report_with_marker(
                 &doc,
                 page_num,
                 options.detect_tables,
                 options.detect_layout,
                 options.detect_math,
             );
-            let (geo, geo_hint) = match geo {
+            any_decode_failure |= geo_result.is_err();
+            let (geo, geo_hint) = match geo_result {
                 Ok(pair) => pair,
                 Err(_) => (
                     text_extract::PageText {
@@ -1303,7 +1534,7 @@ pub fn convert_pdf_bytes_to_markdown(
             b.text = text_extract::normalize_decoded_text(&b.text);
         }
 
-        let page_media: Vec<media::MediaItem> = if options.detect_media {
+        let page_media: Vec<media::MediaItem> = if options.media_mode != MediaMode::None {
             let page_bbox = page_media_box(&doc, page_id);
             let mut m = media::extract_page_media(
                 &doc,
@@ -1411,7 +1642,7 @@ pub fn convert_pdf_bytes_to_markdown(
 
         let mut processed_text = format_urls_and_footnotes(&text);
 
-        if options.embed_media {
+        if options.media_mode == MediaMode::Embed {
             // Page-relative sizing: reproduce the on-page footprint so a high-DPI
             // placement that covers only part of the page does not render at its
             // full pixel width (which is much larger than it was on the page).
@@ -1608,20 +1839,41 @@ pub fn convert_pdf_bytes_to_markdown(
 
     // When nothing was decoded, give an actionable reason instead of a silent
     // empty markdown:
-    //  * text-show operators seen but zero words decoded -> the text layer is
-    //    unusable; glyph-encoded/outlined fonts, a missing or broken ToUnicode
-    //    CMap, and a corrupt font program are all possible. The font subtype is
-    //    not inspected here, so the message must not assert a specific one;
+    //  * text-show operators seen but zero words decoded AND no page failed to
+    //    decode -> the text layer is unusable; glyph-encoded/outlined fonts, a
+    //    missing or broken ToUnicode CMap, and a corrupt font program are all
+    //    possible. This is the Type3/CID class. Return a well-formed status
+    //    document plus structured rescue metadata instead of a 0-byte output,
+    //    so a downstream consumer gets an unambiguous signal (the legacy exit
+    //    code is preserved by the CLI, which still exits non-zero for this
+    //    case). The font subtype is not inspected here, so the text must not
+    //    assert a specific one;
+    //  * a page whose content stream could not be decoded at all (bomb/corrupt)
+    //    is a genuine hard failure and stays on the explicit-error path;
     //  * no fonts and no text-show operators at all -> scanned/image page.
     if total_words == 0 {
-        if any_text_ops {
-            return Err(
-                "Document draws text (text-show operators present) but no readable words were decoded; \
-                 the text layer may be glyph-encoded or outlined (e.g. Type3), may lack a usable Unicode \
-                 mapping (e.g. a missing or broken ToUnicode CMap on a Type0/CID font), or its embedded \
-                 font program may be corrupt — route through the OCR/Vision pipeline (vision-LLM rescue)."
-                    .to_string(),
+        if any_text_ops && !any_decode_failure {
+            let status = format!(
+                "# Conversion status: glyph-encoded text layer\n\n\
+                 > **Vision rescue required.** This document draws text (text-show\n\
+                 > operators are present) but no Unicode-mappable words were decoded.\n\
+                 > The fast digital-text path cannot recover it — route it through the\n\
+                 > OCR/Vision pipeline (vision-LLM rescue).\n\n\
+                 <!-- pdf2md: {{\"needs_vision_rescue\":true,\"rescue_reason\":\"glyph_encoded\",\"pages\":{total_pages},\"words\":0}} -->\n"
             );
+            return Ok(ConversionResult {
+                markdown: status,
+                total_pages,
+                total_words,
+                pages_below_word_floor,
+                tables_detected,
+                duration_us: t0.elapsed_us(),
+                budget_exhausted,
+                media: media_items,
+                blocks: block_items,
+                needs_vision_rescue: true,
+                rescue_reason: Some(RescueReason::GlyphEncoded),
+            });
         }
         if !any_fonts {
             return Err(
@@ -1689,6 +1941,11 @@ pub fn convert_pdf_bytes_to_markdown(
     // standalone ratio/data value survives.
     if options.detect_layout {
         suppress_page_counters(&mut page_md);
+        // Cross-page running furniture expressed as multi-line blocks (a
+        // repeated title plus a letterhead/status table) is invisible to the
+        // line-based passes above because table rows and multi-line blocks are
+        // excluded there, so collapse it as whole blocks before reflow.
+        collapse_repeated_furniture_blocks(&mut page_md);
     }
     for (_p, chunk) in page_md {
         // Paragraph reflow: join the walker's one-line-per-PDF-line output
@@ -1718,6 +1975,8 @@ pub fn convert_pdf_bytes_to_markdown(
         budget_exhausted,
         media: media_items,
         blocks: block_items,
+        needs_vision_rescue: false,
+        rescue_reason: None,
     })
 }
 
@@ -1933,7 +2192,11 @@ mod regression_tests {
     fn embedded_images_are_resized_to_page_footprint() {
         let pdf_path = "../../../scratch/tests/fixtures/synth_logo_image.pdf";
         if let Ok(bytes) = std::fs::read(pdf_path) {
-            let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default()).unwrap();
+            let opts = ConversionOptions {
+                media_mode: MediaMode::Embed,
+                ..Default::default()
+            };
+            let res = convert_pdf_bytes_to_markdown(&bytes, &opts).unwrap();
             let md = &res.markdown;
 
             // The fixture must actually embed a raster image so the assertion is
@@ -1969,7 +2232,11 @@ mod regression_tests {
         // insertion point back to the start of the matched line.
         let pdf_path = "../../../scratch/tests/fixtures/billet_electronique.pdf";
         if let Ok(bytes) = std::fs::read(pdf_path) {
-            let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default()).unwrap();
+            let opts = ConversionOptions {
+                media_mode: MediaMode::Embed,
+                ..Default::default()
+            };
+            let res = convert_pdf_bytes_to_markdown(&bytes, &opts).unwrap();
             let md = &res.markdown;
             for line in md.lines() {
                 let trimmed = line.trim_end();
@@ -1994,6 +2261,7 @@ mod regression_tests {
         if let Ok(bytes) = std::fs::read(pdf_path) {
             let opts = ConversionOptions {
                 max_media_bytes_per_doc: 1, // any real image blows this instantly
+                media_mode: MediaMode::Embed,
                 ..Default::default()
             };
             let res = convert_pdf_bytes_to_markdown(&bytes, &opts).unwrap();
@@ -2017,14 +2285,32 @@ mod regression_tests {
         }
     }
 
+    /// The media policy defaults to `None` (no extraction, no inline data
+    /// URIs); `Embed` remains a working explicit opt-in.
     #[test]
-    fn media_budget_default_still_embeds_a_normal_sized_image() {
+    fn media_mode_defaults_to_none_and_embed_remains_opt_in() {
         let pdf_path = "../../../scratch/tests/fixtures/synth_logo_image.pdf";
         if let Ok(bytes) = std::fs::read(pdf_path) {
-            let res = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default()).unwrap();
+            let default_res =
+                convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default()).unwrap();
+            assert!(
+                !default_res.markdown.contains("data:image/"),
+                "the default media policy must not inline an image: {}",
+                default_res.markdown
+            );
+            assert!(
+                default_res.media.is_empty(),
+                "the default media policy must not extract media"
+            );
+
+            let opts = ConversionOptions {
+                media_mode: MediaMode::Embed,
+                ..Default::default()
+            };
+            let res = convert_pdf_bytes_to_markdown(&bytes, &opts).unwrap();
             assert!(
                 res.markdown.contains("data:image/"),
-                "a small fixture image must not trip the default 512KB budget"
+                "an explicit `Embed` media policy must still inline a small fixture image"
             );
         }
     }
@@ -2133,6 +2419,7 @@ mod regression_tests {
         // so the figure must be embedded rather than omitted.
         let opts = ConversionOptions {
             max_media_bytes_per_doc: 1_500_000,
+            media_mode: MediaMode::Embed,
             ..Default::default()
         };
         let res = convert_pdf_bytes_to_markdown(&bytes, &opts).unwrap();
@@ -2178,6 +2465,7 @@ mod regression_tests {
         // placeholder remains the true last resort.
         let opts = ConversionOptions {
             max_media_bytes_per_doc: 32 * 1024,
+            media_mode: MediaMode::Embed,
             ..Default::default()
         };
         let res = convert_pdf_bytes_to_markdown(&bytes, &opts).unwrap();
@@ -2203,6 +2491,7 @@ mod regression_tests {
         let budget = 300 * 1024;
         let opts = ConversionOptions {
             max_media_bytes_per_doc: budget,
+            media_mode: MediaMode::Embed,
             ..Default::default()
         };
         let res = convert_pdf_bytes_to_markdown(&bytes, &opts).unwrap();
@@ -3083,6 +3372,183 @@ mod regression_tests {
             kept.matches("TICKET DE CAISSE").count(),
             3,
             "sparse repeated content must survive: {kept}"
+        );
+    }
+
+    /// A multi-line footer block (running title + page-varying status table)
+    /// repeats on every page: only the first occurrence survives, and every
+    /// page's unique body block is kept.
+    #[test]
+    fn collapse_repeated_furniture_blocks_drops_footer_after_first_page() {
+        let footer = |n: u32| {
+            format!(
+                "| Enedis-NOI-CF_110E | Page : {n}/4 |\n| --- | --- |\n| 4.0 | 08/08/2024 |\nModalités spécifiques aux points de connexion"
+            )
+        };
+        let mut pages: Vec<(u32, String)> = (1..=4)
+            .map(|i| {
+                (
+                    i,
+                    format!("body alpha {i}\n\nmore body {i}\n\nfiller one\n\nfiller two\n\n{}", footer(i)),
+                )
+            })
+            .collect();
+        collapse_repeated_furniture_blocks(&mut pages);
+        let all = pages.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            all.matches("Enedis-NOI-CF_110E").count(),
+            1,
+            "repeated footer table must be kept once: {all}"
+        );
+        assert_eq!(
+            all.matches("Modalités spécifiques").count(),
+            1,
+            "repeated running title must be kept once: {all}"
+        );
+        for i in 1..=4 {
+            assert!(all.contains(&format!("body alpha {i}")), "page {i} body lost: {all}");
+        }
+        // Dropping the trailing footer must leave a blank-line boundary so the
+        // neighbouring pages' bodies do not weld into one paragraph.
+        assert!(
+            pages[1].1.ends_with("\n\n"),
+            "dropping a trailing footer must keep a page boundary: {:?}",
+            pages[1].1
+        );
+    }
+
+    /// Regression for the `enedis_facture_hta` integration bug: a page whose
+    /// retained *last* block is a lone short heading (`# 8`) while the repeated
+    /// letterhead before it (in the footer band) is dropped must keep its
+    /// trailing blank-line page separator. Without it the next page's first
+    /// block — a table row — is welded on with zero characters (`# 8|   | …`),
+    /// which is not a valid GFM table start.
+    #[test]
+    fn collapse_repeated_furniture_blocks_keeps_page_boundary_before_next_page_table() {
+        let letterhead = "Enedis, SA a directoire et a conseil de surveillance\n\
+                          Tour Enedis 92079 Paris La Defense Cedex - RCS de NANTERRE 444608442";
+        let table =
+            "|   | Page « Détails des éléments |\n| --- | --- |\n|   | facturés hors taxes » |";
+        // Each page chunk ends with `\n\n` — the separator page assembly always
+        // appends (see the `chunk.push_str("\n\n")` at page build time).
+        let mut pages: Vec<(u32, String)> = vec![
+            (
+                1,
+                format!("{letterhead}\n\nintro one\n\nbody one\n\nbody two\n\nbody three\n\n# 1\n\n"),
+            ),
+            // Page 2 ends with the retained lone heading, immediately after the
+            // dropped furniture: exactly the enedis shape.
+            (
+                2,
+                format!("header two\n\nintro two\n\nbody two a\n\nbody two b\n\n{letterhead}\n\n# 8\n\n"),
+            ),
+            // Page 3 begins with the table block (no blank line before it).
+            (
+                3,
+                format!("header three\n\nintro three\n\nbody three a\n\nbody three b\n\n{letterhead}\n\n{table}\n\n"),
+            ),
+            (
+                4,
+                format!("header four\n\nintro four\n\nbody four a\n\nbody four b\n\n{letterhead}\n\n# 10\n\n"),
+            ),
+        ];
+
+        collapse_repeated_furniture_blocks(&mut pages);
+
+        let all = pages
+            .iter()
+            .map(|(_, s)| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // (a) Letterhead dedup still holds: first occurrence kept, later dropped.
+        assert_eq!(
+            all.matches("Enedis, SA a directoire").count(),
+            1,
+            "letterhead dedup lost: {all}"
+        );
+        // (b) The page ending in the lone heading keeps a newline boundary.
+        assert!(
+            pages[1].1.ends_with('\n'),
+            "rebuilt page must keep a boundary: {:?}",
+            pages[1].1
+        );
+        // (c) Production concatenates pages with `push_str` and no separator:
+        // the heading must never be glued to the following table row.
+        let mut out = String::new();
+        for (_, s) in &pages {
+            out.push_str(s);
+        }
+        assert!(
+            !out.contains("# 8|"),
+            "heading welded to following table row: {out}"
+        );
+        assert!(
+            out.contains("# 8\n"),
+            "heading must be separated from the table by a newline: {out}"
+        );
+    }
+
+    /// A near-identical footer whose only varying line is a real data value is
+    /// not furniture and must survive on every page.
+    #[test]
+    fn collapse_repeated_furniture_blocks_keeps_distinct_data_blocks() {
+        let footer = |amount: &str| {
+            format!("Releve de compte\n| Total | {amount} |\n| --- | --- |\n| Reglement | 08/08/2024 |")
+        };
+        let mut pages: Vec<(u32, String)> = (1..=4)
+            .map(|i| {
+                (
+                    i,
+                    format!(
+                        "lead {i}\n\na\n\nb\n\nc\n\n{}",
+                        footer(&format!("1 234,5{i}"))
+                    ),
+                )
+            })
+            .collect();
+        collapse_repeated_furniture_blocks(&mut pages);
+        let all = pages.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+        for i in 1..=4 {
+            assert!(
+                all.contains(&format!("1 234,5{i}")),
+                "per-page amount {i} must survive: {all}"
+            );
+        }
+    }
+
+    /// A repeated block that sits in the middle of a page (outside the
+    /// header/footer bands) is body content and must not be collapsed.
+    #[test]
+    fn collapse_repeated_furniture_blocks_keeps_mid_page_repeats() {
+        let mid = "repeated middle paragraph";
+        let mut pages: Vec<(u32, String)> = (1..=4)
+            .map(|i| {
+                (
+                    i,
+                    format!("first {i}\n\nsecond {i}\n\n{mid}\n\nfourth {i}\n\nfifth {i}"),
+                )
+            })
+            .collect();
+        collapse_repeated_furniture_blocks(&mut pages);
+        let all = pages.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            all.matches(mid).count(),
+            4,
+            "mid-page repeated block must survive on every page: {all}"
+        );
+    }
+
+    /// A wholly-repeated sparse page (<= 4 blocks) is content, not furniture.
+    #[test]
+    fn collapse_repeated_furniture_blocks_keeps_sparse_repeated_pages() {
+        let body = "TICKET DE CAISSE\nArticle un 5,00\nArticle deux 7,50\nTOTAL 12,50";
+        let mut pages: Vec<(u32, String)> = (1..=3).map(|i| (i, body.to_string())).collect();
+        collapse_repeated_furniture_blocks(&mut pages);
+        let all = pages.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            all.matches("TICKET DE CAISSE").count(),
+            3,
+            "sparse repeated page must survive: {all}"
         );
     }
 

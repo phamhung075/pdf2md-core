@@ -134,7 +134,7 @@ impl CanvasTable {
     /// no value cell in row 0 and is kept; so is an all-numeric first row, so
     /// the existing cell-count contract for headerless numeric grids is
     /// unchanged.
-    fn first_row_is_header(rows: &[Vec<String>]) -> bool {
+    pub(crate) fn first_row_is_header(rows: &[Vec<String>]) -> bool {
         if rows.len() < 2 {
             return true;
         }
@@ -215,22 +215,42 @@ impl CanvasTable {
     }
 }
 
+/// How placed images are handled during a conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaMode {
+    /// Neither extract nor emit images (the default: fastest, smallest output,
+    /// and the policy the CLI and services ship with).
+    None,
+    /// Extract image placements into the JSON `media` side-channel, but never
+    /// inline a `data:` URI into the markdown. Use this when the caller saves
+    /// the images itself (e.g. the Obsidian plugin's `attachments/` folder).
+    Reference,
+    /// Extract image placements and inline them as self-contained `data:` URI
+    /// images in the markdown (explicit opt-in: large output).
+    Embed,
+}
+
+impl Default for MediaMode {
+    fn default() -> Self {
+        MediaMode::None
+    }
+}
+
 /// Conversion and parsing options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversionOptions {
     pub detect_tables: bool,
     pub detect_headings: bool,
     pub min_words_per_page: usize,
-    /// Extract placed images and return them as base64 media items.
-    pub detect_media: bool,
+    /// How placed images are handled: [`MediaMode::None`] (default),
+    /// [`MediaMode::Reference`] (JSON `media` list only) or
+    /// [`MediaMode::Embed`] (inline `data:` URIs).
+    pub media_mode: MediaMode,
     /// Rebuild reading order with zones/columns/furniture handling on the
     /// geometry path (fallback is byte-identical for simple single-column
     /// pages).
     pub detect_layout: bool,
-    /// Embed extracted, non-decorative images into the markdown itself as
-    /// self-contained data-URI lines (placed top-to-bottom per page). When
-    /// false, images are only returned in the `media` JSON list.
-    pub embed_media: bool,
     /// Detect pure-vector figure regions (charts/diagrams/logos drawn with
     /// paths, no raster) and cut them out as standalone clipped PDFs.
     pub detect_vectors: bool,
@@ -250,7 +270,7 @@ pub struct ConversionOptions {
     /// pages.
     pub max_image_dimension: u32,
     /// Maximum total bytes of base64-encoded image data inlined into the
-    /// markdown across the whole document (`embed_media`).
+    /// markdown across the whole document (`MediaMode::Embed`).
     ///
     /// When an image's full-size payload would exceed the remaining budget it
     /// is first adaptively shrunk to fit: progressively downscaled (aspect
@@ -273,9 +293,8 @@ impl Default for ConversionOptions {
             detect_tables: true,
             detect_headings: true,
             min_words_per_page: 5,
-            detect_media: true,
+            media_mode: MediaMode::None,
             detect_layout: true,
-            embed_media: true,
             detect_vectors: false,
             detect_math: true,
             max_image_dimension: 1536,
@@ -313,6 +332,35 @@ pub struct ConversionResult {
     /// layout engine.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<crate::layout::DocBlock>,
+    /// True when the text layer could not be decoded into readable words and
+    /// the document should be routed through the OCR/Vision rescue pipeline.
+    /// When set, `markdown` still holds a well-formed (non-empty) status
+    /// document instead of being empty, so a downstream caller never has to
+    /// special-case a 0-byte result. `false` for every ordinary conversion.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub needs_vision_rescue: bool,
+    /// Why rescue is needed, when [`ConversionResult::needs_vision_rescue`] is
+    /// set. Structured counterpart to the legacy error string so the gateway/
+    /// worker gets an unambiguous signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rescue_reason: Option<RescueReason>,
+}
+
+/// Structured reason a document needs the vision-rescue route. Emitted on
+/// [`ConversionResult`] alongside the human-readable status markdown so a
+/// caller can branch on the cause instead of parsing prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RescueReason {
+    /// Text-show operators were present but zero readable words were decoded:
+    /// glyph-encoded/outlined fonts (e.g. Type3) or a missing/broken ToUnicode
+    /// CMap on a Type0/CID font. The document is not a scan, so only vision
+    /// rescue can recover it.
+    GlyphEncoded,
+    /// Fonts were referenced but no readable text decoded.
+    UnreadableFonts,
+    /// No fonts and no text-show operators: a scanned/image-only document.
+    ScannedImage,
 }
 
 /// `skip_serializing_if` helper: omit the `budget_exhausted` key when false, so
@@ -396,6 +444,8 @@ mod tests {
             budget_exhausted: false,
             media: Vec::new(),
             blocks: Vec::new(),
+            needs_vision_rescue: false,
+            rescue_reason: None,
         };
         let v = serde_json::to_value(&r).expect("serialise");
         assert!(

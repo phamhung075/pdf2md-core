@@ -762,9 +762,19 @@ fn header_like_row(
     if row.words.len() > max_header_words {
         return false;
     }
+    // Header cells are frequently centred over their column rather than
+    // left-aligned on the data's start ruler, so a label such as the Mistral
+    // table's `MT Bench` starts ~1.5pt right of the `6.84` value ruler below
+    // it. The pass-wide `tol` is derived from the smallest font on the page
+    // (often < 1pt), so the exact `tol * 1.5` test rejected the only row that
+    // would have kept the header attached, leaving `Guardrails`/`MT Bench` as
+    // detached bold body text. A floor of 2pt keeps a genuine two-cell header
+    // matching while the no-straddle and short-cell gates below still reject
+    // prose and captions.
+    let match_tol = (tol * 1.5).max(2.0);
     let matched = rulers
         .iter()
-        .filter(|&&r| row_matches_ruler(row, r, tol * 1.5))
+        .filter(|&&r| row_matches_ruler(row, r, match_tol))
         .count();
     if matched < 2 {
         return false;
@@ -2252,6 +2262,35 @@ mod tests {
                 && hit.rows[0].iter().any(|c| c.contains("Col9")),
             "wide header cells missing from row 0: {:?}",
             hit.rows[0]
+        );
+    }
+
+    /// `complex_p5`: a two-cell table header whose right label is centred over
+    /// the value column (`MT` starts ~1.4pt right of the `6.84` ruler) must
+    /// still be annexed to the table. The pass-wide `tol` is under 1pt on that
+    /// page, so the exact `tol * 1.5` test matched only one ruler and
+    /// `Guardrails`/`MT Bench` was emitted as detached bold body text instead
+    /// of the table's header row.
+    #[test]
+    fn centred_header_label_still_matches_a_value_column_ruler() {
+        let header = vec![
+            sp("Guardrails", 379.0, 66.0),
+            sp("MT", 456.0, 14.0),
+            sp("Bench", 472.0, 25.0),
+        ];
+        let words = line_words(&header);
+        let starts = words.iter().map(|w| w.x0).collect();
+        let ends = words.iter().map(|w| w.x1).collect();
+        let info = vec![RowInfo {
+            words,
+            starts,
+            ends,
+            size: 10.0,
+        }];
+        let rulers = vec![387.52, 454.56, 472.50, 497.60];
+        assert!(
+            header_like_row(&info, 0, &rulers, 0.6, 6.0),
+            "a header whose label is centred over the value column was rejected"
         );
     }
 }

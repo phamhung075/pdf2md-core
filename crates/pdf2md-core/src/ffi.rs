@@ -7,7 +7,7 @@
 use std::ffi::CString;
 use std::os::raw::c_char;
 
-use crate::{convert_pdf_bytes_to_markdown, is_digital_pdf_bytes, ConversionOptions};
+use crate::{convert_pdf_bytes_to_markdown, is_digital_pdf_bytes, ConversionOptions, MediaMode};
 
 pub(crate) fn cstring_into_raw(s: String) -> *mut c_char {
     match CString::new(s) {
@@ -45,12 +45,10 @@ pub extern "C" fn pdf2md_convert_ex(
 }
 
 /// Same as `pdf2md_convert_ex`, but with an additional explicit `no_media`
-/// flag (0 = off/default, nonzero = on) so per-request FFI consumers (a
-/// long-lived server process, where the P2M_* env-var hatches below cannot
-/// vary per request) can request text-only extraction — equivalent to the
-/// CLI's `--no-media`: both `detect_media` and `embed_media` are set to
-/// false, so the `media` JSON array is empty and no data-URI images are
-/// embedded in the returned markdown.
+/// flag (0 = off/default, nonzero = on): equivalent to the CLI's `--no-media`
+/// and forces [`MediaMode::None`]. The media policy now defaults to none for
+/// every entry point, so `no_media = 0` selects that default rather than
+/// embedding.
 #[no_mangle]
 pub extern "C" fn pdf2md_convert_ex2(
     pdf_ptr: *const u8,
@@ -62,7 +60,36 @@ pub extern "C" fn pdf2md_convert_ex2(
         pdf_ptr,
         pdf_len,
         Some(detect_vectors != 0),
-        Some(no_media != 0),
+        if no_media != 0 {
+            Some(MediaMode::None)
+        } else {
+            None
+        },
+    )
+}
+
+/// Same as `pdf2md_convert_ex`, but with an explicit media policy:
+/// `0 = none` (default), `1 = reference` (JSON `media` list only),
+/// `2 = embed` (inline `data:` URIs). Any other value selects the default
+/// (`none`). This is the general FFI surface for
+/// [`crate::MediaMode`]; `pdf2md_convert_ex2`'s `no_media` flag remains the
+/// compatibility alias for `none`.
+#[no_mangle]
+pub extern "C" fn pdf2md_convert_ex3(
+    pdf_ptr: *const u8,
+    pdf_len: usize,
+    detect_vectors: i32,
+    media_mode: i32,
+) -> *mut c_char {
+    pdf2md_convert_impl(
+        pdf_ptr,
+        pdf_len,
+        Some(detect_vectors != 0),
+        Some(match media_mode {
+            1 => MediaMode::Reference,
+            2 => MediaMode::Embed,
+            _ => MediaMode::None,
+        }),
     )
 }
 
@@ -70,7 +97,7 @@ fn pdf2md_convert_impl(
     pdf_ptr: *const u8,
     pdf_len: usize,
     vectors_override: Option<bool>,
-    no_media_override: Option<bool>,
+    media_mode_override: Option<MediaMode>,
 ) -> *mut c_char {
     let json = if pdf_ptr.is_null() {
         serde_json::json!({ "ok": false, "error": "null input pointer" })
@@ -94,14 +121,19 @@ fn pdf2md_convert_impl(
                 _ => opts.detect_math = true,
             }
         }
-        // Explicit per-request text-only switch (the CLI's `--no-media`):
-        // disable both media detection and embedding so the `media` JSON
-        // array stays empty and no data-URI images are inlined into the
-        // markdown. This cannot ride the P2M_* env hatches above because
-        // those are process-wide, not per call.
-        if no_media_override.unwrap_or(false) {
-            opts.detect_media = false;
-            opts.embed_media = false;
+        // Media policy: an explicit per-call override (the `media_mode` /
+        // `no_media` arguments) wins; otherwise the process-wide
+        // `P2M_MEDIA_MODE` hatch (none|reference|embed) can raise it, since a
+        // long-lived server process cannot vary the per-call argument for a
+        // legacy entry point. Unset uses the default, `none`.
+        if let Some(mode) = media_mode_override {
+            opts.media_mode = mode;
+        } else if let Ok(v) = std::env::var("P2M_MEDIA_MODE") {
+            opts.media_mode = match v.trim().to_ascii_lowercase().as_str() {
+                "embed" => MediaMode::Embed,
+                "reference" | "ref" => MediaMode::Reference,
+                _ => MediaMode::None,
+            };
         }
         // Optional overrides for the media-embed size guardrails (R1): cap the
         // pixel dimension a raster is downscaled to, and the total base64
@@ -133,6 +165,8 @@ fn pdf2md_convert_impl(
                     "media": media_json,
                     "blocks": blocks_json,
                     "duration_us": r.duration_us,
+                    "needs_vision_rescue": r.needs_vision_rescue,
+                    "rescue_reason": r.rescue_reason,
                 })
             }
             Err(e) => serde_json::json!({ "ok": false, "error": e }),
@@ -330,32 +364,58 @@ mod tests {
     }
 
     #[test]
-    fn ex2_no_media_empties_media_array_and_embeds_nothing() {
+    fn media_mode_none_is_default_and_embed_is_opt_in() {
         let bytes = synthetic_noise_image_pdf(300, 240);
 
         // Sanity: the fixture really does carry embeddable media, so the
-        // `no_media = 1` result below is meaningful.
-        let baseline: serde_json::Value =
-            serde_json::from_str(&call_json(&bytes, |p, l| pdf2md_convert(p, l))).unwrap();
+        // "no media by default" result below is meaningful.
+        let embed: serde_json::Value =
+            serde_json::from_str(&call_json(&bytes, |p, l| pdf2md_convert_ex3(p, l, 0, 2)))
+                .unwrap();
         assert!(
-            !baseline["media"].as_array().unwrap().is_empty(),
-            "fixture must contain at least one media item; got {baseline}"
+            !embed["media"].as_array().unwrap().is_empty(),
+            "fixture must contain at least one media item; got {embed}"
         );
         assert!(
-            baseline["markdown"].as_str().unwrap().contains("data:image"),
-            "fixture must embed a data-URI image by default; got {baseline}"
+            embed["markdown"].as_str().unwrap().contains("data:image"),
+            "explicit embed must inline a data-URI image; got {embed}"
         );
 
-        let json = call_json(&bytes, |p, l| pdf2md_convert_ex2(p, l, 0, 1));
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["ok"], true, "conversion must succeed: {v}");
+        // New default: no media extracted and no data-URI inlined.
+        let default_call: serde_json::Value =
+            serde_json::from_str(&call_json(&bytes, |p, l| pdf2md_convert(p, l))).unwrap();
         assert!(
-            v["media"].as_array().unwrap().is_empty(),
-            "no_media=1 must yield an empty media array; got {v}"
+            default_call["media"].as_array().unwrap().is_empty(),
+            "default must not extract media; got {default_call}"
         );
         assert!(
-            !v["markdown"].as_str().unwrap().contains("data:image"),
-            "no_media=1 markdown must contain no data:image; got {v}"
+            !default_call["markdown"].as_str().unwrap().contains("data:image"),
+            "default must not inline a data:image; got {default_call}"
+        );
+
+        // `reference`: extract to the JSON side-channel but never inline.
+        let reference: serde_json::Value =
+            serde_json::from_str(&call_json(&bytes, |p, l| pdf2md_convert_ex3(p, l, 0, 1)))
+                .unwrap();
+        assert!(
+            !reference["media"].as_array().unwrap().is_empty(),
+            "reference mode must extract media; got {reference}"
+        );
+        assert!(
+            !reference["markdown"].as_str().unwrap().contains("data:image"),
+            "reference mode must not inline a data:image; got {reference}"
+        );
+
+        // `no_media = 1` is the compatibility alias for `none`.
+        let no_media: serde_json::Value =
+            serde_json::from_str(&call_json(&bytes, |p, l| pdf2md_convert_ex2(p, l, 0, 1))).unwrap();
+        assert!(
+            no_media["media"].as_array().unwrap().is_empty(),
+            "no_media=1 must yield an empty media array; got {no_media}"
+        );
+        assert!(
+            !no_media["markdown"].as_str().unwrap().contains("data:image"),
+            "no_media=1 markdown must contain no data:image; got {no_media}"
         );
     }
 

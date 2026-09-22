@@ -7,6 +7,7 @@
 use crate::layout::glyph_stream::Span;
 use crate::layout::tables::rulers::{RowInfo, WordTok};
 use crate::layout::tables::validation::has_data_tokens;
+use crate::models::CanvasTable;
 
 /// Assign every word of row `ri` to a column, using the ruler midpoints.
 ///
@@ -307,8 +308,15 @@ pub fn consolidate_table_rows(
 
     // 2. Header rows identification: row 0 is header.
     // In wide grids (>= 3 columns), check if row 1 is a bilingual/unit header continuation:
+    //
+    // Whether row 0 is a header at all uses the same rule the Markdown renderer
+    // uses (`first_row_is_header`), so consolidation and rendering agree: a
+    // headerless label/value grid (the billet's
+    // `DAI HUNG PHAM - 1989 | 28.00 € | …`) keeps its first row as data and can
+    // absorb its own continuation lines.
+    let row0_is_header = CanvasTable::first_row_is_header(&table_rows);
     let mut header_rows_count = 1usize;
-    if num_cols >= 3 && table_rows.len() > 2 {
+    if row0_is_header && num_cols >= 3 && table_rows.len() > 2 {
         let prev_line = win_rows[0];
         let curr_line = win_rows[1];
         let gap = lines[prev_line][0].y - lines[curr_line][0].y;
@@ -328,6 +336,11 @@ pub fn consolidate_table_rows(
     }
 
     let mut consolidated: Vec<Vec<String>> = Vec::new();
+    // The first data row index: past the header when row 0 is one, otherwise 0
+    // itself. A headerless first row must stay open (`cur_row`) so its own
+    // wrapped continuation lines merge into it instead of becoming blank-keyed
+    // rows of their own (the billet's middle column).
+    let data_start = if row0_is_header { header_rows_count } else { 0 };
     if header_rows_count > 1 {
         let mut merged_header = table_rows[0].clone();
         for h in 1..header_rows_count {
@@ -342,15 +355,26 @@ pub fn consolidate_table_rows(
             }
         }
         consolidated.push(merged_header);
-    } else {
+    } else if row0_is_header {
         consolidated.push(table_rows[0].clone());
     }
 
     // 3. Data rows consolidation
-    let mut cur_row: Option<Vec<String>> = None;
-    let mut prev_y = lines[win_rows[header_rows_count - 1]][0].y;
+    let mut cur_row: Option<Vec<String>> = if data_start == 0 {
+        Some(table_rows[0].clone())
+    } else {
+        None
+    };
+    let mut prev_y = if data_start == 0 {
+        lines[win_rows[0]][0].y
+    } else {
+        lines[win_rows[header_rows_count - 1]][0].y
+    };
 
-    for r_idx in header_rows_count..table_rows.len() {
+    for r_idx in data_start..table_rows.len() {
+        if r_idx == 0 {
+            continue; // already seeded as the open row above
+        }
         let line_idx = win_rows[r_idx];
         let y = lines[line_idx][0].y;
         let gap = prev_y - y;
@@ -537,5 +561,59 @@ mod tests {
             out[1].iter().any(|c| c.contains("10:05")) && out[1][0] == "28MAR",
             "joined record is missing its parts: {out:?}"
         );
+    }
+
+    /// `billet_table_complex`: a *headerless* label/value grid (no header row —
+    /// the first row already holds the passenger label and the `28.00€` amount)
+    /// whose first logical row's cells spill onto the following visual lines.
+    /// Those lines fill only later columns and must fold back into the row
+    /// above instead of becoming blank-keyed rows of their own.
+    #[test]
+    fn headerless_first_row_absorbs_wrapped_cell_continuations() {
+        let lines: Vec<Vec<Span>> = vec![
+            vec![sp("DAI HUNG PHAM - 1989", 253.0)],
+            vec![sp("bagages en indiquant mes", 250.0)],
+            vec![sp("cabine sous mon siège", 245.0)],
+            vec![sp("coordonnées", 240.0)],
+            vec![sp("Place Standard", 226.0)],
+        ];
+        let info: Vec<RowInfo> = lines
+            .iter()
+            .map(|_| RowInfo {
+                words: Vec::new(),
+                starts: Vec::new(),
+                ends: Vec::new(),
+                size: 10.0,
+            })
+            .collect();
+        let win_rows: Vec<usize> = (0..5).collect();
+        let rows = vec![
+            vec![
+                "DAI HUNG PHAM - 1989".to_string(),
+                "28.00€".to_string(),
+                "Je place mon bagage".to_string(),
+                "".to_string(),
+            ],
+            vec!["".to_string(), "".to_string(), "".to_string(), "bagages en indiquant mes".to_string()],
+            vec!["".to_string(), "".to_string(), "cabine sous mon siège".to_string(), "".to_string()],
+            vec!["".to_string(), "".to_string(), "".to_string(), "coordonnées".to_string()],
+            vec!["Place Standard".to_string(), "".to_string(), "".to_string(), "".to_string()],
+        ];
+        let out = consolidate_table_rows(rows, &win_rows, &lines, &info);
+        assert_eq!(
+            out.len(),
+            2,
+            "continuation lines were not folded into the headerless first row: {out:?}"
+        );
+        assert_eq!(out[0][0], "DAI HUNG PHAM - 1989", "{out:?}");
+        assert!(
+            out[0][2].contains("Je place mon bagage") && out[0][2].contains("cabine sous mon siège"),
+            "middle-column continuation was lost: {out:?}"
+        );
+        assert!(
+            out[0][3].contains("bagages en indiquant mes") && out[0][3].contains("coordonnées"),
+            "last-column continuation was lost: {out:?}"
+        );
+        assert_eq!(out[1][0], "Place Standard", "a fresh col-0 row started a new record: {out:?}");
     }
 }

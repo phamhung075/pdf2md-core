@@ -1,6 +1,6 @@
 [package]
 name = "pdf2md-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["PDF2MD Core Team"]
 description = "High-performance native Rust core engine for sub-millisecond PDF-to-Markdown extraction and 2D spatial canvas geometry"

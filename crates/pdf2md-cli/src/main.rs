@@ -14,7 +14,27 @@ use clap::Parser;
 
 use pdf2md_core::{
     convert_pdf_bytes_to_markdown, is_digital_pdf_bytes, pdf_password_required, ConversionOptions,
+    MediaMode,
 };
+
+/// CLI spelling of [`MediaMode`] so clap can parse it without a core → clap
+/// dependency.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum MediaModeArg {
+    None,
+    Reference,
+    Embed,
+}
+
+impl From<MediaModeArg> for MediaMode {
+    fn from(m: MediaModeArg) -> Self {
+        match m {
+            MediaModeArg::None => MediaMode::None,
+            MediaModeArg::Reference => MediaMode::Reference,
+            MediaModeArg::Embed => MediaMode::Embed,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -49,11 +69,22 @@ struct Args {
     #[arg(long, default_value_t = false)]
     vectors: bool,
 
-    /// Disable media extraction and embedding
+    /// Media handling: `none` (default; smallest output), `reference`
+    /// (extract into the JSON `media` side-channel only) or `embed` (inline
+    /// base64 `data:` URIs in the markdown)
+    #[arg(long, value_enum, default_value_t = MediaModeArg::None)]
+    media_mode: MediaModeArg,
+
+    /// Inline extracted images as base64 `data:` URIs in the markdown
+    /// (shorthand for --media-mode embed; opt-in, large output)
+    #[arg(long, default_value_t = false)]
+    embed_media: bool,
+
+    /// Alias for --media-mode none (the default); kept for compatibility
     #[arg(long, default_value_t = false)]
     no_media: bool,
 
-    /// Alias for --no-media
+    /// Alias for --no-media / --media-mode none
     #[arg(long, default_value_t = false)]
     no_images: bool,
 }
@@ -93,17 +124,26 @@ fn main() {
         process::exit(2);
     }
 
-    let disable_media = args.no_media || args.no_images;
+    // Precedence: --no-media/--no-images force `none` (the default; kept as
+    // explicit aliases); otherwise --embed-media opts into embedding;
+    // otherwise --media-mode (default none) applies.
+    let mut media_mode = MediaMode::from(args.media_mode);
+    if args.embed_media {
+        media_mode = MediaMode::Embed;
+    }
+    if args.no_media || args.no_images {
+        media_mode = MediaMode::None;
+    }
     let options = ConversionOptions {
         detect_tables: !args.no_tables,
         detect_vectors: args.vectors,
-        detect_media: !disable_media,
-        embed_media: !disable_media,
+        media_mode,
         ..Default::default()
     };
 
     match convert_pdf_bytes_to_markdown(&bytes, &options) {
         Ok(res) => {
+            let needs_rescue = res.needs_vision_rescue;
             if !args.quiet {
                 eprintln!(
                     "Converted {} pages ({} words) in {:.2} ms",
@@ -111,6 +151,11 @@ fn main() {
                     res.total_words,
                     res.duration_us as f64 / 1000.0
                 );
+                if needs_rescue {
+                    eprintln!(
+                        "Warning: text layer is glyph-encoded; emitted a status document instead of empty output. Route through the OCR/Vision pipeline."
+                    );
+                }
             }
 
             let output_text = if args.json {
@@ -131,6 +176,14 @@ fn main() {
                     eprintln!("Error writing to stdout: {}", e);
                     process::exit(1);
                 }
+            }
+
+            // The glyph-encoded case now returns a well-formed status document
+            // rather than a 0-byte error, but it is still a failure to decode:
+            // keep the historical non-zero exit so callers that branch on the
+            // status keep routing the document to vision rescue.
+            if needs_rescue {
+                process::exit(3);
             }
         }
         Err(e) => {

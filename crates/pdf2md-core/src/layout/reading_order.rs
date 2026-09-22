@@ -820,7 +820,32 @@ fn projection_columns_region(
             if avg_words_per_row(&left) < 2.5 || avg_words_per_row(&right) < 2.5 {
                 continue;
             }
-            if !projection_prose_beside_grid(&left, &right) {
+            // The running-gutter pass can also miss a *narrow* gutter between
+            // two clean text columns: when the left column is justified flush
+            // against the facing column (a body paragraph whose last word ends
+            // exactly at the side column's left edge) no row ever shows the
+            // standalone `1.2em` gap the pass needs, so both regions fall back
+            // to one interleaved stream and the side column's text is woven into
+            // the body prose line-by-line. The projection has already proved a
+            // straddle-free corridor over several rows with multi-word text on
+            // both sides; accept it when both halves are clean single columns
+            // that read as wrapped text and the corridor left real white.
+            let two_clean_text_columns = {
+                let gap = right_start - left_end;
+                let size = left
+                    .iter()
+                    .chain(right.iter())
+                    .flat_map(|r| r.iter())
+                    .map(|s| s.size)
+                    .fold(0.0f64, f64::max)
+                    .max(0.1);
+                rows_are_clean(&left)
+                    && rows_are_clean(&right)
+                    && gap >= 0.6 * size
+                    && wrapped_prose(&left)
+                    && wrapped_prose(&right)
+            };
+            if !projection_prose_beside_grid(&left, &right) && !two_clean_text_columns {
                 continue;
             }
             // Longest run wins; a tie keeps the earlier (leftmost) gutter, the
@@ -3832,6 +3857,103 @@ mod column_band_tests {
             ColumnBand::Full(rows) => assert_eq!(render_line_text(&rows[0]), "Heading"),
             ColumnBand::Columns { .. } => panic!("a full-width heading must not be a column"),
         }
+    }
+
+    #[test]
+    fn flush_body_beside_narrow_side_column_is_split() {
+        // A body paragraph justified flush against a narrow side column leaves
+        // no row with a `1.2em` intra-line gap, so the running-gutter pass
+        // cannot seed the block and the two regions used to be woven together
+        // line-by-line (`complex_p5`/`complex_p6`). The vertical projection
+        // proves the straddle-free corridor; two clean wrapped text columns on
+        // either side of a real (if narrow) white gutter must still split.
+        //
+        // The left column has a fixed right edge (x=120) and the side column a
+        // fixed left edge (x=130): a 10pt corridor, below the 12pt (`1.2em`)
+        // the standalone row split needs.
+        let word = |t: &str, x: f64, y: f64| Span {
+            text: t.to_string(),
+            x,
+            y,
+            size: 10.0,
+            advance: 22.0,
+            word_advance: 22.0,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_vertical: false,
+        };
+        let row = |y: f64, left: [&str; 3], right: [&str; 3]| {
+            vec![
+                word(left[0], 50.0, y),
+                word(left[1], 74.0, y),
+                word(left[2], 98.0, y),
+                word(right[0], 130.0, y),
+                word(right[1], 154.0, y),
+                word(right[2], 178.0, y),
+            ]
+        };
+        let lines = vec![
+            row(300.0, ["alpha", "beta", "gamma"], ["caption", "one", "here"]),
+            row(290.0, ["delta", "epsilon", "zeta"], ["more", "caption", "words"]),
+            row(280.0, ["eta", "theta", "iota"], ["still", "the", "side"]),
+            row(270.0, ["kappa", "lambda", "mu"], ["column", "keeps", "going"]),
+            row(260.0, ["nu", "xi", "omicron"], ["and", "then", "ends"]),
+            row(250.0, ["pi", "rho", "sigma"], ["with", "a", "line"]),
+        ];
+        let bands = detect_column_bands(&lines);
+        let cols = bands.iter().find_map(|b| match b {
+            ColumnBand::Columns { left, right } => Some((left, right)),
+            _ => None,
+        });
+        let (left, right) = cols.unwrap_or_else(|| {
+            panic!(
+                "flush body + side column was not split into a Columns band ({} bands)",
+                bands.len()
+            )
+        });
+        assert_eq!(left.len(), 6, "body rows must stay in the left stream");
+        assert_eq!(right.len(), 6, "side-column rows must stay in the right stream");
+        let lt: Vec<String> = left.iter().map(|l| render_line_text(l)).collect();
+        let rt: Vec<String> = right.iter().map(|l| render_line_text(l)).collect();
+        assert!(
+            lt[0].contains("alpha") && !lt[0].contains("caption"),
+            "side column woven into the body: {lt:?}"
+        );
+        assert!(
+            rt[0].contains("caption") && !rt[0].contains("alpha"),
+            "body woven into the side column: {rt:?}"
+        );
+    }
+
+    #[test]
+    fn single_full_width_prose_column_stays_full() {
+        // The counterpart guard: an ordinary full-width paragraph column has no
+        // content on one side of any candidate gutter and must stay a single
+        // Full band.
+        let row = |y: f64, text: &str| {
+            let mut v = Vec::new();
+            let mut x = 50.0;
+            for w in text.split_whitespace() {
+                v.push(sp(w, x, y));
+                x += w.len() as f64 * 6.0 + 4.0;
+            }
+            v
+        };
+        let lines = vec![
+            row(300.0, "the quick brown fox jumps over the lazy dog"),
+            row(290.0, "and then it runs away into the deep dark wood"),
+            row(280.0, "where nobody can find it again for a long time"),
+            row(270.0, "so we sit and wait for the morning to arrive"),
+            row(260.0, "the end of the story is not yet written down"),
+            row(250.0, "but we will know it when we see the sun rise"),
+        ];
+        let bands = detect_column_bands(&lines);
+        assert!(
+            bands.iter().all(|b| !matches!(b, ColumnBand::Columns { .. })),
+            "single-column prose must not be split ({} bands)",
+            bands.len()
+        );
     }
 
     #[test]

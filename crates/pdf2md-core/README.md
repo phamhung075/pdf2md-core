@@ -10,7 +10,7 @@
 - **Automatic Skew Correction (Hough/Radon):** A super-lightweight, sparse-point Hough line-angle vote (grouped lines) and Radon projection scan (raw span cloud) estimate page tilt from glyph baselines — no rasterization — and deskew the geometry before **XY-Cut segmentation and `build_lines` clustering**, so skewed scans and tilted pages still get clean rows, columns, and horizontal/vertical valley cuts.
 - **Visual Media Extraction:** Extracts raster image XObjects with base64 data URIs, handles JPEG passthrough, encodes RGBA PNGs, and clips standalone vector diagrams into cropped PDFs.
 - **C ABI Compatible:** Seamlessly embeds into Go (via cgo), Python (via PyO3), C/C++, Node.js, and WebAssembly (`wasm32-unknown-unknown`).
-- **Source-Available Licensing:** Licensed under the **Business Source License 1.1 (BSL-1.1)**. Converts to Apache-2.0 / MIT on Sept 1, 2029.
+- **Source-Available Licensing:** Licensed under the **Business Source License 1.1 (BSL-1.1)**. Converts to Apache-2.0 / MIT on Sept 22, 2029.
 
 ---
 
@@ -53,7 +53,7 @@ src/
 ## Rust API Usage
 
 ```rust
-use pdf2md_core::{convert_pdf_bytes_to_markdown, ConversionOptions};
+use pdf2md_core::{convert_pdf_bytes_to_markdown, ConversionOptions, MediaMode};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pdf_bytes = std::fs::read("invoice.pdf")?;
@@ -61,8 +61,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut options = ConversionOptions::default();
     options.detect_tables = true;   // 2D spatial table reconstruction
     options.detect_layout = true;   // Multi-column & reading order flow
-    options.detect_media = true;    // Image and vector figure extraction
-    options.embed_media = true;     // Inline base64 image tags in markdown
+    // Image policy: `None` (default, text-only), `Reference` (JSON `media`
+    // list only) or `Embed` (inline base64 `data:` URIs, large output).
+    options.media_mode = MediaMode::Reference;
 
     let result = convert_pdf_bytes_to_markdown(&pdf_bytes, &options)?;
     
@@ -92,6 +93,15 @@ char *pdf2md_convert(const uint8_t *pdf_ptr, size_t pdf_len);
 // Convert with explicit vector detection flag (0 = off, 1 = on)
 char *pdf2md_convert_ex(const uint8_t *pdf_ptr, size_t pdf_len, int detect_vectors);
 
+// Convert with a per-request no-media flag (0 = default/none, 1 = force none).
+// Media policy defaults to none, so this is the compatibility alias for the
+// CLI's --no-media.
+char *pdf2md_convert_ex2(const uint8_t *pdf_ptr, size_t pdf_len, int detect_vectors, int no_media);
+
+// Convert with an explicit media policy: 0 = none (default), 1 = reference
+// (JSON `media` list only), 2 = embed (inline base64 `data:` URIs).
+char *pdf2md_convert_ex3(const uint8_t *pdf_ptr, size_t pdf_len, int detect_vectors, int media_mode);
+
 // Quick digital text layer probe (1 = digital, 0 = scanned/image-only)
 int pdf2md_is_digital(const uint8_t *pdf_ptr, size_t pdf_len);
 
@@ -101,6 +111,13 @@ void pdf2md_free_string(char *ptr);
 // Returns engine version string
 char *pdf2md_version(void);
 ```
+
+The conversion JSON carries `"needs_vision_rescue"` (and, when true, a
+`"rescue_reason"` of `glyph_encoded`, `unreadable_fonts` or `scanned_image`).
+A document whose text layer draws glyphs but decodes no readable words returns
+a well-formed status document in `"markdown"` with `"needs_vision_rescue": true`
+instead of an empty string, so a caller routes it to the OCR/Vision pipeline
+without special-casing a zero-byte result.
 
 ### Building Static and Shared Libraries
 
