@@ -16,7 +16,7 @@
 # ==============================================================================
 # Stage 1: Build Rust core static library (libpdf2md_core.a)
 # ==============================================================================
-FROM rust:1.80-alpine AS rust-builder
+FROM rust:1.91-alpine AS rust-builder
 RUN apk add --no-cache musl-dev
 
 WORKDIR /src
