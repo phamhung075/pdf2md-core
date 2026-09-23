@@ -136,6 +136,10 @@ pub fn page_two_columns_rows(lines: &[Vec<Span>]) -> Option<PageColumns> {
         y: f64,
         left: Vec<Span>,
         right: Vec<Span>,
+        /// Right edge of the left column's text on this row.
+        l_end: f64,
+        /// Left edge of the right column's text on this row.
+        r_start: f64,
         gutter_x: f64,
     }
     let mut splits: Vec<Split> = Vec::new();
@@ -150,6 +154,8 @@ pub fn page_two_columns_rows(lines: &[Vec<Span>]) -> Option<PageColumns> {
                 y: l[0].y,
                 left,
                 right,
+                l_end,
+                r_start,
                 gutter_x: (l_end + r_start) / 2.0,
             });
         }
@@ -161,9 +167,30 @@ pub fn page_two_columns_rows(lines: &[Vec<Span>]) -> Option<PageColumns> {
     gxs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let med = gxs[gxs.len() / 2];
     let tol = (0.15 * med.abs()).max(6.0);
+    // The columns' facing *edges* are what stay fixed across a block; the
+    // midpoint of the white between them recedes left as soon as a row's
+    // facing text is short. The last line of a paragraph is the common case
+    // and defeats the midpoint gate: on this document's receipt block the
+    // left segment ends at x=125 instead of x=285, moving the midpoint from
+    // 295 to 215 while the right column still begins at exactly x=305. Such a
+    // row is still a crossing row of the same two columns, so accept a split
+    // when its corridor overlaps the block's median corridor. Without this it
+    // was filtered out of `keep`, `col_bottom` stopped one row above it, and
+    // the row was flushed as `bottom_full` after the entire opposite column —
+    // cutting both the French and the English sentence in half.
+    let mut l_ends: Vec<f64> = splits.iter().map(|s| s.l_end).collect();
+    let mut r_starts: Vec<f64> = splits.iter().map(|s| s.r_start).collect();
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v[v.len() / 2]
+    };
+    let (med_l, med_r) = (median(&mut l_ends), median(&mut r_starts));
     let keep: Vec<Split> = splits
         .into_iter()
-        .filter(|s| (s.gutter_x - med).abs() <= tol)
+        .filter(|s| {
+            (s.gutter_x - med).abs() <= tol
+                || (s.l_end <= med_r + tol && s.r_start >= med_l - tol)
+        })
         .collect();
     if keep.len() < 3 {
         return None;
@@ -4632,5 +4659,61 @@ mod column_band_tests {
             "single-column prose must not project into columns"
         );
         assert_eq!(page_read_order(&lines).len(), 1);
+    }
+
+    /// Regression for the Air France e-ticket receipt block. The last visual
+    /// line of the two-column block carries only a short facing segment on the
+    /// left ("réservations en cliquant ici"), so the *midpoint* of the white in
+    /// front of the right column recedes far left of the established gutter —
+    /// while the right column still begins at its usual margin. The
+    /// midpoint-only consistency filter discarded that split, `col_bottom`
+    /// stopped one row above it, and the line was flushed as `bottom_full`
+    /// after the entire opposite column, cutting both the French and the
+    /// English sentence in half.
+    #[test]
+    fn short_final_row_stays_in_its_columns() {
+        let full_left = ["Le", "tarif", "reserve", "est", "valable", "pour", "un", "billet"];
+        let right = ["France", "web", "site", "by", "clicking"];
+        let place = |words: &[&str], mut x: f64, y: f64| -> (Vec<Span>, f64) {
+            let mut v = Vec::new();
+            for w in words {
+                v.push(sp(w, x, y));
+                x += w.len() as f64 * 6.0 + 6.0;
+            }
+            (v, x)
+        };
+        let mut lines: Vec<Vec<Span>> = Vec::new();
+        for i in 0..4 {
+            let y = 600.0 - i as f64 * 10.0;
+            let (mut row, _) = place(&full_left, 50.0, y); // left text ends at x=308
+            let (mut r, _) = place(&right, 450.0, y);
+            row.append(&mut r);
+            lines.push(row);
+        }
+        let y = 560.0;
+        let (mut row, _) = place(&["Vos", "en", "ici"], 50.0, y); // left text ends at x=110
+        let (mut r, _) = place(&right, 450.0, y);
+        row.append(&mut r);
+        lines.push(row);
+
+        let pc = page_two_columns(&lines).expect("a two-column page must be detected");
+        assert!(
+            pc.bottom_full.is_empty(),
+            "the final row leaked past the columns: {:?}",
+            pc.bottom_full
+        );
+        assert_eq!(pc.left.len(), 5, "left column lost its final line: {:?}", pc.left);
+        assert_eq!(pc.right.len(), 5, "right column lost its final line: {:?}", pc.right);
+        let tail_left: String = pc.left.last().unwrap().iter().map(|s| s.text.as_str()).collect();
+        let tail_right: String = pc.right.last().unwrap().iter().map(|s| s.text.as_str()).collect();
+        assert!(tail_left.contains("Vos") && tail_left.contains("ici"), "French tail not on the left: {tail_left:?}");
+        assert!(
+            tail_right.contains("France") && tail_right.contains("clicking"),
+            "English tail not on the right: {tail_right:?}"
+        );
+        assert!(
+            !tail_right.contains("Vos"),
+            "the short French tail was woven into the right column: {tail_right:?}"
+        );
     }
 }
