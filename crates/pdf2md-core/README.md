@@ -10,7 +10,7 @@
 - **Automatic Skew Correction (Hough/Radon):** A super-lightweight, sparse-point Hough line-angle vote (grouped lines) and Radon projection scan (raw span cloud) estimate page tilt from glyph baselines — no rasterization — and deskew the geometry before **XY-Cut segmentation and `build_lines` clustering**, so skewed scans and tilted pages still get clean rows, columns, and horizontal/vertical valley cuts.
 - **Visual Media Extraction:** Extracts raster image XObjects with base64 data URIs, handles JPEG passthrough, encodes RGBA PNGs, and clips standalone vector diagrams into cropped PDFs.
 - **C ABI Compatible:** Seamlessly embeds into Go (via cgo), Python (via PyO3), C/C++, Node.js, and WebAssembly (`wasm32-unknown-unknown`).
-- **Source-Available Licensing:** Licensed under the **Business Source License 1.1 (BSL-1.1)**. Converts to Apache-2.0 / MIT on Sept 22, 2029.
+- **Source-Available Licensing:** Licensed under the **Business Source License 1.1 (BSL-1.1)**. Converts to Apache-2.0 / MIT on Sept 23, 2029.
 
 ---
 

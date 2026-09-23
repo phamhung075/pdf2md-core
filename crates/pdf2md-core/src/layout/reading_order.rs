@@ -628,6 +628,31 @@ fn avg_words_per_row(rows: &[Vec<Span>]) -> f64 {
         / rows.len() as f64
 }
 
+/// Average number of *whitespace-separated words* per row (0 for an empty
+/// slice).
+///
+/// [`avg_words_per_row`] counts non-empty spans, a good "single column versus
+/// grid of short cells" signal when a producer emits one span per word. It is
+/// the wrong signal when a producer draws each visual line as a single `Tj`
+/// run: a genuine prose column then averages 1.0 span per row and falls below
+/// every prose gate (verified on the Air France e-ticket's bilingual
+/// FR/EN blocks, whose every line is one run). The projection recovery uses
+/// this word count instead, so a column's wordiness is measured independently
+/// of how the producer grouped its runs.
+fn words_per_row(rows: &[Vec<Span>]) -> f64 {
+    if rows.is_empty() {
+        return 0.0;
+    }
+    rows.iter()
+        .map(|v| {
+            v.iter()
+                .map(|sp| sp.text.split_whitespace().count())
+                .sum::<usize>() as f64
+        })
+        .sum::<f64>()
+        / rows.len() as f64
+}
+
 /// Whether every row's internal span gaps stay below a column-gutter width —
 /// i.e. the rows form a single column, not a multi-column table grid.
 fn rows_are_clean(rows: &[Vec<Span>]) -> bool {
@@ -639,6 +664,32 @@ fn rows_are_clean(rows: &[Vec<Span>]) -> bool {
             gap <= 1.2 * size
         })
     })
+}
+
+/// Spread between the leftmost x of the rows' first spans — how ragged the
+/// side's *starting edge* is.
+///
+/// A genuine column is left-aligned: every row starts at the column's margin,
+/// so the spread is a few points. When the projection cuts a single full-width
+/// paragraph at a recurring vertical gap, the "right column" is instead the
+/// line continuations after that gap, and their start x jumps around with the
+/// sentence (verified on `enedis_hp_hc`, whose false regions spread 100-360pt
+/// against the bilingual e-ticket's 22pt). A bounded spread keeps the
+/// projection from transposing fragments of one paragraph.
+fn column_start_spread(rows: &[Vec<Span>]) -> f64 {
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for r in rows {
+        let start = r.iter().map(|s| s.x).fold(f64::INFINITY, f64::min);
+        if start.is_finite() {
+            lo = lo.min(start);
+            hi = hi.max(start);
+        }
+    }
+    if lo.is_finite() {
+        hi - lo
+    } else {
+        0.0
+    }
 }
 
 /// Whether `rows` is a *wrapped* text column: some consecutive pair where the
@@ -817,9 +868,6 @@ fn projection_columns_region(
             if left.len() < 3 || right.len() < 3 {
                 continue;
             }
-            if avg_words_per_row(&left) < 2.5 || avg_words_per_row(&right) < 2.5 {
-                continue;
-            }
             // The running-gutter pass can also miss a *narrow* gutter between
             // two clean text columns: when the left column is justified flush
             // against the facing column (a body paragraph whose last word ends
@@ -827,9 +875,26 @@ fn projection_columns_region(
             // standalone `1.2em` gap the pass needs, so both regions fall back
             // to one interleaved stream and the side column's text is woven into
             // the body prose line-by-line. The projection has already proved a
-            // straddle-free corridor over several rows with multi-word text on
-            // both sides; accept it when both halves are clean single columns
-            // that read as wrapped text and the corridor left real white.
+            // straddle-free corridor over several rows with text on both sides;
+            // accept it when both halves are clean single columns that read as
+            // text and the corridor left real white.
+            //
+            // "Multi-word" is measured per whitespace-separated word, not per
+            // span: a bilingual block (French and English side by side) is
+            // routinely drawn as one `Tj` run per line, so `avg_words_per_row`
+            // reports 1.0 for a column that plainly carries a sentence. The
+            // wrapped-continuation check is likewise required on *either* side
+            // rather than both: the French column continues across lines
+            // ("... (si" / "votre tarif ...") while each English list item
+            // starts capitalized, and the corridor plus the clean halves are
+            // what establish the split.
+            //
+            // Both halves must also be *columns* rather than fragments: each
+            // side's rows have to share a starting edge (a few points of
+            // raggedness at most). Cutting one full-width paragraph at a
+            // recurring gap yields halves whose start x jumps with the
+            // sentence — the `enedis_hp_hc` false positives spread 100-360pt,
+            // against the bilingual e-ticket's 22pt.
             let two_clean_text_columns = {
                 let gap = right_start - left_end;
                 let size = left
@@ -842,9 +907,20 @@ fn projection_columns_region(
                 rows_are_clean(&left)
                     && rows_are_clean(&right)
                     && gap >= 0.6 * size
-                    && wrapped_prose(&left)
-                    && wrapped_prose(&right)
+                    && words_per_row(&left) >= 2.5
+                    && words_per_row(&right) >= 2.5
+                    && column_start_spread(&left) <= 4.0 * size
+                    && column_start_spread(&right) <= 4.0 * size
+                    && (wrapped_prose(&left) || wrapped_prose(&right))
             };
+            // A span-count prose gate still admits the shape this fallback was
+            // written for (a column of one-word spans); when it fails, the
+            // word-based two-clean-columns gate is the second chance.
+            if !two_clean_text_columns
+                && (avg_words_per_row(&left) < 2.5 || avg_words_per_row(&right) < 2.5)
+            {
+                continue;
+            }
             if !projection_prose_beside_grid(&left, &right) && !two_clean_text_columns {
                 continue;
             }
@@ -1312,25 +1388,48 @@ pub fn detect_column_bands(lines: &[Vec<Span>]) -> Vec<ColumnBand> {
     }
 
     // The running-gutter pass can only seed a column block from a row whose
-    // inter-column gap clears the standalone `1.2em` threshold. When no row on
-    // the page does — a narrow page gutter beside a wider internal table gutter
-    // — no band is found and the two regions fall back to one interleaved
-    // stream. Recover such a block from the vertical projection instead.
-    if !bands.iter().any(|b| matches!(b, ColumnBand::Columns { .. })) {
-        if let Some((start, end, left, right)) = projection_columns_region(lines) {
-            let mut rebuilt: Vec<ColumnBand> = Vec::new();
-            if start > 0 {
-                rebuilt.push(ColumnBand::Full(lines[..start].to_vec()));
-            }
-            rebuilt.push(ColumnBand::Columns { left, right });
-            if end + 1 < lines.len() {
-                rebuilt.push(ColumnBand::Full(lines[end + 1..].to_vec()));
-            }
-            return rebuilt;
+    // inter-column gap clears the standalone `1.2em` threshold. Whole classes of
+    // real two-column blocks never clear that bar and still sit in a `Full`
+    // band here — a narrow page gutter beside a wider internal table gutter, or
+    // a bilingual layout (French and English side by side) whose every visual
+    // line is a single `Tj` run. Recover those from the vertical projection.
+    //
+    // The projection is applied to *every* `Full` band, not only when the page
+    // produced no `Columns` band at all. A page can hold one two-column block
+    // the running-gutter pass already found (this document's page 2 baggage
+    // notes) *and* another it could not (the AVANT/PENDANT/APRÈS bilingual
+    // contact blocks, left in a `Full` band); skipping the projection because
+    // *a* `Columns` band existed anywhere else left the second block woven
+    // row by row.
+    let mut out: Vec<ColumnBand> = Vec::new();
+    for band in bands {
+        match band {
+            ColumnBand::Columns { .. } => out.push(band),
+            ColumnBand::Full(rows) => project_full_band(rows, &mut out),
         }
     }
+    out
+}
 
-    bands
+/// Recursively peel two-column projection regions out of one `Full` band.
+///
+/// [`projection_columns_region`] returns only the longest region, and a single
+/// `Full` band can hold several independent two-column blocks (the bilingual
+/// AVANT/PENDANT/APRÈS blocks share one band). Peel one region, then recurse on
+/// the rows before and after it; a slice with no region stays a `Full` band.
+fn project_full_band(rows: Vec<Vec<Span>>, out: &mut Vec<ColumnBand>) {
+    match projection_columns_region(&rows) {
+        Some((start, end, left, right)) => {
+            if start > 0 {
+                project_full_band(rows[..start].to_vec(), out);
+            }
+            out.push(ColumnBand::Columns { left, right });
+            if end + 1 < rows.len() {
+                project_full_band(rows[end + 1..].to_vec(), out);
+            }
+        }
+        None => out.push(ColumnBand::Full(rows)),
+    }
 }
 
 /// Split `line` at every gap wide enough that `render_spans` would hard-break
@@ -4125,6 +4224,130 @@ mod column_band_tests {
         assert!(
             bands.iter().all(|b| !matches!(b, ColumnBand::Columns { .. })),
             "single-column prose must not be split into columns: {:?} bands",
+            bands.len()
+        );
+    }
+
+    /// Regression for the bilingual (French/English side-by-side) Air France
+    /// e-ticket. The page holds *two* independent two-column blocks. The first
+    /// is drawn one span per word, so the running-gutter pass seeds a `Columns`
+    /// band from it. The second draws every visual line as a single `Tj` run:
+    /// `split_row_columns` needs >=5 spans and `avg_words_per_row` counts spans,
+    /// so the running-gutter pass cannot see it — and because the page already
+    /// produced a `Columns` band, the old projection fallback (gated on "no
+    /// `Columns` band at all") was skipped, leaving the two languages woven row
+    /// by row. The projection is now applied to every leftover `Full` band, and
+    /// the two-clean-columns gate measures words rather than spans.
+    #[test]
+    fn bilingual_single_run_columns_split_beside_an_existing_column_band() {
+        let mut lines: Vec<Vec<Span>> = Vec::new();
+        // First block: one span per word, so `split_row_columns` seeds it.
+        for i in 0..4 {
+            let y = 780.0 - i as f64 * 10.0;
+            let mut row = Vec::new();
+            for k in 0..4 {
+                row.push(sp(&format!("c{i}{k}"), 50.0 + k as f64 * 24.0, y));
+            }
+            for k in 0..4 {
+                row.push(sp(&format!("v{i}{k}"), 350.0 + k as f64 * 24.0, y));
+            }
+            lines.push(row);
+        }
+        // Bilingual block: one run per line, a wider facing gutter. French
+        // continuations start lowercase, English entries start capitalized —
+        // `wrapped_prose` is true for the left column only, which the gate now
+        // accepts.
+        let fr = [
+            "Le texte francais commence ici",
+            "et continue sur la ligne suivante",
+            "encore une suite de mots ici",
+            "puis la fin du paragraphe",
+            "une autre phrase commence",
+            "et sa continuation finale",
+        ];
+        let en = [
+            "Site internet Air France",
+            "Air France website section",
+            "Par telephone au zero neuf",
+            "By phone at zero nine",
+            "Dans un point de vente",
+            "At an Air France point of sale",
+        ];
+        for (i, (l, r)) in fr.iter().zip(en.iter()).enumerate() {
+            let y = 620.0 - i as f64 * 10.0;
+            lines.push(vec![sp(l, 50.0, y), sp(r, 420.0, y)]);
+        }
+
+        let bands = detect_column_bands(&lines);
+        let cols: Vec<(&Vec<Vec<Span>>, &Vec<Vec<Span>>)> = bands
+            .iter()
+            .filter_map(|b| match b {
+                ColumnBand::Columns { left, right } => Some((left, right)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cols.len(),
+            2,
+            "both two-column blocks must be recovered ({} bands)",
+            bands.len()
+        );
+        let (left, right) = cols[1];
+        assert_eq!(left.len(), 6, "the French lines must stay left: {left:?}");
+        assert_eq!(right.len(), 6, "the English lines must stay right: {right:?}");
+        let lt: Vec<String> = left.iter().map(|l| render_line_text(l)).collect();
+        let rt: Vec<String> = right.iter().map(|l| render_line_text(l)).collect();
+        assert!(
+            lt[0].contains("Le texte francais") && !lt[0].contains("Site internet"),
+            "English woven into the French column: {lt:?}"
+        );
+        assert!(
+            rt[0].contains("Site internet") && !rt[0].contains("Le texte francais"),
+            "French woven into the English column: {rt:?}"
+        );
+    }
+
+    /// Regression for the `enedis_hp_hc` false positive the bilingual
+    /// relaxation introduced: running furniture/table fragments where a
+    /// recurring vertical gap cuts one flowing block in two. Both halves are
+    /// clean, wordy and wrap-continue, so the word-based two-clean-columns gate
+    /// alone admits them; only the starting-edge spread tells them apart from a
+    /// real column — the left half's rows start at wildly different x (measured
+    /// 100-360pt on enedis against 12-22pt on the bilingual e-ticket). The
+    /// projection must leave these rows whole.
+    #[test]
+    fn high_start_spread_fragments_are_not_a_text_column() {
+        // The left span migrates 50 -> 250 (200pt spread); the right span stays
+        // put. Every row reads as wrapped prose, so nothing but the spread
+        // rejects the split.
+        let left = [
+            "alpha beta gamma delta",
+            "et continue ici encore",
+            "encore une suite de mots",
+            "puis la fin du passage",
+            "une autre phrase commence",
+            "et sa continuation finale",
+        ];
+        let right = [
+            "premier element de la ligne",
+            "deuxieme element suivant ici",
+            "troisieme element de la suite",
+            "quatrieme element encore la",
+            "cinquieme element de la liste",
+            "sixieme element final ici",
+        ];
+        let mut lines: Vec<Vec<Span>> = Vec::new();
+        for i in 0..6 {
+            let y = 700.0 - i as f64 * 10.0;
+            lines.push(vec![
+                sp(left[i], 50.0 + i as f64 * 40.0, y),
+                sp(right[i], 500.0, y),
+            ]);
+        }
+        let bands = detect_column_bands(&lines);
+        assert!(
+            bands.iter().all(|b| !matches!(b, ColumnBand::Columns { .. })),
+            "high-spread fragments must not be split into columns: {} bands",
             bands.len()
         );
     }
