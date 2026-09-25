@@ -1,6 +1,6 @@
 [package]
 name = "pdf2md-wasm"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 authors = ["PDF2MD Core Team"]
 description = "WebAssembly compilation target for in-browser, zero-cloud-cost PDF-to-Markdown extraction"
