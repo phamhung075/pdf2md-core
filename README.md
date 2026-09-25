@@ -109,7 +109,7 @@ Licensed under the **[Business Source License 1.1 (BSL-1.1)](LICENSE)**.
 
 - **Free for Developers & Local Use:** You are free to use, test, modify, and build local software, academic research, desktop applications, and personal knowledge management tools (such as Obsidian or Logseq plugins).
 - **Anti-Competition SaaS Restriction:** You may **NOT** use this software or any derivative works to offer a commercial hosted, managed, or cloud-based document conversion service / API that competes directly with the Licensor.
-- **Conversion to Open Source:** On **September 23, 2029**, this license automatically converts to the permissive **Apache License, Version 2.0 OR MIT License**.
+- **Conversion to Open Source:** On **September 25, 2029**, this license automatically converts to the permissive **Apache License, Version 2.0 OR MIT License**.
 - **Commercial SaaS Licensing:** For enterprise cloud exemptions, white-label licenses, or proprietary integration, please contact the author ([@phamhung075](https://github.com/phamhung075)).
 
 ### Third-Party Notices

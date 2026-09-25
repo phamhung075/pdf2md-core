@@ -451,11 +451,12 @@ fn table_rulers_opts(
     // edge rulers a few points past a real column start (the pressure table in
     // `0225173d`), which then tripped the window gutter check and collapsed the
     // whole grid.
-    let straddle_none = |ri: usize, x: f64| -> bool {
-        matches!(
-            classify_straddle(&info[ri], &all_rulers, x, tol, min_gutter),
-            Straddle::None
-        )
+    let end_straddle_ok = |ri: usize, x: f64| -> bool {
+        match classify_straddle(&info[ri], &col_starts, x, tol, min_gutter) {
+            Straddle::None => true,
+            Straddle::Contained => ri == window_rows[0] && strong_support(x),
+            Straddle::Spanning | Straddle::Veto => false,
+        }
     };
     let start_rulers = dedup(
         start_candidates
@@ -484,7 +485,7 @@ fn table_rulers_opts(
         end_candidates
             .into_iter()
             .filter(|&x| {
-                window_rows.iter().all(|&ri| straddle_none(ri, x))
+                window_rows.iter().all(|&ri| end_straddle_ok(ri, x))
                     // The end pass exists for a *right-aligned value column*
                     // whose values are their own cells. A left-aligned text
                     // column whose two longest cells merely share a rendered
@@ -523,7 +524,8 @@ fn table_rulers_opts(
         center_rulers(info, &window_rows, tol, min_gutter, &start_rulers, &end_rulers);
     let mut merged = start_rulers;
     for e in end_rulers {
-        if merged.iter().all(|&r| (e - r).abs() >= min_gutter) {
+        let redundant = merged.iter().any(|&r| (e - r).abs() <= tol || (r < e && e - r < min_gutter));
+        if !redundant {
             merged.push(e);
         }
     }
@@ -611,6 +613,30 @@ fn end_ruler_is_separate_cell(row: &RowInfo, x: f64, tol: f64, min_gutter: f64) 
     false
 }
 
+/// Whether `text` is a measurement/currency unit token — "Unit(s)", "Liter",
+/// "kg", "€", "%" and the like. Used to keep a tight number+unit pair ("20
+/// Unit(s)") inside one cell while letting a tight rank+name pair ("1 CAPIN")
+/// split into two columns.
+fn is_unit_like(text: &str) -> bool {
+    let t = text.trim().to_lowercase();
+    let clean = t.trim_matches(|c: char| !c.is_alphanumeric() && c != '%' && c != '€' && c != '$' && c != '£' && c != '°');
+    if clean.is_empty() {
+        return false;
+    }
+    let base = clean.replace("(s)", "").replace('(', "").replace(')', "");
+    const KNOWN_UNITS: &[&str] = &[
+        "unit", "units", "liter", "liters", "litre", "litres",
+        "kg", "g", "mg", "t", "m", "cm", "mm", "km", "l", "ml", "cl", "dl",
+        "s", "sec", "min", "h", "hr", "hrs",
+        "eur", "usd", "gbp", "chf", "%", "€", "$", "£",
+        "pcs", "pce", "pces", "stk", "un", "ex", "ct", "boite", "bte", "colis", "paq", "pkg",
+        "bar", "kpa", "mpa", "pa", "mbar", "rpm", "hz", "khz", "mhz", "ghz",
+        "kw", "kwh", "w", "v", "a", "kva", "var",
+        "m³", "cm³", "mm²", "cm²", "m²", "µm", "μm", "da", "dan",
+    ];
+    KNOWN_UNITS.contains(&base.as_str()) || KNOWN_UNITS.contains(&clean)
+}
+
 /// Whether the word of `row` starting on `x` is a *separate cell* rather than
 /// an interior word of a multi-word cell. Only a word at the row's own start
 /// (index 0) or one separated from the preceding word by a column-like gutter
@@ -625,6 +651,14 @@ fn start_ruler_is_separate_cell(row: &RowInfo, x: f64, tol: f64, min_gutter: f64
             let prev = &row.words[i - 1];
             if w.x0 - prev.x1 >= min_gutter {
                 return true;
+            }
+            // When the previous token carries a digit, the pair is either a
+            // number+unit cell ("20 Unit(s)"), which must stay one cell, or a
+            // tight rank/id followed by a name ("1 CAPIN"), which is a real
+            // column boundary. Only a unit word keeps the pair together; any
+            // other token after the digit starts a new column.
+            if prev.text.chars().any(|c| c.is_ascii_digit()) {
+                return !is_unit_like(&w.text);
             }
             // The token starts only an ordinary word space after the previous
             // one. Treat it as an interior word of the same cell (not a column
@@ -1756,6 +1790,132 @@ mod tests {
         assert!(
             !cells.iter().any(|c| c.trim() == "20"),
             "the number must not become its own phantom column, got {cells:?}"
+        );
+    }
+
+    /// The ranking grid of `018a81a4_tjvclassements2013_0_page0`: a tight rank
+    /// number ("1", "2", "3") is drawn only a couple of points before the
+    /// athlete surname ("CAPIN", "LEBRUN", "PERIOU"). `start_ruler_is_separate_cell`
+    /// rejected that surname start because the start-to-start distance was under
+    /// 2em, so the rank fused with the name into one cell ("1 CAPIN" /
+    /// "2 LEBRUN"). A digit followed by a non-unit word is a real column
+    /// boundary, so the two must be separate cells.
+    #[test]
+    fn rank_number_and_name_are_separate_cells() {
+        let cell = |t: &str, x: f64, y: f64, adv: f64| sp_at(t, x, y, adv);
+        let lines: Vec<Vec<Span>> = vec![
+            vec![
+                cell("1", 34.0, 500.0, 5.0),
+                cell("CAPIN", 46.0, 500.0, 33.0),
+                cell("Christophe", 100.0, 500.0, 52.0),
+                cell("Leucémie Espoir", 200.0, 500.0, 82.0),
+                cell("172", 340.0, 500.0, 18.0),
+            ],
+            vec![
+                cell("2", 34.0, 480.0, 5.0),
+                cell("LEBRUN", 46.0, 480.0, 40.0),
+                cell("Tony", 100.0, 480.0, 24.0),
+                cell("VS Plabennec", 200.0, 480.0, 70.0),
+                cell("159", 340.0, 480.0, 18.0),
+            ],
+            vec![
+                cell("3", 34.0, 460.0, 5.0),
+                cell("PERIOU", 46.0, 460.0, 40.0),
+                cell("Mathieu", 100.0, 460.0, 40.0),
+                cell("Cotes d'armor cyclisme", 200.0, 460.0, 120.0),
+                cell("136", 340.0, 460.0, 18.0),
+            ],
+        ];
+        let hits = find_tables(&lines);
+        let rank_row = hits
+            .iter()
+            .flat_map(|h| h.rows.iter())
+            .find(|r| r.iter().any(|c| c.contains("CAPIN")))
+            .expect("ranking grid was not detected");
+        let capin = rank_row
+            .iter()
+            .position(|c| c.contains("CAPIN"))
+            .expect("CAPIN cell missing");
+        assert_eq!(
+            rank_row[capin], "CAPIN",
+            "surname fused with the rank number: {rank_row:?}"
+        );
+        assert_eq!(
+            rank_row[capin - 1],
+            "1",
+            "rank number fused with the surname: {rank_row:?}"
+        );
+    }
+
+    /// The other side of the digit-aware tight-pair rule: a genuine
+    /// number+unit pair must stay one cell, not split.
+    ///
+    /// `quantity_number_and_unit_are_one_cell` already pins the observable
+    /// *tight* "20 Unit(s)" case, but the fallback `start-to-start >= 2em`
+    /// test already fuses that one, so it cannot detect a regression in the
+    /// `is_unit_like` branch itself. This test adds the unit-level decision the
+    /// branch actually makes — after a digit, a unit word is not a column
+    /// start, while a name is (see `rank_number_and_name_are_separate_cells`)
+    /// — at the non-tight geometry where the fallback alone would accept the
+    /// unit start and split the pair. It also keeps an end-to-end fusion
+    /// assertion on the emitted cells.
+    #[test]
+    fn number_and_unit_stay_one_cell() {
+        let cell = |t: &str, x: f64, y: f64, adv: f64| sp_at(t, x, y, adv);
+        let lines: Vec<Vec<Span>> = vec![
+            vec![
+                cell("Farine T55", 34.0, 486.0, 60.0),
+                cell("20", 358.0, 486.0, 8.0),
+                cell("kg", 370.0, 486.0, 12.0),
+                cell("4,55 €", 432.0, 486.0, 25.0),
+            ],
+            vec![
+                cell("Sucre blanc", 34.0, 468.0, 60.0),
+                cell("15", 358.0, 468.0, 8.0),
+                cell("kg", 370.0, 468.0, 12.0),
+                cell("3,20 €", 432.0, 468.0, 25.0),
+            ],
+            vec![
+                cell("Huile d'olive", 34.0, 450.0, 60.0),
+                cell("25", 358.0, 450.0, 8.0),
+                cell("kg", 370.0, 450.0, 12.0),
+                cell("19,80 €", 432.0, 450.0, 25.0),
+            ],
+        ];
+        let hits = find_tables(&lines);
+        let cells: Vec<&str> = hits
+            .iter()
+            .flat_map(|h| h.rows.iter().flatten())
+            .map(|c| c.as_str())
+            .collect();
+        assert!(
+            cells.iter().any(|c| c.contains("20 kg")),
+            "number and unit must stay in one cell, got {cells:?}"
+        );
+        assert!(
+            !cells.iter().any(|c| c.trim() == "kg"),
+            "the unit must not become its own phantom column, got {cells:?}"
+        );
+
+        // The unit-level decision the `is_unit_like` branch makes, at a
+        // non-tight geometry the old fallback would have split: 358 -> 380 is
+        // a full 2.2em at size 10, yet the residual gap (10pt) is under the
+        // 11pt column gutter, so only the digit branch decides.
+        let row = |a: &str, b: &str| {
+            let line = vec![sp_at(a, 358.0, 500.0, 12.0), sp_at(b, 380.0, 500.0, 12.0)];
+            let words = line_words(&line);
+            let starts = words.iter().map(|w| w.x0).collect();
+            let ends = words.iter().map(|w| w.x1).collect();
+            RowInfo { words, starts, ends, size: 10.0 }
+        };
+        assert!(380.0 - 358.0 >= 2.0 * 10.0, "pair must trip the old fallback");
+        assert!(
+            !start_ruler_is_separate_cell(&row("20", "kg"), 380.0, 1.0, 11.0),
+            "a unit after a digit must not become its own column start"
+        );
+        assert!(
+            start_ruler_is_separate_cell(&row("1", "CAPIN"), 380.0, 1.0, 11.0),
+            "a name after a digit must become its own column start"
         );
     }
 
