@@ -1919,6 +1919,75 @@ mod tests {
         );
     }
 
+    /// A sparse bilingual key/value grid: a French header row, its English twin,
+    /// then one or two data rows where one data cell is blank (the receipt
+    /// number) and another holds a long ticket number. All four columns are
+    /// short, but the label column averages 2.25 tokens/cell — short
+    /// "Nom"/"Name" cells beside a 4-token full name and a 3-token
+    /// "(Adulte / Adult)" qualifier — which sat just past `is_tabular_rows`'s
+    /// old 2.2 short-column bar, so the whole grid was dropped to flat
+    /// paragraph text. The bilingual header doubling the row count is what
+    /// pushes the mean over; the grid must still reconstruct as a table with
+    /// its blank cell preserved.
+    #[test]
+    fn sparse_bilingual_key_value_grid_is_tabular() {
+        let cell = |t: &str, x: f64, y: f64, adv: f64| sp_at(t, x, y, adv);
+        let lines: Vec<Vec<Span>> = vec![
+            vec![
+                cell("Nom", 35.0, 600.0, 16.0),
+                cell("NUMÉRO DE REÇU", 180.0, 600.0, 82.0),
+                cell("Numéro de billet associé", 300.0, 600.0, 104.0),
+                cell("Mode de paiement", 420.0, 600.0, 84.0),
+            ],
+            vec![
+                cell("Name", 35.0, 586.0, 26.0),
+                cell("RECEIPT NUMBER", 180.0, 586.0, 90.0),
+                cell("Associated ticket number", 300.0, 586.0, 112.0),
+                cell("Form of payment", 420.0, 586.0, 86.0),
+            ],
+            vec![
+                cell("ALPHA BETA GAMMA MR", 35.0, 572.0, 108.0),
+                cell("9990001112223", 300.0, 572.0, 72.0),
+                cell("Carte Master/Eurocard", 420.0, 572.0, 104.0),
+            ],
+            vec![
+                cell("(Adulte / Adult)", 35.0, 558.0, 70.0),
+                cell("Card Master/Eurocard", 420.0, 558.0, 96.0),
+            ],
+        ];
+        let hits = find_tables(&lines);
+        let hit = hits
+            .iter()
+            .find(|h| {
+                h.rows
+                    .iter()
+                    .flatten()
+                    .any(|c| c.contains("NUMÉRO DE REÇU"))
+            })
+            .expect("sparse bilingual key/value grid was not reconstructed as a table");
+        let width = hit.rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        assert_eq!(
+            width, 4,
+            "grid lost one of its four columns: {:?}",
+            hit.rows
+        );
+        let row = hit
+            .rows
+            .iter()
+            .find(|r| r.iter().any(|c| c.contains("ALPHA BETA GAMMA MR")))
+            .expect("passenger name row missing");
+        assert_eq!(
+            row[2], "9990001112223",
+            "ticket-number value was stranded out of its column: {:?}",
+            hit.rows
+        );
+        assert_eq!(
+            row[1], "",
+            "the blank receipt-number cell was filled or shifted: {:?}",
+            hit.rows
+        );
+    }
+
     /// A 2-column label/value grid whose *last* value wraps onto one more
     /// visual line ("RENDU DROITS NON" then "ACQUITTÉS" below it). Because the
     /// wrapped tail is the final line of the table, there is no future row for

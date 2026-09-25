@@ -277,7 +277,20 @@ pub fn is_tabular_rows(rows: &[Vec<String>]) -> bool {
         // whole grid as prose. Any column whose cells are measurement-like (a
         // digit plus a unit/range glyph or unit word) is a data column, not
         // prose, even when a few tokens long.
-        if mean <= 2.2 || (mean <= 4.5 && cells.iter().any(|c| looks_like_measurement(c))) {
+        //
+        // A sparse bilingual key-value grid (a French header row, its English
+        // twin, then one or two data rows) inflates every column's mean the
+        // same way: the label column holds short cells ("Nom" / "Name") beside
+        // a 4-token full-name value and the 3-token "(Adulte / Adult)"
+        // qualifier, averaging 2.25 tokens/cell — just past the old 2.2 bar,
+        // even though no cell is a sentence. Genuine prose/URL columns sit at
+        // 2.5 and above (see
+        // `french_bibliography_with_numero_degree_is_not_tabular`, whose URL
+        // column is exactly 2.5, and
+        // `stopword_dense_grid_without_numeric_column_is_rejected`, whose
+        // shortest column is 2.75), so 2.4 admits the bilingual grid while
+        // still rejecting those.
+        if mean <= 2.4 || (mean <= 4.5 && cells.iter().any(|c| looks_like_measurement(c))) {
             short_col = true;
         }
     }
