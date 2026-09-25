@@ -69,9 +69,10 @@ pub extern "C" fn pdf2md_convert_ex2(
 }
 
 /// Same as `pdf2md_convert_ex`, but with an explicit media policy:
-/// `0 = none` (default), `1 = reference` (JSON `media` list only),
-/// `2 = embed` (inline `data:` URIs). Any other value selects the default
-/// (`none`). This is the general FFI surface for
+/// `0 = none` (neither extract nor inline, the default), `1 = reference`
+/// (extract the JSON `media` list only, never inline a `data:` URI) and
+/// `2 = embed` (extract and inline `data:` URIs). Any other value selects the
+/// safe middle policy, `reference`. This is the general FFI surface for
 /// [`crate::MediaMode`]; `pdf2md_convert_ex2`'s `no_media` flag remains the
 /// compatibility alias for `none`.
 #[no_mangle]
@@ -86,9 +87,11 @@ pub extern "C" fn pdf2md_convert_ex3(
         pdf_len,
         Some(detect_vectors != 0),
         Some(match media_mode {
-            1 => MediaMode::Reference,
+            0 => MediaMode::None,
             2 => MediaMode::Embed,
-            _ => MediaMode::None,
+            // 1, and any unrecognized value, use the middle policy: extract
+            // the `media` side-channel but inline no `data:` URIs.
+            _ => MediaMode::Reference,
         }),
     )
 }
@@ -461,5 +464,85 @@ mod tests {
             comparable(&legacy).to_string(),
             "default-off path must be byte-identical to pdf2md_convert except for duration_us"
         );
+    }
+
+    /// `ex3(..., media_mode = 0)` is `MediaMode::None`, so it must agree on
+    /// every deterministic field with the `ex2` compatibility alias for
+    /// "no media" (`no_media = 1`).
+    #[test]
+    fn ex3_none_mode_matches_ex2_no_media_alias() {
+        let bytes = synthetic_noise_image_pdf(300, 240);
+
+        let ex3_none = call_json(&bytes, |p, l| pdf2md_convert_ex3(p, l, 0, 0));
+        let ex2_no_media = call_json(&bytes, |p, l| pdf2md_convert_ex2(p, l, 0, 1));
+
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&ex3_none)
+                .unwrap()["media"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "ex3 none mode must leave the media array empty: {ex3_none}"
+        );
+        assert_eq!(
+            comparable(&ex3_none),
+            comparable(&ex2_no_media),
+            "pdf2md_convert_ex3(..., 0, 0) must match pdf2md_convert_ex2(..., 0, 1) on every field except duration_us"
+        );
+    }
+
+    /// `ex3(..., media_mode = 2)` is `MediaMode::Embed`. The crate's own
+    /// `ConversionOptions::default()` is now `MediaMode::None` (see
+    /// `models.rs`), so the matching in-crate reference path is an explicit
+    /// `MediaMode::Embed` conversion, not `pdf2md_convert` / `ex2(..., 0, 0)`.
+    /// Assert the deterministic markdown and media side-channel agree with it.
+    #[test]
+    fn ex3_embed_matches_explicit_embed_options() {
+        let bytes = synthetic_noise_image_pdf(300, 240);
+
+        let ffi: serde_json::Value =
+            serde_json::from_str(&call_json(&bytes, |p, l| pdf2md_convert_ex3(p, l, 0, 2)))
+                .unwrap();
+
+        let mut opts = ConversionOptions::default();
+        opts.media_mode = MediaMode::Embed;
+        let direct = convert_pdf_bytes_to_markdown(&bytes, &opts).expect("direct embed conversion");
+
+        assert!(!direct.media.is_empty(), "embed fixture must carry media");
+        assert_eq!(
+            ffi["markdown"].as_str().unwrap(),
+            direct.markdown,
+            "ex3 embed markdown must match an explicit MediaMode::Embed conversion"
+        );
+        assert_eq!(
+            ffi["media"].as_array().unwrap().len(),
+            direct.media.len(),
+            "ex3 embed media count must match an explicit MediaMode::Embed conversion"
+        );
+        assert!(
+            ffi["markdown"].as_str().unwrap().contains("data:image"),
+            "ex3 embed must inline a data-URI image: {ffi}"
+        );
+    }
+
+    /// `1 = reference` and any unrecognized value use the safe middle policy:
+    /// extract the media side-channel but never inline a `data:` URI.
+    #[test]
+    fn ex3_reference_and_unknown_modes_never_inline() {
+        let bytes = synthetic_noise_image_pdf(300, 240);
+
+        for mode in [1, 3] {
+            let v: serde_json::Value =
+                serde_json::from_str(&call_json(&bytes, |p, l| pdf2md_convert_ex3(p, l, 0, mode)))
+                    .unwrap();
+            assert!(
+                !v["media"].as_array().unwrap().is_empty(),
+                "ex3 mode {mode} must extract the media side-channel; got {v}"
+            );
+            assert!(
+                !v["markdown"].as_str().unwrap().contains("data:image"),
+                "ex3 mode {mode} must not inline a data:image; got {v}"
+            );
+        }
     }
 }

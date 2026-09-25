@@ -32,6 +32,14 @@ char *pdf2md_convert_ex(const uint8_t *pdf_bytes, size_t pdf_len, int detect_vec
  * in the returned markdown. */
 char *pdf2md_convert_ex2(const uint8_t *pdf_bytes, size_t pdf_len, int detect_vectors, int no_media);
 
+/* Same as pdf2md_convert_ex, but with an explicit media_mode:
+ * 0 = none (neither extract nor inline media), 1 = reference (extract the
+ * JSON "media" list only, no data-URI images inlined in the markdown),
+ * 2 = embed (extract and inline data-URI images in the returned markdown,
+ * subject to the core's size guardrails). Any other value selects the safe
+ * middle policy, reference. */
+char *pdf2md_convert_ex3(const uint8_t *pdf_bytes, size_t pdf_len, int detect_vectors, int media_mode);
+
 /* Returns 1 when the PDF has a digital text layer, 0 otherwise. */
 int pdf2md_is_digital(const uint8_t *pdf_bytes, size_t pdf_len);
 
