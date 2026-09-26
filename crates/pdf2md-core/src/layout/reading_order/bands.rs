@@ -261,11 +261,18 @@ pub(super) fn detect_column_bands_opts(lines: &[Vec<Span>], allow_stacks: bool) 
     for band in bands {
         match band {
             ColumnBand::Columns { .. } | ColumnBand::Stacks(_) => out.push(band),
-            ColumnBand::Full(rows) => project_full_band(rows, allow_stacks, &mut out),
+            ColumnBand::Full(rows) => project_full_band(rows, allow_stacks, &mut out, 0),
         }
     }
     out
 }
+
+/// Depth cap for the recursive band projection. The recursion already
+/// terminates (each peel passes strictly smaller row slices), but a pathological
+/// band that peels one region at a time could nest once per row; at the cap the
+/// remaining rows are emitted as a single `Full` band. 512 is far above any real
+/// page's band depth.
+const MAX_BAND_RECURSION_DEPTH: usize = 512;
 
 /// Recursively peel two-column projection regions out of one `Full` band, then
 /// (when `allow_stacks`) a staggered multi-column region.
@@ -277,14 +284,18 @@ pub(super) fn detect_column_bands_opts(lines: &[Vec<Span>], allow_stacks: bool) 
 /// The staggered pass runs only when the projection found nothing on this band,
 /// and leaves its surroundings as plain `Full` rows rather than re-projecting
 /// them.
-pub(super) fn project_full_band(rows: Vec<Vec<Span>>, allow_stacks: bool, out: &mut Vec<ColumnBand>) {
+pub(super) fn project_full_band(rows: Vec<Vec<Span>>, allow_stacks: bool, out: &mut Vec<ColumnBand>, depth: usize) {
+    if depth >= MAX_BAND_RECURSION_DEPTH {
+        out.push(ColumnBand::Full(rows));
+        return;
+    }
     if let Some((start, end, left, right)) = projection_columns_region(&rows) {
         if start > 0 {
-            project_full_band(rows[..start].to_vec(), allow_stacks, out);
+            project_full_band(rows[..start].to_vec(), allow_stacks, out, depth + 1);
         }
         out.push(ColumnBand::Columns { left, right });
         if end + 1 < rows.len() {
-            project_full_band(rows[end + 1..].to_vec(), allow_stacks, out);
+            project_full_band(rows[end + 1..].to_vec(), allow_stacks, out, depth + 1);
         }
         return;
     }

@@ -147,15 +147,23 @@ pub fn compute_document_statistics(lines: &[TextLine]) -> DocumentStatistics {
 /// and X (vertical column gutters) to naturally partition mixed-column documents
 /// (e.g. 1-col title -> 2-col body -> 1-col references) into homogeneous semantic blocks
 /// in strict topological reading order (Top-to-Bottom, Left-to-Right).
+/// Depth cap for the recursive XY-cut. The recursion already terminates (each
+/// cut passes strictly smaller index slices), but a pathological layout that
+/// cuts one line at a time would nest once per line; the cap falls back to
+/// emitting the remaining slice as one leaf block. 512 is far above any real
+/// page's cut depth.
+const MAX_XY_CUT_DEPTH: usize = 512;
+
 pub fn recursive_xy_cut(lines: &[TextLine], options: &XyCutOptions, median_fs: f64) -> Vec<TextBlock> {
     let indices: Vec<usize> = (0..lines.len()).collect();
-    xy_cut_sub(lines, &indices, options, median_fs)
+    xy_cut_sub(lines, &indices, options, median_fs, 0)
 }
 
-fn xy_cut_sub(lines: &[TextLine], indices: &[usize], options: &XyCutOptions, median_fs: f64) -> Vec<TextBlock> {
+fn xy_cut_sub(lines: &[TextLine], indices: &[usize], options: &XyCutOptions, median_fs: f64, depth: usize) -> Vec<TextBlock> {
     if indices.is_empty() {
         return Vec::new();
     }
+    let at_depth_cap = depth >= MAX_XY_CUT_DEPTH;
     if indices.len() == 1 {
         let l = &lines[indices[0]];
         return vec![TextBlock {
@@ -186,16 +194,16 @@ fn xy_cut_sub(lines: &[TextLine], indices: &[usize], options: &XyCutOptions, med
         }
     }
 
-    if !h_cuts.is_empty() {
+    if !at_depth_cap && !h_cuts.is_empty() {
         let mut blocks = Vec::new();
         let mut prev_idx = 0;
         for cut in h_cuts {
             let slice = &sorted_by_y[prev_idx..cut];
-            blocks.extend(xy_cut_sub(lines, slice, options, median_fs));
+            blocks.extend(xy_cut_sub(lines, slice, options, median_fs, depth + 1));
             prev_idx = cut;
         }
         let slice = &sorted_by_y[prev_idx..];
-        blocks.extend(xy_cut_sub(lines, slice, options, median_fs));
+        blocks.extend(xy_cut_sub(lines, slice, options, median_fs, depth + 1));
         return blocks;
     }
 
@@ -219,16 +227,16 @@ fn xy_cut_sub(lines: &[TextLine], indices: &[usize], options: &XyCutOptions, med
         }
     }
 
-    if !v_cuts.is_empty() {
+    if !at_depth_cap && !v_cuts.is_empty() {
         let mut blocks = Vec::new();
         let mut prev_idx = 0;
         for cut in v_cuts {
             let slice = &sorted_by_x[prev_idx..cut];
-            blocks.extend(xy_cut_sub(lines, slice, options, median_fs));
+            blocks.extend(xy_cut_sub(lines, slice, options, median_fs, depth + 1));
             prev_idx = cut;
         }
         let slice = &sorted_by_x[prev_idx..];
-        blocks.extend(xy_cut_sub(lines, slice, options, median_fs));
+        blocks.extend(xy_cut_sub(lines, slice, options, median_fs, depth + 1));
         return blocks;
     }
 

@@ -40,7 +40,20 @@ pub(super) fn read_name(data: &[u8], j: &mut usize) -> Vec<u8> {
     data[start..*j].to_vec()
 }
 
+/// Maximum nesting depth of an inline-image value (arrays inside arrays).
+///
+/// Real inline-image dictionaries are 1–2 levels deep; the cap only stops a
+/// crafted sample of `[[[[…` from recursing until the process stack overflows.
+pub(super) const MAX_INLINE_VALUE_DEPTH: usize = 32;
+
 pub(super) fn read_inline_value(data: &[u8], j: &mut usize) -> Option<Object> {
+    read_inline_value_at(data, j, 0)
+}
+
+fn read_inline_value_at(data: &[u8], j: &mut usize, depth: usize) -> Option<Object> {
+    if depth >= MAX_INLINE_VALUE_DEPTH {
+        return None;
+    }
     skip_ws(data, j);
     if *j >= data.len() {
         return None;
@@ -80,7 +93,7 @@ pub(super) fn read_inline_value(data: &[u8], j: &mut usize) -> Option<Object> {
                 if *j >= data.len() {
                     break;
                 }
-                if let Some(v) = read_inline_value(data, j) {
+                if let Some(v) = read_inline_value_at(data, j, depth + 1) {
                     arr.push(v);
                 } else {
                     *j += 1;

@@ -25,6 +25,13 @@ pub fn page_read_order(lines: &[Vec<Span>]) -> Vec<Vec<Vec<Span>>> {
     read_order_segmented(lines)
 }
 
+/// Depth cap for the recursive page segmentation. The recursion already
+/// terminates (each projection peel passes strictly smaller line slices), but a
+/// pathological page that peels one region at a time could nest once per line;
+/// at the cap the remaining lines are emitted as one stream. 512 is far above
+/// any real page's segmentation depth.
+const MAX_SEGMENT_RECURSION_DEPTH: usize = 512;
+
 /// Segment a page — or the part of one left over after a `page_two_columns`
 /// decision — into column bands, recovering *every* multi-column region rather
 /// than only the single longest one.
@@ -41,6 +48,13 @@ pub fn page_read_order(lines: &[Vec<Span>]) -> Vec<Vec<Vec<Span>>> {
 /// applying it to an arbitrary slice would let a partial layout masquerade as
 /// a page-wide one.
 pub(super) fn read_order_segmented(lines: &[Vec<Span>]) -> Vec<Vec<Vec<Span>>> {
+    read_order_segmented_at(lines, 0)
+}
+
+fn read_order_segmented_at(lines: &[Vec<Span>], depth: usize) -> Vec<Vec<Vec<Span>>> {
+    if depth >= MAX_SEGMENT_RECURSION_DEPTH {
+        return vec![lines.to_vec()];
+    }
     // A 3+-column page whose narrow (~0.7em) gutters no single-gutter detector
     // can seed: `page_two_columns` needs one gutter across the whole page and
     // `detect_column_bands` splits a run at one gutter, leaving the remaining
@@ -49,11 +63,11 @@ pub(super) fn read_order_segmented(lines: &[Vec<Span>]) -> Vec<Vec<Vec<Span>>> {
     if let Some(region) = multi_column_projection(lines) {
         let mut streams = Vec::new();
         if region.start > 0 {
-            streams.extend(read_order_segmented(&lines[..region.start]));
+            streams.extend(read_order_segmented_at(&lines[..region.start], depth + 1));
         }
         streams.extend(region.columns);
         if region.end + 1 < lines.len() {
-            streams.extend(read_order_segmented(&lines[region.end + 1..]));
+            streams.extend(read_order_segmented_at(&lines[region.end + 1..], depth + 1));
         }
         return streams;
     }
