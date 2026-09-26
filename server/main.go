@@ -8,10 +8,11 @@
 // Python or external ML dependencies.
 //
 // Endpoints:
-//   GET  /health          — liveness probe ({"status": "ok", "version": "public-core"})
-//   POST /api/v1/convert  — converts digital PDF (multipart or binary) to Markdown
-//   POST /convert         — legacy alias for /api/v1/convert
-//   GET  /                — in-browser test sandbox
+//
+//	GET  /health          — liveness probe ({"status": "ok", "version": "public-core"})
+//	POST /api/v1/convert  — converts digital PDF (multipart or binary) to Markdown
+//	POST /convert         — legacy alias for /api/v1/convert
+//	GET  /                — in-browser test sandbox
 package main
 
 import (
@@ -28,6 +29,10 @@ import (
 )
 
 const maxUploadBytes = 100 << 20 // 100 MB
+
+// multipartOverheadBytes is headroom above maxUploadBytes for the multipart
+// boundaries, part headers, and any non-file fields that wrap the file payload.
+const multipartOverheadBytes = 1 << 20 // 1 MiB
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -46,12 +51,17 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func extractPDFBytes(r *http.Request) ([]byte, error) {
+func extractPDFBytes(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	contentType := r.Header.Get("Content-Type")
 	if strings.HasPrefix(contentType, "multipart/form-data") {
+		// Cap the whole request body, not just the in-memory part: without this
+		// an oversized file part spills to disk and is never bounded.
+		r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes+multipartOverheadBytes)
 		if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
 			return nil, fmt.Errorf("failed to parse multipart form: %w", err)
 		}
+		defer r.MultipartForm.RemoveAll()
+
 		var fileHeaders []*struct {
 			Filename string
 		}
@@ -80,7 +90,7 @@ func extractPDFBytes(r *http.Request) ([]byte, error) {
 		return io.ReadAll(file)
 	}
 
-	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxUploadBytes))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxUploadBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read body: %w", err)
 	}
@@ -93,8 +103,13 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pdfBytes, err := extractPDFBytes(r)
+	pdfBytes, err := extractPDFBytes(w, r)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "request body too large"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
