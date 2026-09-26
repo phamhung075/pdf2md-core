@@ -87,6 +87,12 @@ struct Args {
     /// Alias for --no-media / --media-mode none
     #[arg(long, default_value_t = false)]
     no_images: bool,
+
+    /// Insert an exact per-page HTML-comment boundary marker
+    /// (`<!-- pdf2w:page n="N" -->`, 1-indexed, one per page including page 1)
+    /// immediately before each page's content in the markdown
+    #[arg(long, default_value_t = false)]
+    page_markers: bool,
 }
 
 fn main() {
@@ -138,6 +144,7 @@ fn main() {
         detect_tables: !args.no_tables,
         detect_vectors: args.vectors,
         media_mode,
+        page_markers: args.page_markers,
         ..Default::default()
     };
 

@@ -40,6 +40,14 @@ char *pdf2md_convert_ex2(const uint8_t *pdf_bytes, size_t pdf_len, int detect_ve
  * middle policy, reference. */
 char *pdf2md_convert_ex3(const uint8_t *pdf_bytes, size_t pdf_len, int detect_vectors, int media_mode);
 
+/* Same as pdf2md_convert_ex3, but with an additional explicit page_markers
+ * flag (0 = off/default, nonzero = on): when set, an exact per-page
+ * HTML-comment boundary marker (`<!-- pdf2w:page n="N" -->`, 1-indexed, one
+ * per page including page 1) is inserted immediately before each page's
+ * content in the returned markdown. Only meaningful for digital PDFs;
+ * ex4(..., 0) is byte-identical to pdf2md_convert_ex3. */
+char *pdf2md_convert_ex4(const uint8_t *pdf_bytes, size_t pdf_len, int detect_vectors, int media_mode, int page_markers);
+
 /* Returns 1 when the PDF has a digital text layer, 0 otherwise. */
 int pdf2md_is_digital(const uint8_t *pdf_bytes, size_t pdf_len);
 

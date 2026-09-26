@@ -247,6 +247,12 @@ pub struct ConversionOptions {
     /// [`MediaMode::Reference`] (JSON `media` list only) or
     /// [`MediaMode::Embed`] (inline `data:` URIs).
     pub media_mode: MediaMode,
+    /// Insert an exact per-page HTML-comment boundary marker
+    /// (`<!-- pdf2w:page n="N" -->`, 1-indexed, one per page including page 1)
+    /// immediately before that page's reflowed content in the returned
+    /// markdown. Disabled by default; opt-in because it adds machine-readable
+    /// noise to the output.
+    pub page_markers: bool,
     /// Rebuild reading order with zones/columns/furniture handling on the
     /// geometry path (fallback is byte-identical for simple single-column
     /// pages).
@@ -294,6 +300,7 @@ impl Default for ConversionOptions {
             detect_headings: true,
             min_words_per_page: 5,
             media_mode: MediaMode::None,
+            page_markers: false,
             detect_layout: true,
             detect_vectors: false,
             detect_math: true,

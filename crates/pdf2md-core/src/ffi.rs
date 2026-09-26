@@ -29,7 +29,7 @@ pub(crate) fn cstring_into_raw(s: String) -> *mut c_char {
 ///   { "ok": false, "error": "..." }
 #[no_mangle]
 pub extern "C" fn pdf2md_convert(pdf_ptr: *const u8, pdf_len: usize) -> *mut c_char {
-    pdf2md_convert_impl(pdf_ptr, pdf_len, None, None)
+    pdf2md_convert_impl(pdf_ptr, pdf_len, None, None, None)
 }
 
 /// Same as `pdf2md_convert`, but with an explicit `detect_vectors` flag
@@ -41,7 +41,7 @@ pub extern "C" fn pdf2md_convert_ex(
     pdf_len: usize,
     detect_vectors: i32,
 ) -> *mut c_char {
-    pdf2md_convert_impl(pdf_ptr, pdf_len, Some(detect_vectors != 0), None)
+    pdf2md_convert_impl(pdf_ptr, pdf_len, Some(detect_vectors != 0), None, None)
 }
 
 /// Same as `pdf2md_convert_ex`, but with an additional explicit `no_media`
@@ -65,6 +65,7 @@ pub extern "C" fn pdf2md_convert_ex2(
         } else {
             None
         },
+        None,
     )
 }
 
@@ -93,6 +94,36 @@ pub extern "C" fn pdf2md_convert_ex3(
             // the `media` side-channel but inline no `data:` URIs.
             _ => MediaMode::Reference,
         }),
+        None,
+    )
+}
+
+/// Same as `pdf2md_convert_ex3`, but with an additional explicit
+/// `page_markers` flag (0 = off/default, nonzero = on): emits an exact
+/// per-page HTML-comment boundary marker (`<!-- pdf2w:page n="N" -->`, one per
+/// page including page 1) immediately before each page's reflowed content.
+/// Only meaningful for digital PDFs; the marker is opt-in so `ex4(..., 0)`
+/// stays byte-identical to `ex3`.
+#[no_mangle]
+pub extern "C" fn pdf2md_convert_ex4(
+    pdf_ptr: *const u8,
+    pdf_len: usize,
+    detect_vectors: i32,
+    media_mode: i32,
+    page_markers: i32,
+) -> *mut c_char {
+    pdf2md_convert_impl(
+        pdf_ptr,
+        pdf_len,
+        Some(detect_vectors != 0),
+        Some(match media_mode {
+            0 => MediaMode::None,
+            2 => MediaMode::Embed,
+            // 1, and any unrecognized value, use the middle policy: extract
+            // the `media` side-channel but inline no `data:` URIs.
+            _ => MediaMode::Reference,
+        }),
+        Some(page_markers != 0),
     )
 }
 
@@ -101,6 +132,7 @@ fn pdf2md_convert_impl(
     pdf_len: usize,
     vectors_override: Option<bool>,
     media_mode_override: Option<MediaMode>,
+    page_markers_override: Option<bool>,
 ) -> *mut c_char {
     let json = if pdf_ptr.is_null() {
         serde_json::json!({ "ok": false, "error": "null input pointer" })
@@ -138,6 +170,11 @@ fn pdf2md_convert_impl(
                 _ => MediaMode::None,
             };
         }
+        // Per-page HTML-comment boundary markers: explicit opt-in only, no
+        // process-wide env hatch. Legacy entry points (`convert`/`ex`/`ex2`/
+        // `ex3`) pass `None`, which resolves to the disabled default exactly
+        // like the media-mode override above.
+        opts.page_markers = page_markers_override.unwrap_or(false);
         // Optional overrides for the media-embed size guardrails (R1): cap the
         // pixel dimension a raster is downscaled to, and the total base64
         // bytes inlined into the markdown per document. Unset uses the
@@ -429,6 +466,9 @@ mod tests {
         let legacy = call_json(&bytes, |p, l| pdf2md_convert(p, l));
         let legacy_ex = call_json(&bytes, |p, l| pdf2md_convert_ex(p, l, 0));
         let new_default = call_json(&bytes, |p, l| pdf2md_convert_ex2(p, l, 0, 0));
+        // `ex4` with `page_markers = 0` must stay on the legacy path: this is
+        // the same equivalence pattern extended to the newest entry point.
+        let ex4_default = call_json(&bytes, |p, l| pdf2md_convert_ex4(p, l, 0, 0, 0));
 
         assert_eq!(
             comparable(&new_default),
@@ -444,6 +484,46 @@ mod tests {
             comparable(&legacy),
             comparable(&legacy_ex),
             "pdf2md_convert and pdf2md_convert_ex(..., 0) must agree as before"
+        );
+        assert_eq!(
+            comparable(&ex4_default),
+            comparable(&legacy),
+            "pdf2md_convert_ex4(..., 0, 0, 0) must match pdf2md_convert on every field except duration_us"
+        );
+        assert_eq!(
+            comparable(&ex4_default),
+            comparable(&new_default),
+            "pdf2md_convert_ex4(..., 0, 0, 0) must match pdf2md_convert_ex2(..., 0, 0) on every field except duration_us"
+        );
+    }
+
+    /// `ex4` with `page_markers = 1` opts in: the marker appears exactly once
+    /// for the single synthetic page, and the legacy entry points stay marker-
+    /// free so the disabled default cannot regress.
+    #[test]
+    fn ex4_page_markers_opt_in_inserts_exactly_one_marker() {
+        let bytes = synthetic_noise_image_pdf(300, 240);
+
+        let on: serde_json::Value =
+            serde_json::from_str(&call_json(&bytes, |p, l| pdf2md_convert_ex4(p, l, 0, 0, 1)))
+                .unwrap();
+        let md = on["markdown"].as_str().unwrap();
+        assert_eq!(
+            md.matches("<!-- pdf2w:page n=\"").count(),
+            1,
+            "page_markers=1 must emit exactly one marker for a one-page doc: {md}"
+        );
+        assert!(
+            md.contains("<!-- pdf2w:page n=\"1\" -->"),
+            "page_markers=1 must emit the 1-indexed marker: {md}"
+        );
+
+        // The frozen contract: `ex4(..., 0)` (and every legacy entry point) is
+        // byte-identical to the marker-free conversion.
+        let off = call_json(&bytes, |p, l| pdf2md_convert_ex4(p, l, 0, 0, 0));
+        assert!(
+            !off.contains("pdf2w:page"),
+            "page_markers=0 must not emit a marker: {off}"
         );
     }
 

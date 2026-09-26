@@ -1947,11 +1947,21 @@ pub fn convert_pdf_bytes_to_markdown(
         // excluded there, so collapse it as whole blocks before reflow.
         collapse_repeated_furniture_blocks(&mut page_md);
     }
-    for (_p, chunk) in page_md {
+    for (p, chunk) in page_md {
         // Paragraph reflow: join the walker's one-line-per-PDF-line output
         // back into paragraphs. Run per page, after the line-based furniture
         // and page-counter passes, so a running header or a suppressed
         // counter is never welded into body prose.
+        //
+        // The opt-in page marker is emitted here, not inside the per-page
+        // build loop: anything inserted before the furniture passes could be
+        // normalized to a single cross-page key (the marker differs only by
+        // page number) and silently collapsed away on every page but the
+        // first. `p` is the 1-indexed page number, matching the `## Page {}`
+        // heading heuristic.
+        if options.page_markers {
+            full_markdown.push_str(&format!("<!-- pdf2w:page n=\"{p}\" -->\n\n"));
+        }
         let reflowed = reflow::reflow_markdown(&chunk);
         full_markdown.push_str(&reflowed);
     }
@@ -3997,5 +4007,227 @@ mod regression_tests {
         let mut bytes = Vec::new();
         doc.save_to(&mut bytes).expect("serialize plain stub");
         assert!(!pdf_password_required(&bytes));
+    }
+
+    // ---- Opt-in per-page HTML-comment boundary markers ----
+
+    /// Parse the ordered `(page, content)` sections a marker-delimited markdown
+    /// document is split into. Panics on malformed marker syntax, so a
+    /// regression cannot pass by emitting no markers at all.
+    fn parse_page_marker_sections(md: &str) -> Vec<(u32, String)> {
+        let needle = "<!-- pdf2w:page n=\"";
+        let mut starts: Vec<(usize, u32, usize)> = Vec::new();
+        let mut idx = 0;
+        while let Some(rel) = md[idx..].find(needle) {
+            let start = idx + rel;
+            let num_start = start + needle.len();
+            let num_end = md[num_start..]
+                .find('"')
+                .map(|e| num_start + e)
+                .expect("page marker number must be quoted");
+            let page: u32 = md[num_start..num_end]
+                .parse()
+                .expect("page marker number must parse");
+            let close = md[num_end..]
+                .find("-->")
+                .map(|e| num_end + e + 3)
+                .expect("page marker must be closed");
+            starts.push((start, page, close));
+            idx = close;
+        }
+        starts
+            .iter()
+            .enumerate()
+            .map(|(i, &(_, page, close))| {
+                let end = starts.get(i + 1).map_or(md.len(), |p| p.0);
+                (page, md[close..end].to_string())
+            })
+            .collect()
+    }
+
+    /// Three synthetic pages of *unequal* length, each carrying one unique
+    /// token. Equal page lengths can make a mis-placed marker look correct by
+    /// accident; unequal lengths expose an off-by-one page boundary.
+    fn unequal_page_marker_pdf() -> Vec<u8> {
+        let page1 = td_text(
+            &[
+                "ZEBRAONE intro line",
+                "ZEBRAONE body alpha",
+                "ZEBRAONE body beta",
+                "ZEBRAONE body gamma",
+            ],
+            false,
+        );
+        let page2 = td_text(&["ZEBRATWO intro line", "ZEBRATWO body alpha"], false);
+        let page3 = td_text(
+            &[
+                "ZEBRATHREE intro line",
+                "ZEBRATHREE body alpha",
+                "ZEBRATHREE body beta",
+                "ZEBRATHREE body gamma",
+                "ZEBRATHREE body delta",
+                "ZEBRATHREE body epsilon",
+            ],
+            false,
+        );
+        synth_pages_pdf(&[page1, page2, page3])
+    }
+
+    fn convert_with_markers(bytes: &[u8], page_markers: bool) -> String {
+        let opts = ConversionOptions {
+            page_markers,
+            ..Default::default()
+        };
+        convert_pdf_bytes_to_markdown(bytes, &opts)
+            .expect("synthetic pdf must convert")
+            .markdown
+    }
+
+    /// One marker per page including page 1, ordered, and each marker precedes
+    /// exactly its own page's content. Off by default.
+    #[test]
+    fn page_markers_opt_in_emits_one_marker_per_page_before_its_content() {
+        let bytes = unequal_page_marker_pdf();
+
+        let off = convert_with_markers(&bytes, false);
+        assert!(
+            !off.contains("pdf2w:page"),
+            "page_markers=false must emit no marker:\n{off}"
+        );
+
+        let on = convert_with_markers(&bytes, true);
+        let sections = parse_page_marker_sections(&on);
+        assert_eq!(
+            sections.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "one marker per page, 1-indexed and in order:\n{on}"
+        );
+
+        let tokens = [(1u32, "ZEBRAONE"), (2, "ZEBRATWO"), (3, "ZEBRATHREE")];
+        for (page, section) in &sections {
+            let token = tokens.iter().find(|(p, _)| p == page).unwrap().1;
+            assert!(
+                section.contains(token),
+                "marker for page {page} must precede that page's content:\n{on}"
+            );
+            for (other, other_token) in tokens {
+                if other != *page {
+                    assert!(
+                        !section.contains(other_token),
+                        "page {page} section must not contain page {other}'s token:\n{on}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Regression: every page starts with the identical running header, exactly
+    /// the cross-page shape the furniture passes collapse. A marker inserted
+    /// *before* those passes (inside the per-page build loop) would sit ahead of
+    /// the header and could be normalized to a single cross-page key and
+    /// silently dropped on every page but the first; the post-pass insertion
+    /// point must keep one marker per page.
+    #[test]
+    fn page_markers_survive_a_repeated_running_header() {
+        let header = "ACME RUNNING HEADER CONFIDENTIAL";
+        let page = |body: &str| {
+            td_text(
+                &[
+                    header,
+                    body,
+                    "second body line",
+                    "third body line",
+                    "fourth body line",
+                ],
+                false,
+            )
+        };
+        let bytes = synth_pages_pdf(&[
+            page("PAGEONE uniquebody"),
+            page("PAGETWO uniquebody"),
+            page("PAGETHREE uniquebody"),
+        ]);
+        let on = convert_with_markers(&bytes, true);
+        let sections = parse_page_marker_sections(&on);
+        assert_eq!(
+            sections.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "every page must keep its marker even with a repeated header:\n{on}"
+        );
+        for (page_no, section) in &sections {
+            let token = match page_no {
+                1 => "PAGEONE",
+                2 => "PAGETWO",
+                _ => "PAGETHREE",
+            };
+            assert!(
+                section.contains(token),
+                "page {page_no} body lost with a repeated header:\n{on}"
+            );
+        }
+    }
+
+    /// TEST-ONLY independent oracle: the system `pdftotext -f N -l N` binary
+    /// (never invoked from library/production code) proves each marker
+    /// delimits that PDF page's real text. Skips — rather than fails — when the
+    /// poppler binary is absent so the suite stays portable.
+    #[test]
+    fn page_markers_match_pdftotext_page_oracle() {
+        if std::process::Command::new("pdftotext")
+            .arg("-v")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_err()
+        {
+            eprintln!("skipping: system pdftotext not installed");
+            return;
+        }
+
+        let bytes = unequal_page_marker_pdf();
+        let dir =
+            std::env::temp_dir().join(format!("pdf2md-page-markers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("unequal-pages.pdf");
+        std::fs::write(&path, &bytes).expect("write fixture pdf");
+
+        let oracle = |page: u32| -> String {
+            let out = std::process::Command::new("pdftotext")
+                .args(["-f", &page.to_string(), "-l", &page.to_string()])
+                .arg(&path)
+                .arg("-")
+                .output()
+                .expect("run system pdftotext");
+            assert!(out.status.success(), "pdftotext failed for page {page}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        let on = convert_with_markers(&bytes, true);
+        let sections = parse_page_marker_sections(&on);
+        assert_eq!(sections.len(), 3, "expected three marker sections:\n{on}");
+
+        let tokens = [(1u32, "ZEBRAONE"), (2, "ZEBRATWO"), (3, "ZEBRATHREE")];
+        for (page, section) in &sections {
+            let token = tokens.iter().find(|(p, _)| p == page).unwrap().1;
+            let page_text = oracle(*page);
+            assert!(
+                page_text.contains(token),
+                "oracle page {page} must really carry {token}:\n{page_text}"
+            );
+            assert!(
+                section.contains(token),
+                "marker {page} must delimit the oracle's page {page} text:\n{on}"
+            );
+            for (other, other_token) in tokens {
+                if other != *page {
+                    assert!(
+                        !section.contains(other_token),
+                        "marker {page} section must not contain page {other}'s oracle text:\n{on}"
+                    );
+                }
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
