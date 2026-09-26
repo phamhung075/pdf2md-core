@@ -65,12 +65,57 @@ pub(super) fn standard_role(role: &[u8], map: &HashMap<Vec<u8>, Vec<u8>>) -> Vec
     map.get(role).cloned().unwrap_or_else(|| role.to_ascii_uppercase())
 }
 
+/// Hard recursion bounds for the two untrusted-input tree walks below.
+///
+/// `/K` (structure tree) and `/Kids` (number tree) are attacker-controlled: a
+/// StructElem whose `/K` points at itself, or a number-tree node whose `/Kids`
+/// contains itself, previously made the reader recurse until the process stack
+/// overflowed and aborted the whole host. Each walk therefore carries both an
+/// ancestor set of indirect object ids (only reference operands have identity,
+/// so an inline dictionary may still legitimately appear twice) and a hard
+/// depth cap for a pathological non-cyclic deep chain. The caps are far above
+/// real documents — tagged structure trees are usually < 20 levels and number
+/// trees 2–3 — yet small enough to stay well inside one thread's stack, so
+/// well-formed trees are unaffected.
+pub(super) const MAX_STRUCT_TREE_DEPTH: usize = 256;
+pub(super) const MAX_NUMBER_TREE_DEPTH: usize = 64;
+
 /// Parse one `/K` operand (array / integer / dict / ref) into `Node`s, in order.
+///
+/// Entry point: seeds the ancestor set and depth counter for [`parse_nodes_rec`].
 pub(super) fn parse_nodes(doc: &Document, obj: &Object, role: &[u8], map: &HashMap<Vec<u8>, Vec<u8>>, out: &mut Vec<Node>) {
+    let mut visited: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+    parse_nodes_rec(doc, obj, role, map, out, 0, &mut visited);
+}
+
+fn parse_nodes_rec(
+    doc: &Document,
+    obj: &Object,
+    role: &[u8],
+    map: &HashMap<Vec<u8>, Vec<u8>>,
+    out: &mut Vec<Node>,
+    depth: usize,
+    visited: &mut std::collections::HashSet<ObjectId>,
+) {
+    if depth >= MAX_STRUCT_TREE_DEPTH {
+        return;
+    }
+    // Cycle guard: only reference operands carry object identity.
+    let ref_id = match obj {
+        Object::Reference(id) => Some(*id),
+        _ => None,
+    };
+    if let Some(id) = ref_id {
+        if !visited.insert(id) {
+            // This object is already on the current descent path: skip the
+            // branch instead of recursing forever.
+            return;
+        }
+    }
     match deref(doc, obj) {
         Some(Object::Array(items)) => {
             for it in items {
-                parse_nodes(doc, it, role, map, out);
+                parse_nodes_rec(doc, it, role, map, out, depth + 1, visited);
             }
         }
         Some(Object::Integer(i)) => {
@@ -87,6 +132,9 @@ pub(super) fn parse_nodes(doc: &Document, obj: &Object, role: &[u8], map: &HashM
                         mcid: mcid as usize,
                         actual_text: actual_text_of(d),
                     });
+                    if let Some(id) = ref_id {
+                        visited.remove(&id);
+                    }
                     return;
                 }
             }
@@ -95,7 +143,7 @@ pub(super) fn parse_nodes(doc: &Document, obj: &Object, role: &[u8], map: &HashM
             let child_role = if this_role.is_empty() { role.to_vec() } else { this_role };
             let mut children = Vec::new();
             if let Ok(ks) = d.get(b"K") {
-                parse_nodes(doc, ks, &child_role, map, &mut children);
+                parse_nodes_rec(doc, ks, &child_role, map, &mut children, depth + 1, visited);
             }
             out.push(Node::Elem {
                 role: child_role.clone(),
@@ -104,6 +152,9 @@ pub(super) fn parse_nodes(doc: &Document, obj: &Object, role: &[u8], map: &HashM
             });
         }
         _ => {}
+    }
+    if let Some(id) = ref_id {
+        visited.remove(&id);
     }
 }
 
@@ -165,8 +216,36 @@ pub(super) fn page_elements(doc: &Document, root: &Dictionary, page_id: ObjectId
 }
 
 /// Look up a key in a PDF number tree (`/Nums` leaves with optional `/Kids`).
+///
+/// Entry point: seeds the ancestor set and depth counter for
+/// [`number_tree_value_rec`]. A malformed `/Kids` that contains its own node
+/// used to recurse until the stack overflowed; the ancestor set breaks the
+/// cycle and [`MAX_NUMBER_TREE_DEPTH`] bounds a non-cyclic deep chain.
 pub(super) fn number_tree_value(doc: &Document, root: &Object, key: i64) -> Option<Object> {
-    match deref(doc, root) {
+    let mut visited: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+    number_tree_value_rec(doc, root, key, 0, &mut visited)
+}
+
+fn number_tree_value_rec(
+    doc: &Document,
+    root: &Object,
+    key: i64,
+    depth: usize,
+    visited: &mut std::collections::HashSet<ObjectId>,
+) -> Option<Object> {
+    if depth >= MAX_NUMBER_TREE_DEPTH {
+        return None;
+    }
+    let ref_id = match root {
+        Object::Reference(id) => Some(*id),
+        _ => None,
+    };
+    if let Some(id) = ref_id {
+        if !visited.insert(id) {
+            return None;
+        }
+    }
+    let result = match deref(doc, root) {
         Some(Object::Dictionary(d)) => {
             if let Ok(nums) = d.get(b"Nums") {
                 if let Ok(arr) = nums.as_array() {
@@ -174,14 +253,21 @@ pub(super) fn number_tree_value(doc: &Document, root: &Object, key: i64) -> Opti
                         if pair.len() == 2 {
                             if let Ok(k) = pair[0].as_i64() {
                                 if k == key {
+                                    if let Some(id) = ref_id {
+                                        visited.remove(&id);
+                                    }
                                     return Some(pair[1].clone());
                                 }
                             }
                         }
                     }
+                    if let Some(id) = ref_id {
+                        visited.remove(&id);
+                    }
                     return None;
                 }
             }
+            let mut found = None;
             if let Ok(kids) = d.get(b"Kids") {
                 if let Ok(karr) = kids.as_array() {
                     for kid in karr {
@@ -191,8 +277,12 @@ pub(super) fn number_tree_value(doc: &Document, root: &Object, key: i64) -> Opti
                             }).unwrap_or((None, None));
                             if let (Some(lo), Some(hi)) = (lo, hi) {
                                 if key >= lo && key <= hi {
-                                    if let Some(v) = number_tree_value(doc, &Object::Dictionary(kd.clone()), key) {
-                                        return Some(v);
+                                    // Recurse on the original operand (the
+                                    // reference), not a cloned dictionary, so
+                                    // the ancestor set can identify the node.
+                                    if let Some(v) = number_tree_value_rec(doc, kid, key, depth + 1, visited) {
+                                        found = Some(v);
+                                        break;
                                     }
                                 }
                             }
@@ -200,10 +290,14 @@ pub(super) fn number_tree_value(doc: &Document, root: &Object, key: i64) -> Opti
                     }
                 }
             }
-            None
+            found
         }
         _ => None,
+    };
+    if let Some(id) = ref_id {
+        visited.remove(&id);
     }
+    result
 }
 
 // ---------------------------------------------------------------------------
