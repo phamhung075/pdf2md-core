@@ -166,3 +166,7 @@ mod column_band_tests;
 mod column_band_tests_common;
 #[cfg(test)]
 mod column_band_tests_part2;
+#[cfg(test)]
+mod structural_tests_common;
+#[cfg(test)]
+mod structural_tests_part2;

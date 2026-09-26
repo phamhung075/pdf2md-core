@@ -4,28 +4,8 @@
 
 //! Reading order recovery, multi-column stream separation, and structured DocBlock generation.
 
-    use super::*;
-
-    const BODY: f64 = 10.0;
-
-    fn word(text: &str, x: f64, size: f64, bold: bool) -> Span {
-        Span {
-            text: text.to_string(),
-            x,
-            y: 700.0,
-            size,
-            advance: text.len() as f64 * size * 0.6,
-            word_advance: text.len() as f64 * size * 0.6,
-            is_bold: bold,
-            is_italic: false,
-            is_underline: false,
-            is_vertical: false,
-        }
-    }
-
-    fn one_span_line(text: &str, size: f64, bold: bool) -> Vec<Span> {
-        vec![word(text, 100.0, size, bold)]
-    }
+use super::*;
+use super::structural_tests_common::*;
 
     // -- detect_heading_level ------------------------------------------------
 
@@ -163,16 +143,6 @@
             None,
             "a body-sized prose line must not be promoted to a heading"
         );
-    }
-
-    // -- detect_list_marker ---------------------------------------------------
-
-    fn bulleted_line(marker: &str) -> Vec<Span> {
-        vec![
-            word(marker, 100.0, BODY, false),
-            word(" ", 100.0 + marker.len() as f64 * 6.0, BODY, false),
-            word("Item text", 120.0, BODY, false),
-        ]
     }
 
     #[test]
@@ -455,47 +425,4 @@
             "Item text",
         );
         assert_eq!(out, "- Item text");
-    }
-
-    #[test]
-    fn ordered_list_item_gets_numbered_prefix() {
-        let out = format_structured_line(
-            &LineRole::List { depth: 0, ordered: true, ordinal: 3 },
-            "Third item",
-        );
-        assert_eq!(out, "3. Third item");
-    }
-
-    #[test]
-    fn nested_list_item_is_indented() {
-        let out = format_structured_line(
-            &LineRole::List { depth: 2, ordered: false, ordinal: 1 },
-            "Deep item",
-        );
-        assert_eq!(out, "    - Deep item");
-    }
-
-    #[test]
-    fn body_role_passes_text_through_unchanged() {
-        let out = format_structured_line(&LineRole::Body, "Just a paragraph.");
-        assert_eq!(out, "Just a paragraph.");
-    }
-
-    // -- end-to-end: render_cluster now emits structural Markdown --------------
-
-    #[test]
-    fn render_cluster_emits_heading_and_list_markdown() {
-        let lines = vec![
-            one_span_line("Document Title", 20.0, false), // body ~10 -> 2.0x -> H1
-            one_span_line("First paragraph of body text.", 10.0, false),
-            bulleted_line("-"),
-            bulleted_line("-"),
-        ];
-        let md = render_cluster(&lines);
-        assert!(md.contains("# Document Title"), "got:\n{md}");
-        assert!(md.contains("- Item text"), "got:\n{md}");
-        assert!(
-            !md.contains("**Document Title**"),
-            "heading text must not be redundantly bold-wrapped, got:\n{md}"
-        );
     }
