@@ -1,6 +1,6 @@
 [package]
 name = "pdf2md-core"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 authors = ["PDF2MD Core Team"]
 description = "High-performance native Rust core engine for sub-millisecond PDF-to-Markdown extraction and 2D spatial canvas geometry"
@@ -44,5 +44,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# `unwind` (not `abort`) so the C ABI can catch a panic with `catch_unwind` and
+# return an error value instead of killing the in-process Go gateway via CGO.
+# Every `#[no_mangle] extern "C"` entry point wraps its body — see ffi/mod.rs.
+panic = "unwind"
 strip = true

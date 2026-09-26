@@ -9,6 +9,13 @@ use std::os::raw::c_char;
 
 use crate::{convert_pdf_bytes_to_markdown, is_digital_pdf_bytes, ConversionOptions, MediaMode};
 
+/// Test-only switch that forces a panic inside `pdf2md_convert_impl`, proving
+/// that `catch_ffi` turns an FFI panic into the entry's error return. Compiled
+/// out of release builds.
+#[cfg(test)]
+pub(crate) static FORCE_CONVERT_PANIC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn cstring_into_raw(s: String) -> *mut c_char {
     match CString::new(s) {
         Ok(c) => c.into_raw(),
@@ -16,6 +23,30 @@ pub(crate) fn cstring_into_raw(s: String) -> *mut c_char {
             .map(|c| c.into_raw())
             .unwrap_or(std::ptr::null_mut()),
     }
+}
+
+/// Run an FFI entry body, converting a Rust panic into `fallback` instead of
+/// letting it unwind across the C ABI.
+///
+/// With the previous `panic = "abort"` release profile any panic aborted the
+/// host process (the Go gateway, via CGO). The release profile is now
+/// `panic = "unwind"`, so every `#[no_mangle] pub extern "C"` entry point wraps
+/// its body here: a panic becomes the same error value the entry already
+/// returns on failure (error JSON / null pointer / 0 / empty string), which the
+/// gateway already handles as a conversion error. `AssertUnwindSafe` is sound
+/// at this boundary because a panicking call is abandoned, not reused.
+fn catch_ffi<R>(fallback: impl FnOnce() -> R, body: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(value) => value,
+        Err(_) => fallback(),
+    }
+}
+
+/// The error JSON already used for conversion failures, for a caught panic.
+fn ffi_panic_error(entry: &str) -> *mut c_char {
+    cstring_into_raw(
+        serde_json::json!({ "ok": false, "error": format!("internal panic in {entry}") }).to_string(),
+    )
 }
 
 /// Converts PDF bytes to Markdown and returns the result as a heap-allocated JSON
@@ -29,7 +60,10 @@ pub(crate) fn cstring_into_raw(s: String) -> *mut c_char {
 ///   { "ok": false, "error": "..." }
 #[no_mangle]
 pub extern "C" fn pdf2md_convert(pdf_ptr: *const u8, pdf_len: usize) -> *mut c_char {
-    pdf2md_convert_impl(pdf_ptr, pdf_len, None, None, None)
+    catch_ffi(
+        || ffi_panic_error("pdf2md_convert"),
+        || pdf2md_convert_impl(pdf_ptr, pdf_len, None, None, None),
+    )
 }
 
 /// Same as `pdf2md_convert`, but with an explicit `detect_vectors` flag
@@ -41,7 +75,10 @@ pub extern "C" fn pdf2md_convert_ex(
     pdf_len: usize,
     detect_vectors: i32,
 ) -> *mut c_char {
-    pdf2md_convert_impl(pdf_ptr, pdf_len, Some(detect_vectors != 0), None, None)
+    catch_ffi(
+        || ffi_panic_error("pdf2md_convert_ex"),
+        || pdf2md_convert_impl(pdf_ptr, pdf_len, Some(detect_vectors != 0), None, None),
+    )
 }
 
 /// Same as `pdf2md_convert_ex`, but with an additional explicit `no_media`
@@ -56,16 +93,21 @@ pub extern "C" fn pdf2md_convert_ex2(
     detect_vectors: i32,
     no_media: i32,
 ) -> *mut c_char {
-    pdf2md_convert_impl(
-        pdf_ptr,
-        pdf_len,
-        Some(detect_vectors != 0),
-        if no_media != 0 {
-            Some(MediaMode::None)
-        } else {
-            None
+    catch_ffi(
+        || ffi_panic_error("pdf2md_convert_ex2"),
+        || {
+            pdf2md_convert_impl(
+                pdf_ptr,
+                pdf_len,
+                Some(detect_vectors != 0),
+                if no_media != 0 {
+                    Some(MediaMode::None)
+                } else {
+                    None
+                },
+                None,
+            )
         },
-        None,
     )
 }
 
@@ -83,18 +125,23 @@ pub extern "C" fn pdf2md_convert_ex3(
     detect_vectors: i32,
     media_mode: i32,
 ) -> *mut c_char {
-    pdf2md_convert_impl(
-        pdf_ptr,
-        pdf_len,
-        Some(detect_vectors != 0),
-        Some(match media_mode {
-            0 => MediaMode::None,
-            2 => MediaMode::Embed,
-            // 1, and any unrecognized value, use the middle policy: extract
-            // the `media` side-channel but inline no `data:` URIs.
-            _ => MediaMode::Reference,
-        }),
-        None,
+    catch_ffi(
+        || ffi_panic_error("pdf2md_convert_ex3"),
+        || {
+            pdf2md_convert_impl(
+                pdf_ptr,
+                pdf_len,
+                Some(detect_vectors != 0),
+                Some(match media_mode {
+                    0 => MediaMode::None,
+                    2 => MediaMode::Embed,
+                    // 1, and any unrecognized value, use the middle policy: extract
+                    // the `media` side-channel but inline no `data:` URIs.
+                    _ => MediaMode::Reference,
+                }),
+                None,
+            )
+        },
     )
 }
 
@@ -112,18 +159,23 @@ pub extern "C" fn pdf2md_convert_ex4(
     media_mode: i32,
     page_markers: i32,
 ) -> *mut c_char {
-    pdf2md_convert_impl(
-        pdf_ptr,
-        pdf_len,
-        Some(detect_vectors != 0),
-        Some(match media_mode {
-            0 => MediaMode::None,
-            2 => MediaMode::Embed,
-            // 1, and any unrecognized value, use the middle policy: extract
-            // the `media` side-channel but inline no `data:` URIs.
-            _ => MediaMode::Reference,
-        }),
-        Some(page_markers != 0),
+    catch_ffi(
+        || ffi_panic_error("pdf2md_convert_ex4"),
+        || {
+            pdf2md_convert_impl(
+                pdf_ptr,
+                pdf_len,
+                Some(detect_vectors != 0),
+                Some(match media_mode {
+                    0 => MediaMode::None,
+                    2 => MediaMode::Embed,
+                    // 1, and any unrecognized value, use the middle policy: extract
+                    // the `media` side-channel but inline no `data:` URIs.
+                    _ => MediaMode::Reference,
+                }),
+                Some(page_markers != 0),
+            )
+        },
     )
 }
 
@@ -134,6 +186,10 @@ fn pdf2md_convert_impl(
     media_mode_override: Option<MediaMode>,
     page_markers_override: Option<bool>,
 ) -> *mut c_char {
+    #[cfg(test)]
+    if FORCE_CONVERT_PANIC.load(std::sync::atomic::Ordering::Relaxed) {
+        panic!("test-only forced panic");
+    }
     let json = if pdf_ptr.is_null() {
         serde_json::json!({ "ok": false, "error": "null input pointer" })
     } else {
@@ -219,32 +275,45 @@ fn pdf2md_convert_impl(
 /// Returns 1 when a digital text layer is present, 0 otherwise.
 #[no_mangle]
 pub extern "C" fn pdf2md_is_digital(pdf_ptr: *const u8, pdf_len: usize) -> i32 {
-    if pdf_ptr.is_null() {
-        return 0;
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(pdf_ptr, pdf_len) };
-    if is_digital_pdf_bytes(bytes) {
-        1
-    } else {
-        0
-    }
+    catch_ffi(
+        || 0,
+        || {
+            if pdf_ptr.is_null() {
+                return 0;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(pdf_ptr, pdf_len) };
+            if is_digital_pdf_bytes(bytes) {
+                1
+            } else {
+                0
+            }
+        },
+    )
 }
 
 /// Frees a heap-allocated C string returned by `pdf2md_convert` / `pdf2md_version`.
 #[no_mangle]
 pub extern "C" fn pdf2md_free_string(ptr: *mut c_char) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        drop(CString::from_raw(ptr));
-    }
+    catch_ffi(
+        || (),
+        || {
+            if ptr.is_null() {
+                return;
+            }
+            unsafe {
+                drop(CString::from_raw(ptr));
+            }
+        },
+    );
 }
 
 /// Returns the engine version as a heap-allocated C string (caller frees it).
 #[no_mangle]
 pub extern "C" fn pdf2md_version() -> *mut c_char {
-    cstring_into_raw(env!("CARGO_PKG_VERSION").to_string())
+    catch_ffi(
+        || cstring_into_raw(String::new()),
+        || cstring_into_raw(env!("CARGO_PKG_VERSION").to_string()),
+    )
 }
 
 /// Computes a 64-bit perceptual hash (DCT-pHash) of an encoded image buffer
@@ -254,14 +323,19 @@ pub extern "C" fn pdf2md_version() -> *mut c_char {
 #[cfg(feature = "vision")]
 #[no_mangle]
 pub extern "C" fn pdf2md_perceptual_hash(img_ptr: *const u8, img_len: usize) -> *mut c_char {
-    if img_ptr.is_null() {
-        return cstring_into_raw(String::new());
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(img_ptr, img_len) };
-    let out = crate::phash::perceptual_hash_64(bytes)
-        .map(|h| format!("{:016x}", h))
-        .unwrap_or_default();
-    cstring_into_raw(out)
+    catch_ffi(
+        || cstring_into_raw(String::new()),
+        || {
+            if img_ptr.is_null() {
+                return cstring_into_raw(String::new());
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(img_ptr, img_len) };
+            let out = crate::phash::perceptual_hash_64(bytes)
+                .map(|h| format!("{:016x}", h))
+                .unwrap_or_default();
+            cstring_into_raw(out)
+        },
+    )
 }
 
 /// Computes a whole-document perceptual signature from raw PDF bytes: one 64-bit
@@ -276,21 +350,26 @@ pub extern "C" fn pdf2md_vision_signature(
     pdf_len: usize,
     max_pages: i32,
 ) -> *mut c_char {
-    if pdf_ptr.is_null() {
-        return cstring_into_raw(String::new());
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(pdf_ptr, pdf_len) };
-    let sig = match lopdf::Document::load_mem_with_options(
-        bytes,
-        lopdf::LoadOptions::with_max_decompressed_size(crate::MAX_DECOMPRESSED_STREAM),
-    ) {
-        Ok(doc) => {
-            let cap = if max_pages > 0 { max_pages as usize } else { 8 };
-            crate::phash::vision_signature(&doc, cap)
-        }
-        Err(_) => String::new(),
-    };
-    cstring_into_raw(sig)
+    catch_ffi(
+        || cstring_into_raw(String::new()),
+        || {
+            if pdf_ptr.is_null() {
+                return cstring_into_raw(String::new());
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(pdf_ptr, pdf_len) };
+            let sig = match lopdf::Document::load_mem_with_options(
+                bytes,
+                lopdf::LoadOptions::with_max_decompressed_size(crate::MAX_DECOMPRESSED_STREAM),
+            ) {
+                Ok(doc) => {
+                    let cap = if max_pages > 0 { max_pages as usize } else { 8 };
+                    crate::phash::vision_signature(&doc, cap)
+                }
+                Err(_) => String::new(),
+            };
+            cstring_into_raw(sig)
+        },
+    )
 }
 
 #[cfg(test)]
