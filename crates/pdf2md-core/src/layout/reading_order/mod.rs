@@ -162,3 +162,7 @@ mod paragraph_merge_tests;
 
 #[cfg(test)]
 mod column_band_tests;
+#[cfg(test)]
+mod column_band_tests_common;
+#[cfg(test)]
+mod column_band_tests_part2;

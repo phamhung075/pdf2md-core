@@ -221,3 +221,7 @@ pub(crate) const MAX_PAGE_CONTENT_TOTAL: usize = 64 << 20;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_common;
+#[cfg(test)]
+mod tests_part2;

@@ -93,3 +93,13 @@ pub const ENCRYPTED_PDF_ERROR: &str = "encrypted PDF: password required";
 
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod regression_tests_common;
+#[cfg(test)]
+mod regression_tests_common2;
+#[cfg(test)]
+mod regression_tests_part2;
+#[cfg(test)]
+mod regression_tests_part3;
+#[cfg(test)]
+mod regression_tests_part4;

@@ -27,3 +27,7 @@ use crate::models::BoundingBox;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_common;
+#[cfg(test)]
+mod tests_part2;

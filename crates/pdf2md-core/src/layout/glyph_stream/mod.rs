@@ -163,3 +163,9 @@ pub(crate) struct ContentSignals {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_common;
+#[cfg(test)]
+mod tests_part2;
+#[cfg(test)]
+mod tests_part3;
