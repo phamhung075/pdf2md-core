@@ -5,7 +5,7 @@
 //! Stage 3 & Stage 3b ruler scanning, grid alignment, and column corridor analysis.
 
 use crate::layout::glyph_stream::Span;
-use crate::layout::reading_order::{detect_column_bands, ColumnBand};
+use crate::layout::reading_order::{detect_column_bands_for_tables, ColumnBand};
 use crate::layout::tables::consolidation::{bucket, bucket_rows_content_aware, bucket_words, consolidate_table_rows, merge_complementary_columns};
 use crate::layout::tables::validation::{has_data_tokens, is_tabular_rows};
 use crate::models::BoundingBox;
@@ -1480,7 +1480,7 @@ fn scan_aligned_grids_banded(
     if lines.len() < 2 {
         return Vec::new();
     }
-    let bands = detect_column_bands(lines);
+    let bands = detect_column_bands_for_tables(lines);
     if bands.iter().all(|b| matches!(b, ColumnBand::Full(_))) {
         return scan_aligned_grids_opts(lines, tol_mult, covered, wide_ok);
     }
@@ -1512,6 +1512,7 @@ fn scan_aligned_grids_banded(
         let streams: Vec<Vec<Vec<Span>>> = match band {
             ColumnBand::Full(rows) => vec![rows],
             ColumnBand::Columns { left, right } => vec![left, right],
+            ColumnBand::Stacks(columns) => columns,
         };
         for stream in streams {
             if stream.len() < 2 {

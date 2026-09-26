@@ -593,7 +593,12 @@ fn read_order_segmented(lines: &[Vec<Span>]) -> Vec<Vec<Vec<Span>>> {
     // line-by-line. `detect_column_bands` recovers each such block
     // independently instead of requiring one page-wide layout.
     let bands = detect_column_bands(lines);
-    if bands.len() > 1 || matches!(bands.first(), Some(ColumnBand::Columns { .. })) {
+    if bands.len() > 1
+        || matches!(
+            bands.first(),
+            Some(ColumnBand::Columns { .. } | ColumnBand::Stacks(_))
+        )
+    {
         let mut streams = Vec::new();
         for band in bands {
             match band {
@@ -602,6 +607,7 @@ fn read_order_segmented(lines: &[Vec<Span>]) -> Vec<Vec<Vec<Span>>> {
                     streams.push(left);
                     streams.push(right);
                 }
+                ColumnBand::Stacks(columns) => streams.extend(columns),
             }
         }
         return streams;
@@ -620,6 +626,19 @@ pub enum ColumnBand {
         left: Vec<Vec<Span>>,
         right: Vec<Vec<Span>>,
     },
+    /// Three or more *staggered* side-by-side columns (unlike
+    /// [`ColumnBand::Columns`], which is always the fixed two-column pair),
+    /// already resolved into independent top-to-bottom streams ordered
+    /// left-to-right.
+    ///
+    /// A staggered block has no gutter that runs across the whole region: each
+    /// column keeps its own baselines, so a row in one column sits between two
+    /// rows of a neighbour. The running-gutter pass needs a gutter consistent
+    /// across several rows and the vertical projection needs a corridor clear
+    /// on both sides, so neither can see the block; the rows stay `Full` and
+    /// the plain top-to-bottom order threads one column's line between another
+    /// column's pair. A bilingual heading header is the motivating shape.
+    Stacks(Vec<Vec<Vec<Span>>>),
 }
 
 /// Median gutter x (midpoint between left/right content) of the `Split`
@@ -1204,6 +1223,19 @@ fn multi_column_projection(lines: &[Vec<Span>]) -> Option<MultiColumnRegion> {
 /// restored to their original single-line form and folded back into the
 /// surrounding `Full` block.
 pub fn detect_column_bands(lines: &[Vec<Span>]) -> Vec<ColumnBand> {
+    detect_column_bands_opts(lines, true)
+}
+
+/// [`detect_column_bands`] without the staggered-stack pass, for the table
+/// scanner. Re-banding a page's lines into staggered columns is a *rendering*
+/// decision: the scanner works on the page's own geometry, and splitting a
+/// wrapped-cell table into columns along its cell gutters hides the grid from
+/// the banded aligned-grid scan.
+pub(crate) fn detect_column_bands_for_tables(lines: &[Vec<Span>]) -> Vec<ColumnBand> {
+    detect_column_bands_opts(lines, false)
+}
+
+fn detect_column_bands_opts(lines: &[Vec<Span>], allow_stacks: bool) -> Vec<ColumnBand> {
     enum RunItem {
         Split {
             left: Vec<Span>,
@@ -1431,32 +1463,236 @@ pub fn detect_column_bands(lines: &[Vec<Span>]) -> Vec<ColumnBand> {
     let mut out: Vec<ColumnBand> = Vec::new();
     for band in bands {
         match band {
-            ColumnBand::Columns { .. } => out.push(band),
-            ColumnBand::Full(rows) => project_full_band(rows, &mut out),
+            ColumnBand::Columns { .. } | ColumnBand::Stacks(_) => out.push(band),
+            ColumnBand::Full(rows) => project_full_band(rows, allow_stacks, &mut out),
         }
     }
     out
 }
 
-/// Recursively peel two-column projection regions out of one `Full` band.
+/// Recover a *staggered* multi-column region: three or more spatially disjoint
+/// columns whose rows keep their own baselines, so no single gutter runs across
+/// the block and neither the running-gutter pass nor the vertical projection can
+/// see it.
+///
+/// A bilingual e-ticket header is the motivating shape. The French heading and
+/// its English translation sit one above the other in a narrow column, a
+/// neighbouring heading pair does the same alongside it, and the columns'
+/// baselines interleave (column 1 line 1, column 2 line 1, column 3 line 1,
+/// column 1 line 2, ...). Merging the runs by baseline welds those into
+/// spurious rows, and the plain top-to-bottom order then threads one column's
+/// second line between a neighbour's pair. Split each row into its visual
+/// segments, cluster the segments by horizontal extent, and when the clusters
+/// form staggered columns emit each column top-to-bottom, left-to-right.
+///
+/// The window with the most columns wins (a bridging full-width row merges two
+/// columns into one and lowers the count, so it is naturally excluded), then
+/// the longest such window. Returns `(start, end, columns)`.
+fn staggered_columns_region(rows: &[Vec<Span>]) -> Option<(usize, usize, Vec<Vec<Vec<Span>>>)> {
+    const MIN_STACK_ROWS: usize = 3;
+    const MAX_STACK_WINDOW: usize = 8;
+    if rows.len() < MIN_STACK_ROWS {
+        return None;
+    }
+    let body = body_size_for(rows).max(1.0);
+    let merge_gap = 0.6 * body;
+    let max_spread = 2.5 * body;
+    let segs: Vec<Vec<Vec<Span>>> = rows.iter().map(|r| split_line_segments(r)).collect();
+
+    // Only a row that itself splits into >= 2 segments can anchor a staggered
+    // block: the block's first row must carry at least two of its columns.
+    let mut best: Option<(usize, usize, Vec<Vec<Vec<Span>>>)> = None;
+    for s in 0..rows.len() {
+        if segs[s].len() < 2 {
+            continue;
+        }
+        let last = (s + MAX_STACK_WINDOW).min(rows.len() - 1);
+        for e in (s + MIN_STACK_ROWS - 1)..=last {
+            if let Some(cols) = staggered_window_columns(&segs[s..=e], merge_gap, max_spread) {
+                let key = (cols.len(), e - s + 1);
+                let better = best
+                    .as_ref()
+                    .map_or(true, |b| key > (b.2.len(), b.1 - b.0 + 1));
+                if better {
+                    best = Some((s, e, cols));
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Cluster one candidate window's visual segments into columns by horizontal
+/// extent, or `None` when the window is not a staggered multi-column block.
+fn staggered_window_columns(
+    segs: &[Vec<Vec<Span>>],
+    merge_gap: f64,
+    max_spread: f64,
+) -> Option<Vec<Vec<Vec<Span>>>> {
+    // A staggered stack is a block of consecutive rows that *each* carry pieces
+    // of two or more columns: the columns' baselines interleave, the line
+    // builder welds a column's fragment to a neighbour's, and every resulting
+    // row is still multi-column. A region that merely contains a few
+    // multi-column rows among single-column rows is an ordinary multi-zone
+    // layout (e.g. an invoice header with full-width fields between its zones)
+    // whose logical lines the plain order already keeps together; re-banding it
+    // would split them apart. Requiring every row of the window to split into
+    // >= 2 segments separates the two.
+    if segs.iter().any(|row| row.len() < 2) {
+        return None;
+    }
+    const MAX_STACK_COLS: usize = 6;
+    struct Item {
+        x0: f64,
+        x1: f64,
+        y: f64,
+        seg: Vec<Span>,
+    }
+    let mut items: Vec<Item> = Vec::new();
+    for row in segs {
+        for seg in row {
+            let x0 = seg.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+            let x1 = seg.iter().map(|p| p.x + p.advance).fold(f64::NEG_INFINITY, f64::max);
+            if x0.is_finite() && x1.is_finite() && x1 > x0 {
+                items.push(Item { x0, x1, y: seg[0].y, seg: seg.clone() });
+            }
+        }
+    }
+    if items.len() < 4 {
+        return None;
+    }
+    // 1-D interval cluster of the segments' x extents. Segments of one column
+    // overlap (or nearly touch) and merge; a real inter-column gutter is wider
+    // than `merge_gap`.
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by(|&a, &b| {
+        items[a].x0.partial_cmp(&items[b].x0).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut bounds: Vec<(f64, f64)> = Vec::new();
+    for &i in &order {
+        match bounds.last_mut() {
+            Some(c) if items[i].x0 - c.1 <= merge_gap => c.1 = c.1.max(items[i].x1),
+            _ => bounds.push((items[i].x0, items[i].x1)),
+        }
+    }
+    // Three or more disjoint x-clusters. A two-column arrangement is the
+    // territory of the existing running-gutter / projection passes; requiring a
+    // third column is what keeps a two-column prose block (one flowing run cut
+    // by a recurring gap, or a genuine sidebar) from being re-banded here.
+    if bounds.len() < 3 || bounds.len() > MAX_STACK_COLS {
+        return None;
+    }
+    // Assign each segment to the column it overlaps most; every column must
+    // carry at least two rows, or it is not a column but a stray.
+    let mut cols: Vec<Vec<Vec<Span>>> = vec![Vec::new(); bounds.len()];
+    let mut counts = vec![0usize; bounds.len()];
+    let mut seq: Vec<(f64, usize)> = Vec::new();
+    for it in &items {
+        let mut best_ci = None;
+        let mut best_overlap = 0.0f64;
+        for (ci, &(c0, c1)) in bounds.iter().enumerate() {
+            let overlap = (it.x1.min(c1) - it.x0.max(c0)).max(0.0);
+            if overlap > best_overlap {
+                best_overlap = overlap;
+                best_ci = Some(ci);
+            }
+        }
+        let ci = best_ci?;
+        counts[ci] += 1;
+        seq.push((it.y, ci));
+        cols[ci].push(it.seg.clone());
+    }
+    // Every column is a *pair*: the French line and its English translation,
+    // exactly two rows each. A three-or-more-row column is an invoice header
+    // block or a prose fragment, not a heading pair, and re-banding it would
+    // reorder content the plain order already had right.
+    if counts.iter().any(|&n| n != 2) {
+        return None;
+    }
+    // A real column's rows share a starting edge. When a recurring gap cuts one
+    // flowing block in two, the fragments' start x jumps with the sentence
+    // (verified 100-360pt on `enedis_hp_hc` against 0-21pt on the bilingual
+    // e-ticket header), so a bounded spread keeps the re-banding from
+    // transposing prose.
+    if cols.iter().any(|c| column_start_spread(c) > max_spread) {
+        return None;
+    }
+    // Columns must be *staggered*, not a table grid. A table's columns share
+    // every row baseline (that is what makes it a grid); a bilingual stack's
+    // columns keep their own baselines and interleave. For every pair, at most
+    // half of the shorter column's rows may share a baseline — a grid fails
+    // this on every pair, while the header's two neighbouring columns share at
+    // most the one row the line builder merged across the gutter.
+    let tol = 1.2;
+    let ys: Vec<Vec<f64>> = cols
+        .iter()
+        .map(|c| c.iter().map(|s| s[0].y).collect())
+        .collect();
+    for a in 0..ys.len() {
+        for b in (a + 1)..ys.len() {
+            let shared = ys[a]
+                .iter()
+                .filter(|&&ya| ys[b].iter().any(|&yb| (ya - yb).abs() <= tol))
+                .count();
+            if shared * 2 > ys[a].len().min(ys[b].len()) {
+                return None;
+            }
+        }
+    }
+    for c in &mut cols {
+        c.sort_by(|a, b| b[0].y.partial_cmp(&a[0].y).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    // Only a *staggered* block needs this re-banding. If the rows already fall
+    // column-by-column in the plain top-to-bottom order (a two-column page
+    // whose left column simply precedes the right), column-major equals the
+    // plain order and splitting would only add spurious breaks.
+    seq.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let transitions = seq.windows(2).filter(|w| w[0].1 != w[1].1).count();
+    if transitions < cols.len() {
+        return None;
+    }
+    Some(cols)
+}
+
+/// Recursively peel two-column projection regions out of one `Full` band, then
+/// (when `allow_stacks`) a staggered multi-column region.
 ///
 /// [`projection_columns_region`] returns only the longest region, and a single
 /// `Full` band can hold several independent two-column blocks (the bilingual
 /// AVANT/PENDANT/APRÈS blocks share one band). Peel one region, then recurse on
 /// the rows before and after it; a slice with no region stays a `Full` band.
-fn project_full_band(rows: Vec<Vec<Span>>, out: &mut Vec<ColumnBand>) {
-    match projection_columns_region(&rows) {
-        Some((start, end, left, right)) => {
-            if start > 0 {
-                project_full_band(rows[..start].to_vec(), out);
-            }
-            out.push(ColumnBand::Columns { left, right });
-            if end + 1 < rows.len() {
-                project_full_band(rows[end + 1..].to_vec(), out);
-            }
+/// The staggered pass runs only when the projection found nothing on this band,
+/// and leaves its surroundings as plain `Full` rows rather than re-projecting
+/// them.
+fn project_full_band(rows: Vec<Vec<Span>>, allow_stacks: bool, out: &mut Vec<ColumnBand>) {
+    if let Some((start, end, left, right)) = projection_columns_region(&rows) {
+        if start > 0 {
+            project_full_band(rows[..start].to_vec(), allow_stacks, out);
         }
-        None => out.push(ColumnBand::Full(rows)),
+        out.push(ColumnBand::Columns { left, right });
+        if end + 1 < rows.len() {
+            project_full_band(rows[end + 1..].to_vec(), allow_stacks, out);
+        }
+        return;
     }
+    if allow_stacks {
+        if let Some((start, end, columns)) = staggered_columns_region(&rows) {
+            // The rows around the stack stay plain `Full` blocks. They are not
+            // re-projected: the projection already failed on this whole band
+            // (otherwise the branch above would have run), and re-running it on
+            // a sub-slice can find a region the full band did not and reorder
+            // the remainder.
+            if start > 0 {
+                out.push(ColumnBand::Full(rows[..start].to_vec()));
+            }
+            out.push(ColumnBand::Stacks(columns));
+            if end + 1 < rows.len() {
+                out.push(ColumnBand::Full(rows[end + 1..].to_vec()));
+            }
+            return;
+        }
+    }
+    out.push(ColumnBand::Full(rows));
 }
 
 /// Split `line` at every gap wide enough that `render_spans` would hard-break
@@ -1553,10 +1789,11 @@ pub(crate) fn push_line(
 /// (the common case: no column layout in this stretch of the page) renders
 /// byte-identically to walking the same lines one by one — `prev_line_y` and
 /// `list_state` carry through unchanged. A `Columns` band renders its left
-/// stream fully, then its right stream fully, each starting its own
-/// paragraph/list context (mirroring `render_human_order`'s stream loop) so
-/// column content recovered mid-page doesn't inherit spacing or list state
-/// from the unrelated column next to it.
+/// stream fully, then its right stream fully, and a `Stacks` band renders each
+/// of its columns left-to-right, each starting its own paragraph/list context
+/// (mirroring `render_human_order`'s stream loop) so column content recovered
+/// mid-page doesn't inherit spacing or list state from the unrelated column
+/// next to it.
 pub(crate) fn push_band_lines(
     out: &mut String,
     bands: &[ColumnBand],
@@ -1596,6 +1833,27 @@ pub(crate) fn push_band_lines(
                 *list_state = ListRunState::default();
                 for line in right {
                     push_line(out, line, prev_line_y, list_state, body_size);
+                }
+            }
+            ColumnBand::Stacks(columns) => {
+                for (ci, col) in columns.iter().enumerate() {
+                    // Paragraph break between two column streams (as in
+                    // `Columns`), so the reflow pass cannot weld the last line of
+                    // one column to the first line of the next. The first column
+                    // keeps the surrounding block's spacing state: the line
+                    // before the stack (a heading or body line) must still be
+                    // able to open a blank line before the stack's first line.
+                    if ci > 0 && !col.is_empty() {
+                        if !out.is_empty() && !out.ends_with('\n') {
+                            out.push('\n');
+                        }
+                        out.push('\n');
+                        *prev_line_y = None;
+                        *list_state = ListRunState::default();
+                    }
+                    for line in col {
+                        push_line(out, line, prev_line_y, list_state, body_size);
+                    }
                 }
             }
         }
@@ -3978,10 +4236,13 @@ mod column_band_tests {
                 assert!(rt[0].contains("Ra") && rt[0].contains("V1"), "header + row 1: {rt:?}");
             }
             ColumnBand::Full(_) => panic!("mixed prose/table block was merged instead of split"),
+            ColumnBand::Stacks(_) => panic!("mixed prose/table block was merged instead of split"),
         }
         match &bands[1] {
             ColumnBand::Full(rows) => assert_eq!(render_line_text(&rows[0]), "Heading"),
-            ColumnBand::Columns { .. } => panic!("a full-width heading must not be a column"),
+            ColumnBand::Columns { .. } | ColumnBand::Stacks(_) => {
+                panic!("a full-width heading must not be a column")
+            }
         }
     }
 
@@ -4219,12 +4480,15 @@ mod column_band_tests {
                 );
             }
             ColumnBand::Full(_) => panic!("narrow-gutter prose/grid block was merged"),
+            ColumnBand::Stacks(_) => panic!("narrow-gutter prose/grid block was merged"),
         }
         match &bands[0] {
             ColumnBand::Full(rows) => {
                 assert!(render_line_text(&rows[0]).contains("abcdefghij"))
             }
-            ColumnBand::Columns { .. } => panic!("full-width caption must not be a column"),
+            ColumnBand::Columns { .. } | ColumnBand::Stacks(_) => {
+                panic!("full-width caption must not be a column")
+            }
         }
     }
 
@@ -4379,6 +4643,69 @@ mod column_band_tests {
         );
     }
 
+    /// Regression for the bilingual e-ticket header whose columns are
+    /// *staggered*: a French heading and its English translation sit one above
+    /// the other in a narrow column, a neighbouring pair sits alongside, and
+    /// their baselines interleave. Merging runs by baseline welds the columns
+    /// into spurious rows, and the old top-to-bottom order threaded the English
+    /// half of the first pair ("PART ONE") between the second pair's French and
+    /// English halves. The staggered columns must be recovered and emitted
+    /// left-to-right, each pair together, French first.
+    #[test]
+    fn staggered_bilingual_heading_pairs_keep_each_pair_together() {
+        let lines = vec![
+            vec![sp("Preface line above the block", 37.0, 700.0)],
+            vec![
+                sp("SECTION ONE", 37.0, 665.3),
+                sp("LABEL TWO", 217.0, 666.1),
+            ],
+            vec![
+                sp("TRANSLATION TWO", 217.0, 653.0),
+                sp("SECTION THREE", 434.0, 657.7),
+            ],
+            vec![
+                sp("PART ONE", 37.0, 651.2),
+                sp("PART THREE", 454.0, 647.7),
+            ],
+            // A bridging row: one wide run across the first two columns. It
+            // must stay after the block rather than join a column.
+            vec![sp("A note that spans the first two columns", 37.0, 620.0)],
+        ];
+
+        // Flatten the page's streams, splitting each visual line back into its
+        // segments so a merged row's columns are compared individually. On the
+        // unfixed renderer the merged order is SECTION ONE, LABEL TWO,
+        // TRANSLATION TWO, SECTION THREE, PART ONE, PART THREE — the English
+        // half of the first pair lands between the second pair's halves.
+        let seq: Vec<String> = page_read_order(&lines)
+            .iter()
+            .flatten()
+            .flat_map(|l| {
+                render_line_text(l)
+                    .split('\n')
+                    .map(|s| s.trim().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let pos = |n: &str| {
+            seq.iter()
+                .position(|t| t == n)
+                .unwrap_or_else(|| panic!("missing {n:?} in {seq:?}"))
+        };
+        assert!(pos("SECTION ONE") < pos("PART ONE"), "first pair split: {seq:?}");
+        assert!(pos("PART ONE") < pos("LABEL TWO"), "first pair not kept together: {seq:?}");
+        assert!(pos("LABEL TWO") < pos("TRANSLATION TWO"), "label pair split: {seq:?}");
+        assert!(
+            pos("TRANSLATION TWO") < pos("SECTION THREE"),
+            "label pair not kept together: {seq:?}"
+        );
+        assert!(pos("SECTION THREE") < pos("PART THREE"), "second pair split: {seq:?}");
+        assert!(
+            pos("PART THREE") < pos("A note that spans the first two columns"),
+            "the bridging note must stay after the block: {seq:?}"
+        );
+    }
+
     /// Regression for `mustang_attributeBasedXMP_EN16931.pdf`: a single-column
     /// invoice page with a right-aligned amount column made the vertical-
     /// projection fallback read the page as two columns, so every amount was
@@ -4503,6 +4830,9 @@ mod column_band_tests {
                 assert!(rt[0].contains("Accès") && rt[1].contains("bailleur"), "{rt:?}");
             }
             ColumnBand::Full(_) => panic!("the fused list/box block was merged instead of split"),
+            ColumnBand::Stacks(_) => {
+                panic!("the fused list/box block was merged instead of split")
+            }
         }
         // And the flattened page order must read 1..5 before the box heading.
         let streams = page_read_order(&lines);
