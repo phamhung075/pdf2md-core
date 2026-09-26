@@ -62,7 +62,12 @@ pub(crate) fn decode_asciihex(data: &[u8]) -> Option<Vec<u8>> {
 
 pub(crate) fn decode_ascii85(data: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
-    let mut group: u32 = 0;
+    // Accumulate in `u64`: the largest five-digit group is 85^5 - 1 =
+    // 4_437_053_124, which exceeds `u32::MAX`. Per the ASCII85 spec such a group
+    // is invalid, so any accumulator value above `u32::MAX` is a decode error
+    // (returned as `None`, matching the other decoders' convention) rather than
+    // a wrapping `u32` overflow.
+    let mut group: u64 = 0;
     let mut count = 0usize;
     for &c in data {
         if c == b'~' {
@@ -75,26 +80,22 @@ pub(crate) fn decode_ascii85(data: &[u8]) -> Option<Vec<u8>> {
         if !(b'!'..=b'u').contains(&c) {
             continue;
         }
-        group = group * 85 + (c - b'!') as u32;
+        group = group * 85 + (c - b'!') as u64;
         count += 1;
         if count == 5 {
-            out.extend_from_slice(&group.to_be_bytes());
+            let value = u32::try_from(group).ok()?;
+            out.extend_from_slice(&value.to_be_bytes());
             group = 0;
             count = 0;
         }
     }
-    if count == 1 {
-        group = group.wrapping_mul(85u32.pow(4));
-        out.extend_from_slice(&group.to_be_bytes()[..1]);
-    } else if count == 2 {
-        group = group.wrapping_mul(85u32.pow(3));
-        out.extend_from_slice(&group.to_be_bytes()[..2]);
-    } else if count == 3 {
-        group = group.wrapping_mul(85u32.pow(2));
-        out.extend_from_slice(&group.to_be_bytes()[..3]);
-    } else if count == 4 {
-        group = group.wrapping_mul(85);
-        out.extend_from_slice(&group.to_be_bytes()[..4]);
+    if count > 0 {
+        // A trailing partial group is implicitly zero-padded on the right; the
+        // product stays below 2^32 for valid input, so the `u32` conversion
+        // only rejects the invalid oversized case. Output length is `count - 1`.
+        let padded = group * 85u64.pow((5 - count) as u32);
+        let value = u32::try_from(padded).ok()?;
+        out.extend_from_slice(&value.to_be_bytes()[..count - 1]);
     }
     Some(out)
 }
