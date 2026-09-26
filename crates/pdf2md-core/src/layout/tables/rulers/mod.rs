@@ -25,6 +25,26 @@ use crate::layout::tables::consolidation::{bucket, bucket_rows_content_aware, bu
 use crate::layout::tables::validation::{has_data_tokens, is_tabular_rows};
 use crate::models::BoundingBox;
 
+/// Ruler-alignment tolerance as a fraction of a row's font size, clamped
+/// between [`TOL_MIN_PT`] and [`TOL_MAX_PT`].
+pub(super) const TOL_SIZE_FRAC: f64 = 0.06;
+pub(super) const TOL_MIN_PT: f64 = 0.5;
+pub(super) const TOL_MAX_PT: f64 = 1.2;
+/// Minimum column gutter: [`MIN_GUTTER_SIZE_MULT`] × font size, floored at
+/// [`MIN_GUTTER_FLOOR_PT`].
+pub(super) const MIN_GUTTER_SIZE_MULT: f64 = 1.1;
+pub(super) const MIN_GUTTER_FLOOR_PT: f64 = 6.0;
+
+/// Per-row alignment tolerance in points for a row of `size` pt.
+pub(super) fn tol_for(size: f64) -> f64 {
+    (TOL_SIZE_FRAC * size).clamp(TOL_MIN_PT, TOL_MAX_PT)
+}
+
+/// Minimum gutter width in points for a table set in `size` pt.
+pub(super) fn min_gutter_for(size: f64) -> f64 {
+    (MIN_GUTTER_SIZE_MULT * size).max(MIN_GUTTER_FLOOR_PT)
+}
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

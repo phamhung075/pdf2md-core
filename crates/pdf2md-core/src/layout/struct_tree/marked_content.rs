@@ -25,10 +25,12 @@
 
 use super::*;
 
-pub(super) fn get_name<'a>(d: &'a Dictionary, key: &[u8]) -> Option<&'a [u8]> {
-    d.get(key).ok().and_then(|o| o.as_name().ok())
-}
+// One source of truth for reading a `/Name` entry (shared with `text_extract`).
+pub(super) use crate::text_extract::get_name;
 
+// NB: deliberately *not* shared with `text_extract::deref` — this reader uses a
+// 20-hop reference limit where the text extractor uses 16, so the two are kept
+// separate rather than silently changing structure-tree resolution depth.
 pub(super) fn deref<'d>(doc: &'d Document, obj: &'d Object) -> Option<&'d Object> {
     let mut cur = obj;
     for _ in 0..20 {

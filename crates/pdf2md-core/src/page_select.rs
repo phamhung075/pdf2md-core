@@ -6,6 +6,13 @@
 
 use super::*;
 
+/// Minimum number of words a tagged structure tree must resolve before it is
+/// preferred over the geometry fast path (guards against a near-empty tree).
+const STRUCT_TREE_MIN_WORDS: usize = 5;
+/// Minimum coverage of the geometry fast path's word count, in percent, for the
+/// structure tree to replace it.
+const STRUCT_TREE_COVERAGE_PCT: usize = 85;
+
 /// Extract one page's text, preferring our multilingual decoder and falling
 /// back to lopdf only when the page content cannot be parsed at all.
 ///
@@ -51,7 +58,9 @@ pub(super) fn select_page_text(
     let selected = if has_struct_tree {
         if let Some(tagged) = layout::extract_tagged_page(doc, page_id, options.detect_math) {
             let geo_words = geo.text.split_whitespace().count();
-            if tagged.words >= 5 && tagged.words * 100 >= 85 * geo_words {
+            if tagged.words >= STRUCT_TREE_MIN_WORDS
+                && tagged.words * 100 >= STRUCT_TREE_COVERAGE_PCT * geo_words
+            {
                 (
                     text_extract::PageText {
                         text: tagged.text,

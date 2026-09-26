@@ -40,7 +40,7 @@ pub(super) fn scan_aligned_grids_opts(
     let tol = tol_mult
         * info
             .iter()
-            .map(|r| (0.06 * r.size).clamp(0.5, 1.2))
+            .map(|r| tol_for(r.size))
             .fold(0.0f64, f64::max);
 
     // Vertical bands of consecutive rows that could sit in one grid (tight line pitch,
@@ -126,7 +126,7 @@ pub(super) fn scan_aligned_grids_opts(
                 if hi > lo + 1 {
                     let mid = hi - 1;
                     let mid_size = info[band[mid]].size;
-                    let mid_gutter = (1.1 * mid_size).max(6.0);
+                    let mid_gutter = min_gutter_for(mid_size);
                     if row_has_internal_gutter(&info[band[mid]].words, mid_gutter) {
                         break;
                     }
@@ -135,7 +135,7 @@ pub(super) fn scan_aligned_grids_opts(
                     .iter()
                     .map(|&i| info[i].size)
                     .fold(0.0f64, f64::max);
-                let min_gutter = (1.1 * max_size).max(6.0);
+                let min_gutter = min_gutter_for(max_size);
                 let rulers = table_rulers_opts(&info, tol, band[lo], band[hi], min_gutter, wide_ok);
                 let match_lo = rulers.iter().filter(|&&r| row_matches_ruler(&info[band[lo]], r, tol * 1.5)).count();
                 let match_hi = rulers.iter().filter(|&&r| row_matches_ruler(&info[band[hi]], r, tol * 1.5)).count();
@@ -165,7 +165,7 @@ pub(super) fn scan_aligned_grids_opts(
                 .iter()
                 .map(|&i| info[i].size)
                 .fold(0.0f64, f64::max);
-            let min_gutter = (1.1 * max_size).max(6.0);
+            let min_gutter = min_gutter_for(max_size);
             // Whether this seed is a genuinely multi-column grid (3+ rulers).
             // A 2-column label/value block has no separate right-aligned
             // amount column for a totals block to share, so it keeps the
@@ -187,7 +187,7 @@ pub(super) fn scan_aligned_grids_opts(
                 // totals block, so it keeps the original growth rule.
                 let member_size = info[band[lo]].size.max(info[next_ri].size).max(0.1);
                 let member_tol =
-                    (1.5 * tol_mult * (0.06 * member_size).clamp(0.5, 1.2)).min(tol * 1.5);
+                    (1.5 * tol_mult * tol_for(member_size)).min(tol * 1.5);
                 let established_match = rulers
                     .iter()
                     .filter(|&&r| row_matches_ruler(&info[next_ri], r, member_tol))
@@ -356,7 +356,7 @@ pub(super) fn scan_aligned_grids_opts(
                     .iter()
                     .map(|&i| info[i].size)
                     .fold(0.0f64, f64::max);
-                let min_gutter = (1.1 * max_size).max(6.0);
+                let min_gutter = min_gutter_for(max_size);
                 let ok_gutter = rulers.windows(2).all(|p| p[1] - p[0] >= min_gutter);
                 if !ok_gutter {
                     t(&format!(
