@@ -19,7 +19,15 @@ pub(super) fn downscale_rgba(rgba: &[u8], width: u32, height: u32, max_dim: u32)
     let new_w = ((width as f64 * scale).round() as u32).max(1);
     let new_h = ((height as f64 * scale).round() as u32).max(1);
 
-    let mut out = vec![0u8; new_w as usize * new_h as usize * 4];
+    // Checked product: a 32-bit wasm32 `usize` could otherwise wrap here. On
+    // overflow (not reachable after the pixel guards) leave the image as-is.
+    let Some(out_len) = (new_w as usize)
+        .checked_mul(new_h as usize)
+        .and_then(|n| n.checked_mul(4))
+    else {
+        return (rgba.to_vec(), width, height);
+    };
+    let mut out = vec![0u8; out_len];
     for oy in 0..new_h {
         let y0 = (oy as u64 * height as u64 / new_h as u64) as u32;
         let y1 = (((oy + 1) as u64 * height as u64).div_ceil(new_h as u64)) as u32;
@@ -127,7 +135,8 @@ pub(super) fn decode_for_shrink(data: &[u8], format: &str) -> Option<(Vec<u8>, u
                 .ok()?
                 .into_dimensions()
                 .ok()?;
-            if w as usize * h as usize > crate::media::MAX_IMAGE_PIXELS {
+            // 64-bit product so the guard cannot wrap on 32-bit wasm32.
+            if (w as u64) * (h as u64) > crate::media::MAX_IMAGE_PIXELS as u64 {
                 return None;
             }
             let img = image::load_from_memory(data).ok()?;

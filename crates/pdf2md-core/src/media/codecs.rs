@@ -224,7 +224,9 @@ pub(crate) fn decode_png_rgba(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     if bit_depth != 8 || color_type != 6 || interlace != 0 {
         return None;
     }
-    if width as usize * height as usize > super::MAX_IMAGE_PIXELS {
+    // 64-bit pixel count: on 32-bit wasm32 a `width * height` in `usize` could
+    // wrap and slip past this guard.
+    if (width as u64) * (height as u64) > super::MAX_IMAGE_PIXELS as u64 {
         return None;
     }
     let stride = width as usize * 4;
@@ -233,7 +235,8 @@ pub(crate) fn decode_png_rgba(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     if raw.len() < expected {
         return None;
     }
-    let mut out = vec![0u8; stride * height as usize];
+    let out_len = stride.checked_mul(height as usize)?;
+    let mut out = vec![0u8; out_len];
     let mut prev = vec![0u8; stride];
     for y in 0..height as usize {
         let row = &raw[y * (stride + 1)..];

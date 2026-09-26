@@ -380,7 +380,8 @@ pub fn probe_stream(xobj: &Object) -> Option<(u32, u32, String)> {
     }
     // Reject an oversized declaration before any inflated sample or RGBA buffer
     // is allocated; the pixel count is the true memory driver, not the box.
-    if width as usize * height as usize > super::MAX_IMAGE_PIXELS {
+    // 64-bit product so the guard cannot wrap on 32-bit wasm32.
+    if (width as u64) * (height as u64) > super::MAX_IMAGE_PIXELS as u64 {
         return None;
     }
     let filters = stream_filters(s);

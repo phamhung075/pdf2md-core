@@ -161,7 +161,8 @@ pub(super) fn parse_inline_image(
     }
     // Reject an oversized declaration before any inflated sample or RGBA buffer
     // is allocated; the pixel count is the true memory driver, not the box.
-    if width as usize * height as usize > crate::media::MAX_IMAGE_PIXELS {
+    // 64-bit product so the guard cannot wrap on 32-bit wasm32.
+    if (width as u64) * (height as u64) > crate::media::MAX_IMAGE_PIXELS as u64 {
         return None;
     }
     let bpc = get(b"BPC")
@@ -194,8 +195,11 @@ pub(super) fn parse_inline_image(
     let start = *j;
     let data_len = match &filter {
         None => {
-            let stride = (width as usize * (comps as usize * bpc as usize)).div_ceil(8);
-            height as usize * stride
+            // 64-bit stride × height so the sample span cannot wrap on 32-bit
+            // wasm32; an unrepresentable span is treated as an unusable image.
+            let stride = (width as u64 * (comps as u64 * bpc as u64)).div_ceil(8);
+            let total = stride.checked_mul(height as u64)?;
+            usize::try_from(total).ok()?
         }
         Some(_) => {
             // Filtered: samples run to the whitespace-delimited `EI`. Inflate

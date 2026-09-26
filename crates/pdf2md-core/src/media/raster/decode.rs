@@ -26,7 +26,8 @@ pub fn decode_xobject_bytes(
     }
     // Reject an oversized declaration before any inflated sample or RGBA buffer
     // is allocated; the pixel count is the true memory driver, not the box.
-    if width as usize * height as usize > crate::media::MAX_IMAGE_PIXELS {
+    // 64-bit product so the guard cannot wrap on 32-bit wasm32.
+    if (width as u64) * (height as u64) > crate::media::MAX_IMAGE_PIXELS as u64 {
         return None;
     }
     let filters = stream_filters(s);
@@ -170,16 +171,18 @@ pub(crate) fn expand_color_space(cs: &Object) -> Object {
 
 pub fn raster_to_rgba(doc: &Document, w: u32, h: u32, bits: u32, cs: &Object, data: &[u8]) -> Option<Vec<u8>> {
     // Allocation guard for direct callers too: `pixel × 4` RGBA is the big
-    // buffer, so refuse an oversized raster before computing `n`.
-    if w as usize * h as usize > crate::media::MAX_IMAGE_PIXELS {
+    // buffer, so refuse an oversized raster before computing `n`. The product is
+    // 64-bit so the guard cannot wrap on 32-bit wasm32.
+    if (w as u64) * (h as u64) > crate::media::MAX_IMAGE_PIXELS as u64 {
         return None;
     }
-    let n = w as usize * h as usize;
+    let n = (w as u64 * h as u64) as usize;
     if bits == 1 {
         let row_bytes = (w as usize + 7) / 8;
-        let need = row_bytes * h as usize;
+        let need = row_bytes.checked_mul(h as usize)?;
         let src = data.get(..need)?;
-        let mut rgba = Vec::with_capacity(n * 4);
+        let rgba_cap = n.checked_mul(4)?;
+        let mut rgba = Vec::with_capacity(rgba_cap);
         for r in 0..h as usize {
             for c in 0..w as usize {
                 let byte = src[r * row_bytes + c / 8];
