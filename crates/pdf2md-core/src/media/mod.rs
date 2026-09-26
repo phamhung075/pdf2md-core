@@ -111,4 +111,16 @@ mod tests {
         let text = String::from_utf8_lossy(&dec);
         assert!(text.contains("Man is distinguished"));
     }
+
+    #[test]
+    fn ascii85_rejects_group_above_u32_max() {
+        // Five 'u' digits = 85^5 - 1 = 4_437_053_124 > u32::MAX: an invalid
+        // group per the ASCII85 spec, which must be a decode error (not a
+        // wrapping `u32` value).
+        assert_eq!(decode_ascii85(b"uuuuu"), None);
+        // A trailing partial group whose padded value also exceeds u32::MAX.
+        assert_eq!(decode_ascii85(b"uuuu"), None);
+        // The largest valid full group (`s8W-!` = 0xFFFFFFFF) still decodes.
+        assert_eq!(decode_ascii85(b"s8W-!~>"), Some(vec![0xff, 0xff, 0xff, 0xff]));
+    }
 }

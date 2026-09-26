@@ -334,3 +334,26 @@
             );
         }
     }
+
+    /// A panic inside an FFI entry point must not unwind across the C ABI: the
+    /// release profile is `panic = "unwind"` and every entry wraps its body in
+    /// `catch_ffi`, so the caller sees the entry's normal error value. Forced
+    /// here with a `#[cfg(test)]` hook on the shared conversion path.
+    #[test]
+    fn ffi_panic_is_converted_to_error_json() {
+        FORCE_CONVERT_PANIC.store(true, std::sync::atomic::Ordering::SeqCst);
+        let ptr = pdf2md_convert(std::ptr::null(), 0);
+        FORCE_CONVERT_PANIC.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !ptr.is_null(),
+            "a caught panic must still return the error string, not a null pointer"
+        );
+        let json = unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() };
+        pdf2md_free_string(ptr);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("error JSON");
+        assert_eq!(v["ok"], serde_json::Value::Bool(false), "got {v}");
+        assert!(
+            v["error"].as_str().unwrap_or("").contains("panic"),
+            "error must name the caught panic: {v}"
+        );
+    }

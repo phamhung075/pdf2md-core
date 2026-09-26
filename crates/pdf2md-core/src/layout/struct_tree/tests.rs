@@ -353,3 +353,115 @@ BT\n/F1 12 Tf\n72 720 Td\nBDC /Span << /MCID 1 >>\n(First paragraph sentence one
                 .collect::<Vec<_>>()
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Untrusted /K and /Kids recursion bounds (cycle_parse / cycle_numtree).
+    // -----------------------------------------------------------------------
+
+    /// Single-page skeleton: font + "Hello cyclic world" content + page tree,
+    /// with a benign one-element structure tree whose `/K` and `/ParentTree` the
+    /// caller rewires into the malicious shape. Returns `(doc, elem_id,
+    /// root_id, parenttree_id)`.
+    fn cyclic_base() -> (Document, ObjectId, ObjectId, ObjectId) {
+        let mut doc = Document::with_version("1.4");
+        let font_id = doc.new_object_id();
+        let content_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let pages_id = doc.new_object_id();
+        let catalog_id = doc.new_object_id();
+        let root_id = doc.new_object_id();
+        let elem_id = doc.new_object_id();
+        let parenttree_id = doc.new_object_id();
+
+        doc.objects.insert(font_id, Object::Dictionary(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        }));
+        doc.objects.insert(content_id, Object::Stream(Stream::new(
+            dictionary! {},
+            b"BT /F1 12 Tf 72 720 Td (Hello cyclic world) Tj ET\n".to_vec(),
+        )));
+        doc.objects.insert(page_id, Object::Dictionary(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => Object::Array(vec![
+                Object::Integer(0), Object::Integer(0), Object::Integer(612), Object::Integer(792)]),
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            "Contents" => content_id,
+        }));
+        doc.objects.insert(pages_id, Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => refs(&[page_id]), "Count" => 1,
+        }));
+        doc.objects.insert(catalog_id, Object::Dictionary(dictionary! {
+            "Type" => "Catalog", "Pages" => pages_id, "StructTreeRoot" => root_id,
+        }));
+        doc.objects.insert(elem_id, Object::Dictionary(dictionary! {
+            "Type" => "StructElem", "S" => "P", "K" => Object::Array(vec![]),
+        }));
+        doc.objects.insert(parenttree_id, Object::Dictionary(dictionary! {
+            "Nums" => Object::Array(vec![Object::Integer(0), refs(&[elem_id])]),
+        }));
+        doc.objects.insert(root_id, Object::Dictionary(dictionary! {
+            "Type" => "StructTreeRoot", "K" => refs(&[elem_id]), "ParentTree" => parenttree_id,
+        }));
+        doc.trailer.set(b"Root", Object::Reference(catalog_id));
+        (doc, elem_id, root_id, parenttree_id)
+    }
+
+    /// Convert the in-memory document and require the page text to survive.
+    fn assert_cyclic_doc_converts(doc: &mut Document) -> String {
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        let res = crate::convert_pdf_bytes_to_markdown(&bytes, &crate::ConversionOptions::default())
+            .expect("a cyclic structure tree must not crash conversion");
+        assert!(
+            res.markdown.contains("Hello cyclic world"),
+            "page text must survive a cyclic structure tree: {}",
+            res.markdown
+        );
+        res.markdown
+    }
+
+    #[test]
+    fn cyclic_struct_tree_k_reference_does_not_crash() {
+        let (mut doc, elem_id, _root_id, _pt) = cyclic_base();
+        // `/K` points straight back at the StructElem that owns it.
+        if let Ok(d) = doc.get_dictionary_mut(elem_id) {
+            d.set(b"K", Object::Reference(elem_id));
+        }
+        assert_cyclic_doc_converts(&mut doc);
+    }
+
+    #[test]
+    fn cyclic_number_tree_kids_reference_does_not_crash() {
+        let (mut doc, _elem_id, root_id, _pt) = cyclic_base();
+        let numtree_id = doc.add_object(Object::Dictionary(dictionary! {
+            "Kids" => Object::Array(vec![]), "Limits" => ints(&[0, 0]),
+        }));
+        if let Ok(d) = doc.get_dictionary_mut(numtree_id) {
+            d.set(b"Kids", Object::Array(vec![Object::Reference(numtree_id)]));
+        }
+        if let Ok(d) = doc.get_dictionary_mut(root_id) {
+            d.set(b"ParentTree", Object::Reference(numtree_id));
+        }
+        assert_cyclic_doc_converts(&mut doc);
+    }
+
+    #[test]
+    fn deep_non_cyclic_struct_tree_chain_is_depth_bounded() {
+        let (mut doc, _elem_id, root_id, _pt) = cyclic_base();
+        // 4x the /K cap: a long but acyclic chain must stop at the depth cap
+        // rather than exhausting the stack.
+        let ids: Vec<ObjectId> = (0..MAX_STRUCT_TREE_DEPTH * 4).map(|_| doc.new_object_id()).collect();
+        for w in ids.windows(2) {
+            doc.objects.insert(w[0], Object::Dictionary(dictionary! {
+                "Type" => "StructElem", "S" => "P", "K" => w[1],
+            }));
+        }
+        let last = *ids.last().unwrap();
+        doc.objects.insert(last, Object::Dictionary(dictionary! {
+            "Type" => "StructElem", "S" => "P", "K" => Object::Array(vec![]),
+        }));
+        if let Ok(d) = doc.get_dictionary_mut(root_id) {
+            d.set(b"K", refs(&[*ids.first().unwrap()]));
+        }
+        assert_cyclic_doc_converts(&mut doc);
+    }
