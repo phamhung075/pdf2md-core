@@ -22,8 +22,8 @@ pub fn extract_page_glyphs(
     crate::text_extract::collect_fonts(doc, &chain, &mut raw_fonts);
     let has_fonts = !raw_fonts.is_empty();
 
-    let content: Content<Vec<Operation>> = crate::text_extract::decode_page_content(doc, page_id)
-        .map_err(|e| e.to_string())?;
+    let (content, content_truncated) =
+        crate::text_extract::decode_page_content_bounded(doc, page_id).map_err(|e| e.to_string())?;
 
     let (init_ctm, mut page_height, mut page_width) = page_display_size(doc, page_id);
 
@@ -266,6 +266,6 @@ pub fn extract_page_glyphs(
         has_fonts,
         tables: if table_rendered { hits.len() } else { 0 },
         blocks,
-        budget_exhausted: budget.exhausted,
+        budget_exhausted: budget.exhausted || content_truncated,
     })
 }

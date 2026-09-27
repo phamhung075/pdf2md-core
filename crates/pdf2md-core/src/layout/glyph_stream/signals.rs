@@ -7,18 +7,19 @@
 use super::*;
 
 #[allow(dead_code)]
-pub(crate) fn page_content_signals(doc: &Document, page_id: ObjectId) -> ContentSignals {
+pub(crate) fn page_content_signals(
+    doc: &Document,
+    page_id: ObjectId,
+    ops: &[Operation],
+) -> ContentSignals {
     let mut sig = ContentSignals::default();
-    let Ok(content) = crate::text_extract::decode_page_content(doc, page_id) else {
-        return sig;
-    };
     let chain = crate::text_extract::resource_dicts(doc, page_id);
     let mut budget = GlyphBudget::new();
     let mut form_path: Vec<ObjectId> = Vec::new();
     scan_content_signals(
         doc,
         &chain,
-        &content.operations,
+        ops,
         0,
         &mut form_path,
         &mut budget,

@@ -116,11 +116,25 @@ const MAX_FORM_DEPTH: usize = 8;
 const MAX_FORM_DO_PER_PAGE: usize = 16384;
 const MAX_FORM_OPS_TOTAL: usize = 8_000_000;
 const MAX_FORM_BYTES_TOTAL: usize = 64 << 20;
+/// Maximum number of positioned text spans accumulated for one page.
+///
+/// A page's spans are the dominant per-page allocation of the glyph engine, and
+/// a hostile content stream can pack one `Tj` per handful of decoded bytes: a
+/// 35 KB flate stream expands to 14 MB and ~650 k spans, reaching 1.9 GB RSS.
+/// This is a per-page cost backstop, not a content limit. The largest single-page
+/// span count measured across the 811-document corpus is 8 131, so 64 000 leaves
+/// roughly 8x headroom for any real page (dense multi-thousand-page documents
+/// included — pages are walked one at a time). When the cap trips, the walk
+/// stops adding spans and sets [`GlyphBudget::exhausted`] so the truncation is
+/// reported as `budget_exhausted` instead of being silent.
+const MAX_GLYPH_SPANS_PER_PAGE: usize = 64_000;
 
 struct GlyphBudget {
     do_left: usize,
     ops_left: usize,
     bytes_left: usize,
+    /// Spans still allowed on this page; decremented as runs are pushed.
+    spans_left: usize,
     /// Set when any bound above tripped, so a truncated page is reported.
     exhausted: bool,
 }

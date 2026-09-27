@@ -44,6 +44,17 @@ pub(crate) fn decode_page_content(
     doc: &Document,
     page_id: ObjectId,
 ) -> lopdf::Result<Content<Vec<Operation>>> {
+    decode_page_content_bounded(doc, page_id).map(|(content, _)| content)
+}
+
+/// [`decode_page_content`] that also reports whether the operator cap truncated
+/// the stream (see [`bound_page_content`]). The extraction paths use the flag to
+/// set `budget_exhausted`; the media/hash callers ignore it and get the same
+/// bounded content as before.
+pub(crate) fn decode_page_content_bounded(
+    doc: &Document,
+    page_id: ObjectId,
+) -> lopdf::Result<(Content<Vec<Operation>>, bool)> {
     let limit_err = || {
         lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded {
             limit: MAX_PAGE_CONTENT_TOTAL,
@@ -72,7 +83,11 @@ pub(crate) fn decode_page_content(
         }
         data.push(b'\n');
     }
-    decode_with_comment_fallback(&data)
+    // Bound the operator count *before* lopdf materialises one `Operation` per
+    // operator: the existing walker budgets run after decode and cannot stop the
+    // allocation (see `content_bound`).
+    let truncated = bound_page_content(&mut data);
+    Ok((decode_with_comment_fallback(&data)?, truncated))
 }
 
 pub(super) fn extract_page(
@@ -87,7 +102,7 @@ pub(super) fn extract_page(
     collect_fonts(doc, &chain, &mut fonts);
     let has_fonts = !fonts.is_empty();
 
-    let content: Content<Vec<Operation>> = match decode_page_content(doc, page_id) {
+    let (content, content_truncated) = match decode_page_content_bounded(doc, page_id) {
         Ok(c) => c,
         Err(e) => return (Err(format!("{e}")), GlyphCounts::default()),
     };
@@ -162,11 +177,12 @@ pub(super) fn extract_page(
     // (corpus files/corpus files/a corpus file). Keep these form-aware flags separate
     // from `legacy_geometry` so the newly routed pages still hit the
     // walker-vs-glyph digit-loss fallback below.
-    let sig = crate::layout::glyph_stream::page_content_signals(doc, page_id);
+    let sig = crate::layout::glyph_stream::page_content_signals(doc, page_id, &content.operations);
     // The routing signal scan shares the same family of bounds as the walkers;
     // a page whose signal scan was truncated may have been misrouted, so carry
-    // that fact into the page result too.
-    let signals_exhausted = sig.budget_exhausted;
+    // that fact into the page result too. `content_truncated` (the operator cap
+    // applied before decode) is reported the same way.
+    let signals_exhausted = sig.budget_exhausted || content_truncated;
     let form_geometry =
         (sig.has_tj_array || sig.has_tj_plain) && (sig.has_td_upper || sig.has_tm);
     let form_plain_td = sig.td_total >= 2 && sig.td_horizontal * 2 >= sig.td_total;

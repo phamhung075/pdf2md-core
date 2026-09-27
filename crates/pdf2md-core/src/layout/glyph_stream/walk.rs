@@ -42,6 +42,7 @@ impl GlyphBudget {
             do_left: MAX_FORM_DO_PER_PAGE,
             ops_left: MAX_FORM_OPS_TOTAL,
             bytes_left: MAX_FORM_BYTES_TOTAL,
+            spans_left: MAX_GLYPH_SPANS_PER_PAGE,
             exhausted: false,
         }
     }
@@ -209,14 +210,22 @@ pub(super) fn walk_glyphs(
                 {
                     let f = &fonts_info[ci];
                     let (codec, width, style) = (&f.codec, &f.widths, f.style);
-                    if let Some(dir) =
-                        push_span(codec, width, bytes, 0.0, &tm, &ctm, tfs, tc, tw, style, &mut spans)
-                    {
-                        let n = spans.last().map(|s| s.text.chars().count()).unwrap_or(0);
-                        if dir > 0 {
-                            vertical_up_chars += n;
-                        } else {
-                            vertical_down_chars += n;
+                    if budget.spans_left == 0 {
+                        budget.exhausted = true;
+                    } else {
+                        let before = spans.len();
+                        if let Some(dir) = push_span(
+                            codec, width, bytes, 0.0, &tm, &ctm, tfs, tc, tw, style, &mut spans,
+                        ) {
+                            let n = spans.last().map(|s| s.text.chars().count()).unwrap_or(0);
+                            if dir > 0 {
+                                vertical_up_chars += n;
+                            } else {
+                                vertical_down_chars += n;
+                            }
+                        }
+                        if spans.len() > before {
+                            budget.spans_left -= 1;
                         }
                     }
                     let w = width.width(bytes).unwrap_or(500.0 * bytes.len() as f64);
@@ -246,15 +255,24 @@ pub(super) fn walk_glyphs(
                 for item in arr {
                     match item {
                         Object::String(bytes, _) => {
-                            if let Some(dir) = push_span(
-                                codec, width, bytes, offset, &tm, &ctm, tfs, tc, tw, style,
-                                &mut spans,
-                            ) {
-                                let n = spans.last().map(|s| s.text.chars().count()).unwrap_or(0);
-                                if dir > 0 {
-                                    vertical_up_chars += n;
-                                } else {
-                                    vertical_down_chars += n;
+                            if budget.spans_left == 0 {
+                                budget.exhausted = true;
+                            } else {
+                                let before = spans.len();
+                                if let Some(dir) = push_span(
+                                    codec, width, bytes, offset, &tm, &ctm, tfs, tc, tw, style,
+                                    &mut spans,
+                                ) {
+                                    let n =
+                                        spans.last().map(|s| s.text.chars().count()).unwrap_or(0);
+                                    if dir > 0 {
+                                        vertical_up_chars += n;
+                                    } else {
+                                        vertical_down_chars += n;
+                                    }
+                                }
+                                if spans.len() > before {
+                                    budget.spans_left -= 1;
                                 }
                             }
                             let w = width.width(bytes).unwrap_or(500.0);

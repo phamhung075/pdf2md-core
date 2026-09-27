@@ -336,6 +336,32 @@ use super::regression_tests_common2::*;
         }
     }
 
+    /// M1: a content stream that packs one `(word) Tj` per glyph made lopdf
+    /// materialise 800 000 `Operation`s (~865 MB per decode, twice over) for a
+    /// 35 KB input. The per-page content-operator cap must truncate the raw
+    /// bytes before decode and report the truncation.
+    #[test]
+    fn many_glyph_page_is_operator_bounded_and_reports_truncation() {
+        let bytes = include_bytes!("../tests/fixtures/mem-glyph-amplification-1.87GB.pdf");
+        let result = convert_pdf_bytes_to_markdown(bytes, &ConversionOptions::default())
+            .expect("an operator-bounded conversion must still succeed");
+        assert!(
+            result.budget_exhausted,
+            "hitting the content-operator budget must set budget_exhausted so truncation is visible"
+        );
+    }
+
+    /// The smaller M2 repro aborted under the 1.6 GB address-space limit the
+    /// harness applies; the same content-operator cap must let it finish and
+    /// report the truncation.
+    #[test]
+    fn glyph_abort_repro_is_bounded_too() {
+        let bytes = include_bytes!("../tests/fixtures/mem-glyph-abort-under-1.6GB.pdf");
+        let result = convert_pdf_bytes_to_markdown(bytes, &ConversionOptions::default())
+            .expect("an operator-bounded conversion must still succeed");
+        assert!(result.budget_exhausted);
+    }
+
     /// O1 secondary guard: an all-zero `/W` consumes no bytes per xref entry, so
     /// the `/Index` (or `/Size`) count alone drives insertion into lopdf's map.
     /// It must be rejected as degenerate rather than allowed to insert billions

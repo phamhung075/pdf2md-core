@@ -49,6 +49,8 @@ mod page;
 pub use page::*;
 mod content_sanitize;
 use content_sanitize::*;
+mod content_bound;
+use content_bound::*;
 
 use std::collections::{BTreeMap, HashMap};
 
