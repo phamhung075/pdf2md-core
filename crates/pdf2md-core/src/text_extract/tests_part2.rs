@@ -242,6 +242,48 @@ use super::tests_common::*;
     }
 
     #[test]
+    fn extraction_strips_controls_bidi_and_noncharacters() {
+        // NUL and the C0 controls are dropped, but tab/newline/CR survive.
+        assert_eq!(normalize_decoded_text("\u{0000}A\u{0007}B"), "AB");
+        assert_eq!(
+            normalize_decoded_text("a\u{0009}b\u{000A}c\u{000D}d"),
+            "a\tb\nc\rd"
+        );
+        // DEL and the C1 controls are dropped.
+        assert_eq!(
+            normalize_decoded_text("x\u{007F}y\u{0085}z\u{009F}w"),
+            "xyzw"
+        );
+        // Bidi embedding/override/isolate controls and the zero-width space are
+        // dropped; LRM/RLM and ZWNJ/ZWJ are legitimate and must be kept.
+        assert_eq!(
+            normalize_decoded_text("a\u{202A}\u{202B}\u{202C}\u{202D}\u{202E}b"),
+            "ab"
+        );
+        assert_eq!(
+            normalize_decoded_text("a\u{2066}\u{2067}\u{2068}\u{2069}b\u{200B}c"),
+            "abc"
+        );
+        assert_eq!(
+            normalize_decoded_text("a\u{200E}\u{200F}\u{200C}\u{200D}b"),
+            "a\u{200E}\u{200F}\u{200C}\u{200D}b"
+        );
+        // U+FEFF, the noncharacters (BMP and supplementary), are dropped.
+        assert_eq!(
+            normalize_decoded_text("a\u{FEFF}b\u{FDD0}\u{FDEF}c\u{FFFE}\u{FFFF}d\u{1FFFE}e"),
+            "abcde"
+        );
+    }
+
+    #[test]
+    fn source_line_separators_become_newlines_and_never_survive() {
+        // U+2028 is also the engine's internal CELL_LINE_BREAK_PENDING sentinel,
+        // so a decoded one must be rewritten here before that pass runs.
+        assert_eq!(normalize_decoded_text("a\u{2028}b\u{2029}c"), "a\nb\nc");
+        assert!(!normalize_decoded_text("a\u{2028}b").contains('\u{2028}'));
+    }
+
+    #[test]
     fn pua_mapping_is_font_family_aware() {
         use crate::glyph_data::{pua_to_char_for_family, PuaFamily};
         // 0x52 means Rho in the Symbol charset but a sun in the corpus-verified

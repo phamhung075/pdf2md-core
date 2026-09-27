@@ -44,12 +44,19 @@ use super::*;
 ///   * map a Microsoft Symbol/Wingdings private-use code point
 ///     (U+F020–U+F0FF) to its Unicode equivalent, and drop any other
 ///     private-use character (U+E000, U+F8FF, the supplementary planes): an
-///     unmapped PUA glyph is mojibake, not text.
+///     unmapped PUA glyph is mojibake, not text;
+///   * strip characters that carry no text and must never reach the output:
+///     NUL and the other C0 controls (except tab/newline/carriage-return),
+///     DEL and the C1 controls, bidi embedding/override/isolate controls,
+///     the zero-width space, U+FEFF, and the Unicode noncharacters
+///     (see [`STRIPPED_EXTRACTION_RANGES`]). Bidi marks and joiners that real
+///     RTL and Persian/Indic/emoji text need (U+200C–U+200F) are kept;
+///   * map a source U+2028 LINE SEPARATOR or U+2029 PARAGRAPH SEPARATOR to a
+///     newline. U+2028 is also the engine's internal `CELL_LINE_BREAK_PENDING`
+///     sentinel, so a decoded U+2028 must be rewritten here, before that pass
+///     runs, or it would be emitted as a real `<br>`.
 pub(crate) fn normalize_decoded_text(s: &str) -> String {
-    if !s.chars().any(|c| {
-        matches!(c, '\u{FB00}'..='\u{FB06}' | '\u{00AD}' | '\u{00A0}' | '\u{202F}')
-            || is_private_use_char(c)
-    }) {
+    if !s.chars().any(needs_decoded_text_normalization) {
         return s.to_string();
     }
     let chars: Vec<char> = s.chars().collect();
@@ -80,10 +87,57 @@ pub(crate) fn normalize_decoded_text(s: &str) -> String {
                     out.push(m);
                 }
             }
+            // A source line/paragraph separator becomes a real line break. It
+            // must not survive: U+2028 is the in-cell deferred-break sentinel.
+            '\u{2028}' | '\u{2029}' => out.push('\n'),
+            c if is_stripped_extraction_char(c) => {}
             _ => out.push(c),
         }
     }
     out
+}
+
+/// True when [`normalize_decoded_text`] must rewrite `c` (fold, drop, replace,
+/// or strip). Keeps the common all-plain-text case allocation-free.
+fn needs_decoded_text_normalization(c: char) -> bool {
+    matches!(
+        c,
+        '\u{FB00}'..='\u{FB06}'
+            | '\u{00AD}'
+            | '\u{00A0}'
+            | '\u{202F}'
+            | '\u{2028}'
+            | '\u{2029}'
+    ) || is_private_use_char(c)
+        || is_stripped_extraction_char(c)
+}
+
+/// Code-point ranges (inclusive) removed from extracted text because they carry
+/// no visible text and can corrupt downstream storage or reorder the rendered
+/// output. C0 controls are stripped except tab/newline/carriage-return, which
+/// keep the existing line handling. U+200E/U+200F (LRM/RLM) and U+200C/U+200D
+/// (ZWNJ/ZWJ) are deliberately absent: they are legitimate in RTL and
+/// Persian/Indic/emoji text.
+const STRIPPED_EXTRACTION_RANGES: &[(char, char)] = &[
+    ('\u{0000}', '\u{0008}'), // C0 controls below TAB
+    ('\u{000B}', '\u{000C}'), // VT, FF
+    ('\u{000E}', '\u{001F}'), // C0 controls above CR
+    ('\u{007F}', '\u{009F}'), // DEL + C1 controls
+    ('\u{200B}', '\u{200B}'), // zero-width space
+    ('\u{202A}', '\u{202E}'), // bidi embedding / override
+    ('\u{2066}', '\u{2069}'), // bidi isolates
+    ('\u{FEFF}', '\u{FEFF}'), // BOM / zero-width no-break space
+    ('\u{FDD0}', '\u{FDEF}'), // noncharacters (the nFFFE/nFFFF forms are below)
+];
+
+/// True when a decoded character must be removed from extracted text. Every
+/// noncharacter (`U+nFFFE` / `U+nFFFF`, in any plane) is covered by the low-bit
+/// test, not just the BMP ones.
+fn is_stripped_extraction_char(c: char) -> bool {
+    STRIPPED_EXTRACTION_RANGES
+        .iter()
+        .any(|&(lo, hi)| c >= lo && c <= hi)
+        || (c as u32 & 0xFFFE) == 0xFFFE
 }
 
 /// True when the geometry output dropped a numeric value (>= 3 digits) that the
