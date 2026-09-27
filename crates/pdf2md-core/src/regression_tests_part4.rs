@@ -319,3 +319,57 @@ use super::regression_tests_common2::*;
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// O1: a 542-byte PDF declaring an xref-stream field of 2^32 bytes used to
+    /// make lopdf allocate 4 GiB (`vec![0_u8; field_widths[1]]`) and `abort()`
+    /// under an address-space limit. The raw-byte pre-validation must reject it
+    /// with a clean error, before lopdf allocates. The fixture is synthetic.
+    #[test]
+    fn xref_stream_with_4gib_w_width_is_rejected_not_aborted() {
+        let bytes = include_bytes!("../tests/fixtures/oom-xref-W-4gib.pdf");
+        match load_pdf_document(bytes) {
+            Err(err) => assert!(
+                err.contains("xref stream rejected") && err.contains("/W"),
+                "the rejection must name the /W bound, got: {err}"
+            ),
+            Ok(_) => panic!("an absurd xref /W width must be rejected, not loaded"),
+        }
+    }
+
+    /// O1 secondary guard: an all-zero `/W` consumes no bytes per xref entry, so
+    /// the `/Index` (or `/Size`) count alone drives insertion into lopdf's map.
+    /// It must be rejected as degenerate rather than allowed to insert billions
+    /// of entries.
+    #[test]
+    fn xref_zero_width_w_is_rejected() {
+        let dict = b"<< /Type /XRef /Size 7 /W [0 0 0] /Index [0 7] >>";
+        let err = crate::pdf_load::validate_xref_stream_dicts(dict)
+            .expect_err("an all-zero /W must be rejected");
+        assert!(err.contains("/W"), "the rejection must name /W, got: {err}");
+    }
+
+    /// O1 secondary guard: a single `/Index` pair count above `MAX_XREF_SIZE`
+    /// must be rejected before lopdf iterates it.
+    #[test]
+    fn xref_index_count_over_bound_is_rejected() {
+        let dict = b"<< /Type /XRef /Size 7 /W [1 2 1] /Index [0 999999999] >>";
+        let err = crate::pdf_load::validate_xref_stream_dicts(dict)
+            .expect_err("an over-bound /Index count must be rejected");
+        assert!(
+            err.contains("/Index"),
+            "the rejection must name /Index, got: {err}"
+        );
+    }
+
+    /// O1: PDF name tokens need no whitespace between them, so a fuzzer
+    /// mutation produces `/Type/XRef/W[1 4294967296 1]/Index[0 1]`. The
+    /// validator must still see the glued `/W` (the leading `/` starts the name
+    /// token) or lopdf allocates 4 GiB and aborts.
+    #[test]
+    fn xref_stream_with_glued_names_is_still_validated() {
+        let dict = b"<</Type/XRef/Size 7/W[1 4294967296 1]/Index[0 1]>>";
+        let err = crate::pdf_load::validate_xref_stream_dicts(dict)
+            .expect_err("a glued /W must still be validated");
+        assert!(err.contains("/W"), "the rejection must name /W, got: {err}");
+    }
+

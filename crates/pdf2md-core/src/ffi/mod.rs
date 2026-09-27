@@ -359,10 +359,10 @@ pub extern "C" fn pdf2md_vision_signature(
                 return cstring_into_raw(String::new());
             }
             let bytes = unsafe { std::slice::from_raw_parts(pdf_ptr, pdf_len) };
-            let sig = match lopdf::Document::load_mem_with_options(
-                bytes,
-                lopdf::LoadOptions::with_max_decompressed_size(crate::MAX_DECOMPRESSED_STREAM),
-            ) {
+            // Route through the bounded, pre-validated loader so this entry
+            // point cannot be used to drive lopdf's xref-stream allocation
+            // abort either (see `pdf_load::validate_xref_stream_dicts`).
+            let sig = match crate::pdf_load::load_pdf_document(bytes) {
                 Ok(doc) => {
                     let cap = if max_pages > 0 { max_pages as usize } else { 8 };
                     crate::phash::vision_signature(&doc, cap)

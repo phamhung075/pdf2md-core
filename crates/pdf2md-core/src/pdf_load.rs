@@ -66,17 +66,236 @@ pub(super) fn load_pdf_document_repaired(bytes: &[u8]) -> Result<lopdf::Document
                     return Ok(recover_object_streams(doc));
                 }
             }
-            Err(format!("lopdf parsing error: {}", first_err))
+            Err(first_err)
         }
     }
 }
 
-/// [`lopdf::Document::load_mem`] with the decompression-bomb cap applied.
-pub(super) fn load_bounded(bytes: &[u8]) -> Result<lopdf::Document, lopdf::Error> {
+/// Maximum byte width allowed for one field of a cross-reference stream's `/W`
+/// array. The PDF spec defines the three fields as 1-byte-multiple unsigned
+/// big-endian integers and real producers use 1–8 bytes; lopdf 0.44 allocates
+/// `vec![0_u8; field_widths[i]]` with no upper bound, so a 542-byte PDF that
+/// declares `/W [1 4294967296 1]` makes it allocate 4 GiB. Under an address-space
+/// limit that allocation fails and calls `abort()`, which `catch_unwind` cannot
+/// stop and which kills the in-process CGO gateway. Reject such a dictionary
+/// here, before lopdf parses.
+const MAX_XREF_FIELD_WIDTH: i64 = 8;
+
+/// Maximum value accepted for an xref stream's `/Size` (declared object count)
+/// and for any single `/Index` pair count. lopdf iterates an `/Index` count (or
+/// `[0 Size]` when `/Index` is absent) and inserts one cross-reference entry per
+/// iteration. With a non-degenerate `/W` the reader runs out of stream bytes
+/// first, but with `/W [0 0 0]` no bytes are consumed, so a tiny file declaring
+/// a multi-billion count would insert that many `BTreeMap` entries and exhaust
+/// memory. 4 M is already ~16x the object count of a dense 5000-page document
+/// and far below the level that would exhaust a 4 GB budget.
+const MAX_XREF_SIZE: i64 = 4_000_000;
+
+/// [`lopdf::Document::load_mem`] with the decompression-bomb cap applied and the
+/// raw cross-reference-stream dictionaries pre-validated. Validation runs
+/// before lopdf allocates: see [`validate_xref_stream_dicts`].
+pub(super) fn load_bounded(bytes: &[u8]) -> Result<lopdf::Document, String> {
+    validate_xref_stream_dicts(bytes)?;
     lopdf::Document::load_mem_with_options(
         bytes,
         lopdf::LoadOptions::with_max_decompressed_size(MAX_DECOMPRESSED_STREAM),
     )
+    .map_err(|e| format!("lopdf parsing error: {e}"))
+}
+
+/// Rejects, with a clean error, any raw cross-reference-stream dictionary whose
+/// `/W`, `/Size` or `/Index` would make lopdf allocate an unreasonable amount
+/// (see [`MAX_XREF_FIELD_WIDTH`] / [`MAX_XREF_SIZE`]). Scans the raw bytes for
+/// `/Type /XRef` dictionaries; a document with no such byte sequence pays only
+/// one substring search. Returns `Ok(())` for every dictionary it cannot
+/// confidently parse, leaving lopdf to report its own (bounded) parse error.
+pub(super) fn validate_xref_stream_dicts(bytes: &[u8]) -> Result<(), String> {
+    if find_from(bytes, b"/XRef", 0).is_none() {
+        return Ok(());
+    }
+    let mut from = 0usize;
+    while let Some(rel) = find_from(bytes, b"/Type", from) {
+        from = rel + b"/Type".len();
+        let name = skip_ws(bytes, from);
+        if bytes.get(name..name + 5) != Some(b"/XRef") {
+            continue;
+        }
+        let after = name + 5;
+        if bytes
+            .get(after)
+            .is_some_and(|b| !is_pdf_delimiter_or_ws(*b))
+        {
+            continue;
+        }
+        let Some(dict_start) = find_last(&bytes[..rel], b"<<") else {
+            continue;
+        };
+        let Some(dict_end) = matching_dict_end(bytes, dict_start) else {
+            continue;
+        };
+        validate_one_xref_dict(&bytes[dict_start..dict_end])?;
+    }
+    Ok(())
+}
+
+/// `start` points just past a `<<`; returns the index just past its matching
+/// `>>`. Hex strings (`<...>`) cannot contain `>` inside the digits, so a
+/// simple depth count is exact for an xref-stream dictionary.
+fn matching_dict_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = start;
+    while i + 1 < bytes.len() {
+        match &bytes[i..i + 2] {
+            b"<<" => {
+                depth += 1;
+                i += 2;
+            }
+            b">>" => {
+                depth = depth.checked_sub(1)?;
+                i += 2;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// PDF whitespace or delimiter byte. A `/W` key must be the whole name token,
+/// not the prefix of `/Width` or `/Widths`.
+fn is_pdf_delimiter_or_ws(b: u8) -> bool {
+    b.is_ascii_whitespace()
+        || matches!(
+            b,
+            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+        )
+}
+
+/// Index just past the `key` name token (`key` includes the leading `/`) when it
+/// appears as a whole token in `dict`.
+///
+/// The key starts with `/`, which always begins a new name token in PDF syntax,
+/// and `/` is itself a delimiter, so a preceding name needs no whitespace after
+/// it (`/Type/XRef/W[...]` is three tokens). Only the byte *after* the key
+/// decides whether it is the whole name: `/W` matches while `/Width` and `/W2`
+/// do not.
+fn dict_key_pos(dict: &[u8], key: &[u8]) -> Option<usize> {
+    let mut from = 0usize;
+    while let Some(rel) = find_from(dict, key, from) {
+        from = rel + key.len();
+        let after_ok = dict
+            .get(rel + key.len())
+            .is_none_or(|b| is_pdf_delimiter_or_ws(*b));
+        if after_ok {
+            return Some(rel + key.len());
+        }
+    }
+    None
+}
+
+/// Parses a PDF integer at `start` (optional leading `-`), returning the value
+/// and the index after it.
+fn parse_int(bytes: &[u8], start: usize) -> Option<(i64, usize)> {
+    let mut p = start;
+    let negative = bytes.get(p) == Some(&b'-');
+    if negative {
+        p += 1;
+    }
+    let digits_start = p;
+    while p < bytes.len() && bytes[p].is_ascii_digit() {
+        p += 1;
+    }
+    if p == digits_start {
+        return None;
+    }
+    let value = std::str::from_utf8(&bytes[digits_start..p])
+        .ok()?
+        .parse::<i64>()
+        .ok()?;
+    Some((if negative { -value } else { value }, p))
+}
+
+/// Validates the `/W`, `/Size` and `/Index` of one xref-stream dictionary
+/// against [`MAX_XREF_FIELD_WIDTH`] / [`MAX_XREF_SIZE`]. Anything that is not a
+/// well-formed integer or array is left for lopdf to reject.
+fn validate_one_xref_dict(dict: &[u8]) -> Result<(), String> {
+    if let Some(after_key) = dict_key_pos(dict, b"/W") {
+        let mut p = skip_ws(dict, after_key);
+        if dict.get(p) == Some(&b'[') {
+            p += 1;
+            let mut width_sum: i64 = 0;
+            let mut widths = 0usize;
+            loop {
+                let q = skip_ws(dict, p);
+                match dict.get(q) {
+                    Some(b']') => break,
+                    Some(_) => {
+                        let Some((width, next)) = parse_int(dict, q) else {
+                            return Ok(());
+                        };
+                        if !(0..=MAX_XREF_FIELD_WIDTH).contains(&width) {
+                            return Err(format!(
+                                "xref stream rejected: /W field width {width} exceeds the \
+                                 maximum of {MAX_XREF_FIELD_WIDTH}"
+                            ));
+                        }
+                        width_sum += width;
+                        widths += 1;
+                        p = next;
+                    }
+                    None => return Ok(()),
+                }
+            }
+            // An all-zero /W consumes no stream bytes per entry, so the loop is
+            // driven purely by the /Index (or /Size) count and would insert that
+            // many map entries. No real producer emits it.
+            if widths >= 3 && width_sum == 0 {
+                return Err(
+                    "xref stream rejected: /W has no nonzero field width".to_string(),
+                );
+            }
+        }
+    }
+    if let Some(after_key) = dict_key_pos(dict, b"/Size") {
+        let p = skip_ws(dict, after_key);
+        if let Some((size, _)) = parse_int(dict, p) {
+            if !(0..=MAX_XREF_SIZE).contains(&size) {
+                return Err(format!(
+                    "xref stream rejected: /Size {size} exceeds the maximum of {MAX_XREF_SIZE}"
+                ));
+            }
+        }
+    }
+    if let Some(after_key) = dict_key_pos(dict, b"/Index") {
+        let mut p = skip_ws(dict, after_key);
+        if dict.get(p) == Some(&b'[') {
+            p += 1;
+            let mut position = 0usize;
+            loop {
+                let q = skip_ws(dict, p);
+                match dict.get(q) {
+                    Some(b']') => break,
+                    Some(_) => {
+                        let Some((value, next)) = parse_int(dict, q) else {
+                            return Ok(());
+                        };
+                        if value < 0 || (position % 2 == 1 && value > MAX_XREF_SIZE) {
+                            return Err(format!(
+                                "xref stream rejected: /Index entry {value} exceeds the \
+                                 maximum of {MAX_XREF_SIZE}"
+                            ));
+                        }
+                        p = next;
+                        position += 1;
+                    }
+                    None => return Ok(()),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Returns `bytes` truncated just past the last `%%EOF` marker, or `None` when
