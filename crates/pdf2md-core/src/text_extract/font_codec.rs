@@ -34,7 +34,7 @@ use super::*;
 /// True for the handful of faces whose byte codes index a built-in glyph set
 /// with no Latin semantics (dingbats/dingbat-like fonts). A font merely flagged
 /// Symbolic but named as a text face is *not* one of these.
-pub(super) fn is_dingbat_face(font: &Dictionary) -> bool {
+pub(crate) fn is_dingbat_face(font: &Dictionary) -> bool {
     if let Some(bf) = get_name(font, b"BaseFont") {
         let upper = bf.to_ascii_uppercase();
         for marker in [

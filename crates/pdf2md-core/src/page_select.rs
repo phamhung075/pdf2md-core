@@ -23,15 +23,20 @@ const STRUCT_TREE_COVERAGE_PCT: usize = 85;
 /// otherwise a partial/decorative structure tree (common in invoice generators)
 /// would drop content and regress the tuned geometric engine.
 ///
-/// Returns `(page_text, marker_hint, decode_failed)`.
+/// Returns `(page_text, marker_hint, decode_failed, glyph_counts)`.
 pub(super) fn select_page_text(
     doc: &lopdf::Document,
     page_num: u32,
     page_id: lopdf::ObjectId,
     options: &ConversionOptions,
     has_struct_tree: bool,
-) -> (text_extract::PageText, Option<bool>, bool) {
-    let geo_result = text_extract::extract_page_text_report_with_marker(
+) -> (
+    text_extract::PageText,
+    Option<bool>,
+    bool,
+    crate::glyph_counts::GlyphCounts,
+) {
+    let (geo_result, glyph_counts) = text_extract::extract_page_report_with_counts(
         doc,
         page_num,
         options.detect_tables,
@@ -81,5 +86,5 @@ pub(super) fn select_page_text(
     } else {
         (geo, geo_hint)
     };
-    (selected.0, selected.1, decode_failed)
+    (selected.0, selected.1, decode_failed, glyph_counts)
 }

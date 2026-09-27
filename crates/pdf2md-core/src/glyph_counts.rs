@@ -6,26 +6,30 @@
 //!
 //! A font whose encoding cannot be resolved into a Unicode [`Codec`]
 //! (`resolve_codec` returns `None` — e.g. a Type0 `/Identity-H` font with no
-//! `/ToUnicode`, or a genuine dingbat face) is dropped from every text path,
-//! so the strings drawn with it vanish with no signal. This module counts how
-//! many codes were shown under such a font (`undecodable`) versus under a font
-//! that did decode (`decoded`), so the caller can make the loss observable.
+//! `/ToUnicode`) is dropped from every text path, so the strings drawn with it
+//! vanish with no signal. This module counts how many codes were shown under
+//! such a font (`undecodable`) versus under a font that did decode (`decoded`),
+//! so the caller can make the loss observable. A simple dingbat/icon face
+//! (`is_dingbat_face`) is rejected on purpose and is not text loss, so its
+//! codes count toward neither total; a Type0 face is rejected for its missing
+//! `/ToUnicode` instead, so it always counts as undecodable.
 //!
 //! The count is taken by one canonical pass over the page's own content and
 //! every Form XObject it invokes, mirroring the string walker's traversal
 //! (same depth / `Do` / byte budgets and per-path cycle guard). Routing may
 //! walk a page through the string walker, the layout glyph engine and/or the
-//! structure tree; counting once here, from the raw content rather than from a
-//! selected path's output, keeps a page from being counted twice and makes the
-//! number independent of which path wins.
+//! structure tree, and each of those paths decodes the content stream; to keep
+//! a page from being counted twice and to avoid a second decode, the caller
+//! hands this module the operations `extract_page` already decoded (the pass
+//! that always runs for every page), so the count is independent of which path
+//! wins.
 //!
 //! [`Codec`]: crate::text_extract::Codec
 
 use crate::layout::glyph_stream::{resolve_widths, string_bytes, Widths};
 use crate::text_extract::{
-    collect_fonts, decode_page_content, form_resource_chain, get_name, lookup_form,
-    resource_dicts, resolve_codec, Codec, WalkerBudget, FORM_INVOCATION_OPS,
-    MAX_WALKER_FORM_DEPTH,
+    collect_fonts, form_resource_chain, get_name, is_dingbat_face, lookup_form, resolve_codec,
+    Codec, WalkerBudget, FORM_INVOCATION_OPS, MAX_WALKER_FORM_DEPTH,
 };
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId};
@@ -57,6 +61,17 @@ struct FontCounter {
     /// True for `Subtype /Type0`, the fallback code width when metrics are
     /// unusable.
     is_type0: bool,
+    /// True for a face `is_dingbat_face` rejects (Symbol / ZapfDingbats /
+    /// Wingdings / pictogram faces) on the *simple-font* path, where
+    /// `resolve_codec` returns `None` precisely because of that predicate.
+    /// Such a face draws icons, not text: its codes are deliberately not
+    /// decoded, so they are counted as neither decoded nor undecodable — only
+    /// glyphs that a text path *could* have decoded belong in the loss ratio.
+    ///
+    /// A Type0 face is rejected for a different reason (no `/ToUnicode`), and
+    /// `resolve_codec` never consults `is_dingbat_face` on that path, so a
+    /// Type0 symbol-BaseFont face still counts as undecodable.
+    dingbat: bool,
 }
 
 impl FontCounter {
@@ -65,6 +80,11 @@ impl FontCounter {
         match &self.codec {
             Some(codec) => counts.decoded += codec.code_metrics(bytes).0,
             None => {
+                // Dingbat/icon faces are rejected by design: their codes are
+                // not text loss, so they count toward neither total.
+                if self.dingbat {
+                    return;
+                }
                 counts.undecodable += match self.widths {
                     // Unusable metrics: fall back to the subtype's fixed code
                     // width (a Type0/CID font is two bytes per code).
@@ -84,20 +104,28 @@ impl FontCounter {
     }
 }
 
-/// Count the glyph codes shown on one page, once, over its content streams and
-/// every Form XObject they invoke.
-pub(crate) fn count_page_glyphs(doc: &Document, page_id: ObjectId) -> GlyphCounts {
-    let chain = resource_dicts(doc, page_id);
-    let Ok(content) = decode_page_content(doc, page_id) else {
-        return GlyphCounts::default();
-    };
+/// Count the glyph codes shown on one page, once, over its already-decoded
+/// content operations and every Form XObject they invoke.
+///
+/// `chain` is the page's resource chain (from `resource_dicts`), `page_fonts`
+/// the font map `extract_page` already collected for it, and `ops` the
+/// operations it decoded — so the page content stream is neither decompressed
+/// nor scanned a second time.
+pub(crate) fn count_glyphs(
+    doc: &Document,
+    chain: &[&Dictionary],
+    ops: &[Operation],
+    page_fonts: &BTreeMap<Vec<u8>, &Dictionary>,
+) -> GlyphCounts {
+    let table = build_table(doc, page_fonts);
     let mut counts = GlyphCounts::default();
     let mut budget = WalkerBudget::new();
     let mut form_path: Vec<ObjectId> = Vec::new();
-    count_content(
+    walk_ops(
         doc,
-        &chain,
-        &content.operations,
+        chain,
+        ops,
+        &table,
         &mut counts,
         &mut form_path,
         0,
@@ -106,32 +134,53 @@ pub(crate) fn count_page_glyphs(doc: &Document, page_id: ObjectId) -> GlyphCount
     counts
 }
 
+/// Resolve one content stream's collected fonts into counting facts.
+fn build_table(
+    doc: &Document,
+    fonts: &BTreeMap<Vec<u8>, &Dictionary>,
+) -> Vec<FontCounter> {
+    fonts
+        .iter()
+        .map(|(name, fd)| {
+            let is_type0 = get_name(fd, b"Subtype").map_or(false, |s| s == b"Type0");
+            let codec = resolve_codec(doc, fd);
+            // The advance widths are read only when there is no codec; skip the
+            // (comparatively costly) `/W` parse for every decoded font.
+            let widths = if codec.is_none() {
+                resolve_widths(doc, fd)
+            } else {
+                Widths::None
+            };
+            FontCounter {
+                name: name.clone(),
+                codec,
+                widths,
+                is_type0,
+                // `resolve_codec` rejects a *simple* symbolic face solely
+                // because of this predicate; a Type0 face is rejected for its
+                // missing ToUnicode, so it still counts even with a symbol
+                // BaseFont.
+                dingbat: !is_type0 && is_dingbat_face(fd),
+            }
+        })
+        .collect()
+}
+
 /// Walk one content stream (page or Form XObject), counting the codes of every
 /// `Tj` / `'` / `"` / `TJ`-element shown under the current font. Recursion and
 /// budgets mirror [`crate::text_extract::walk_content`] so the count covers
 /// exactly the content the walkers can output.
 #[allow(clippy::too_many_arguments)]
-fn count_content(
+fn walk_ops(
     doc: &Document,
     chain: &[&Dictionary],
     ops: &[Operation],
+    table: &[FontCounter],
     counts: &mut GlyphCounts,
     form_path: &mut Vec<ObjectId>,
     depth: usize,
     budget: &mut WalkerBudget,
 ) {
-    let mut fonts: BTreeMap<Vec<u8>, &Dictionary> = BTreeMap::new();
-    collect_fonts(doc, chain, &mut fonts);
-    let table: Vec<FontCounter> = fonts
-        .iter()
-        .map(|(name, fd)| FontCounter {
-            name: name.clone(),
-            codec: resolve_codec(doc, fd),
-            widths: resolve_widths(doc, fd),
-            is_type0: get_name(fd, b"Subtype").map_or(false, |s| s == b"Type0"),
-        })
-        .collect();
-
     let mut cur: Option<usize> = None;
     for op in ops {
         if budget.ops_left == 0 {
@@ -206,10 +255,14 @@ fn count_content(
                 if let Some(id) = id {
                     form_path.push(id);
                 }
-                count_content(
+                let mut form_fonts: BTreeMap<Vec<u8>, &Dictionary> = BTreeMap::new();
+                collect_fonts(doc, &fchain, &mut form_fonts);
+                let form_table = build_table(doc, &form_fonts);
+                walk_ops(
                     doc,
                     &fchain,
                     &fc.operations,
+                    &form_table,
                     counts,
                     form_path,
                     depth + 1,

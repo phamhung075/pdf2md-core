@@ -74,11 +74,11 @@ pub fn convert_pdf_bytes_to_markdown(
         // Prefer our own multilingual decoder (correct WinAnsi/Differences/
         // ToUnicode handling — see text_extract.rs) and only fall back to
         // lopdf's extractor when the page content cannot be parsed at all.
-        let (page_text, marker_hint, decode_failed) =
+        let (page_text, marker_hint, decode_failed, page_glyphs) =
             select_page_text(&doc, page_num, page_id, options, has_struct_tree);
-        // One canonical glyph-code count per page, independent of which text
-        // path `select_page_text` kept (see `glyph_counts`).
-        let page_glyphs = crate::glyph_counts::count_page_glyphs(&doc, page_id);
+        // The glyph-code count was taken by the same pass that decoded this
+        // page's content stream (see `glyph_counts`), so it is counted once and
+        // no page is decompressed twice.
         undecodable_glyphs += page_glyphs.undecodable;
         decoded_glyphs += page_glyphs.decoded;
         any_decode_failure |= decode_failed;

@@ -30,6 +30,7 @@
 //! extractor.
 
 use super::*;
+use crate::glyph_counts::GlyphCounts;
 
 /// Decode a page's content streams under explicit decompression caps.
 ///
@@ -80,14 +81,22 @@ pub(super) fn extract_page(
     detect_tables: bool,
     detect_layout: bool,
     detect_math: bool,
-) -> Result<(PageText, Option<bool>), String> {
+) -> (Result<(PageText, Option<bool>), String>, GlyphCounts) {
     let chain = resource_dicts(doc, page_id);
     let mut fonts: BTreeMap<Vec<u8>, &Dictionary> = BTreeMap::new();
     collect_fonts(doc, &chain, &mut fonts);
     let has_fonts = !fonts.is_empty();
 
-    let content: Content<Vec<Operation>> =
-        decode_page_content(doc, page_id).map_err(|e| format!("{e}"))?;
+    let content: Content<Vec<Operation>> = match decode_page_content(doc, page_id) {
+        Ok(c) => c,
+        Err(e) => return (Err(format!("{e}")), GlyphCounts::default()),
+    };
+    // One canonical glyph-code count per page, over the content stream already
+    // decoded here — the single pass that always runs for every page, whatever
+    // text path `select_page_text` ultimately keeps (see `glyph_counts`). The
+    // count is returned even when the text path below fails, matching the
+    // previous independent counting pass.
+    let glyph_counts = crate::glyph_counts::count_glyphs(doc, &chain, &content.operations, &fonts);
 
     // Glyph-positioned pages (one glyph per text object with absolute
     // coordinates, e.g. LibreOffice forms) need a geometry engine — word
@@ -222,17 +231,20 @@ pub(super) fn extract_page(
                     // the walker is the lossless output, so keep it (tables
                     // are not worth unique content).
                     if pt.tables == 0 || loses_digit_content(&walker, &pt.text) {
-                        return Ok((
-                            PageText {
-                                text: walker,
-                                text_ops_seen: walker_ops,
-                                has_fonts,
-                                tables: 0,
-                                blocks: Vec::new(),
-                                budget_exhausted: budget.exhausted || signals_exhausted,
-                            },
-                            marker_hint,
-                        ));
+                        return (
+                            Ok((
+                                PageText {
+                                    text: walker,
+                                    text_ops_seen: walker_ops,
+                                    has_fonts,
+                                    tables: 0,
+                                    blocks: Vec::new(),
+                                    budget_exhausted: budget.exhausted || signals_exhausted,
+                                },
+                                marker_hint,
+                            )),
+                            glyph_counts,
+                        );
                     }
                     // A page the `TJ` arm newly moved off the string walker: the
                     // walker emits vertical runs the horizontal reading-order
@@ -261,18 +273,21 @@ pub(super) fn extract_page(
                             pt.text.push_str(&vertical);
                         }
                     }
-                    return Ok((
-                        PageText {
-                            budget_exhausted: pt.budget_exhausted || signals_exhausted,
-                            ..pt
-                        },
-                        marker_hint,
-                    ));
+                    return (
+                        Ok((
+                            PageText {
+                                budget_exhausted: pt.budget_exhausted || signals_exhausted,
+                                ..pt
+                            },
+                            marker_hint,
+                        )),
+                        glyph_counts,
+                    );
                 }
-                Err(e) => return Err(e),
+                Err(e) => return (Err(e), glyph_counts),
             }
         }
-        return match crate::layout::extract_page_glyphs(
+        let result = match crate::layout::extract_page_glyphs(
             doc,
             page_id,
             detect_tables,
@@ -297,13 +312,16 @@ pub(super) fn extract_page(
                     .map(|b| b.text.split_whitespace().count())
                     .sum();
                 if text_words >= 2 || (text_words > 0 && block_words < 5) {
-                    return Ok((
-                        PageText {
-                            budget_exhausted: pt.budget_exhausted || signals_exhausted,
-                            ..pt
-                        },
-                        None,
-                    ));
+                    return (
+                        Ok((
+                            PageText {
+                                budget_exhausted: pt.budget_exhausted || signals_exhausted,
+                                ..pt
+                            },
+                            None,
+                        )),
+                        glyph_counts,
+                    );
                 }
                 // Keep the page-marker decision the geometry path made, so a
                 // fallback page does not lose the `## Page N` marker the
@@ -325,13 +343,16 @@ pub(super) fn extract_page(
                 );
                 let out = out.trim_end().to_string();
                 if out.split_whitespace().count() <= text_words {
-                    return Ok((
-                        PageText {
-                            budget_exhausted: pt.budget_exhausted || signals_exhausted,
-                            ..pt
-                        },
-                        None,
-                    ));
+                    return (
+                        Ok((
+                            PageText {
+                                budget_exhausted: pt.budget_exhausted || signals_exhausted,
+                                ..pt
+                            },
+                            None,
+                        )),
+                        glyph_counts,
+                    );
                 }
                 Ok((
                     PageText {
@@ -347,6 +368,7 @@ pub(super) fn extract_page(
             }
             Err(e) => Err(e),
         };
+        return (result, glyph_counts);
     }
 
     let mut out = String::new();
@@ -364,17 +386,20 @@ pub(super) fn extract_page(
         &mut budget,
     );
 
-    Ok((
-        PageText {
-            text: out.trim_end().to_string(),
-            text_ops_seen,
-            has_fonts,
-            tables: 0,
-            blocks: Vec::new(),
-            budget_exhausted: budget.exhausted || signals_exhausted,
-        },
-        None,
-    ))
+    (
+        Ok((
+            PageText {
+                text: out.trim_end().to_string(),
+                text_ops_seen,
+                has_fonts,
+                tables: 0,
+                blocks: Vec::new(),
+                budget_exhausted: budget.exhausted || signals_exhausted,
+            },
+            None,
+        )),
+        glyph_counts,
+    )
 }
 
 /// Reports the text for one page (1-based page numbers, as used by
@@ -407,10 +432,34 @@ pub fn extract_page_text_report_with_marker(
     detect_layout: bool,
     detect_math: bool,
 ) -> Result<(PageText, Option<bool>), String> {
+    extract_page_report_with_counts(
+        doc,
+        page_number,
+        detect_tables,
+        detect_layout,
+        detect_math,
+    )
+    .0
+}
+
+/// Like `extract_page_text_report_with_marker`, but also returns the page's
+/// canonical glyph-code counts, computed by the same pass that decoded the
+/// content stream — so the page is decoded once and counted once. The counts
+/// are returned even when the text path fails, matching the previous
+/// independent counting pass. Used by `select_page_text`.
+pub(crate) fn extract_page_report_with_counts(
+    doc: &Document,
+    page_number: u32,
+    detect_tables: bool,
+    detect_layout: bool,
+    detect_math: bool,
+) -> (Result<(PageText, Option<bool>), String>, GlyphCounts) {
     let pages: std::collections::BTreeMap<u32, ObjectId> = doc.get_pages();
-    let page_id = pages
-        .get(&page_number)
-        .copied()
-        .ok_or_else(|| format!("page {page_number} not found"))?;
+    let Some(page_id) = pages.get(&page_number).copied() else {
+        return (
+            Err(format!("page {page_number} not found")),
+            GlyphCounts::default(),
+        );
+    };
     extract_page(doc, page_id, detect_tables, detect_layout, detect_math)
 }
