@@ -38,8 +38,8 @@ pdf2md document.pdf -o document.md
 ```bash
 cd server
 make run
-# http://127.0.0.1:8989  — upload sandbox
-curl -X POST http://127.0.0.1:8989/convert --data-binary @document.pdf
+# http://127.0.0.1:8080  — upload sandbox
+curl -X POST http://127.0.0.1:8080/convert --data-binary @document.pdf
 ```
 
 See [`server/README.md`](server/README.md).

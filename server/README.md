@@ -19,7 +19,7 @@ Prerequisites: [Rust](https://rustup.rs) and [Go](https://go.dev/dl) 1.22+.
 ```bash
 # from pdf2md-core/server
 make run
-# → listening on http://0.0.0.0:8989  (override with PORT=8080 make run)
+# → listening on http://0.0.0.0:8080  (override with PORT=8989 make run)
 ```
 
 The Makefile builds the Rust core as a release `cdylib` (`cargo build --release
@@ -38,7 +38,7 @@ LD_LIBRARY_PATH=../crates/pdf2md-core/target/release ./bin/pdf2md-server
 ## Convert a PDF
 
 ```bash
-curl -X POST http://127.0.0.1:8989/convert \
+curl -X POST http://127.0.0.1:8080/convert \
   --data-binary @document.pdf \
   -H 'Content-Type: application/pdf'
 ```
