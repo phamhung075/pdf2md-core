@@ -323,6 +323,22 @@ pub struct ConversionResult {
     /// this vs. `total_pages` as a ratio to catch that case.
     pub pages_below_word_floor: usize,
     pub tables_detected: usize,
+    /// Glyph codes shown on the pages under a font whose encoding could not be
+    /// resolved into a Unicode codec (a Type0 `/Identity-H` font with no usable
+    /// `/ToUnicode`, or a dingbat face). Every text path drops those glyphs, so
+    /// a nonzero value while `total_words > 0` is a *partial* text loss that the
+    /// old `needs_vision_rescue` flag (only set when **no** word decoded) could
+    /// not signal. `0` for every ordinary document, and the field is additive:
+    /// older JSON consumers ignore it. See also
+    /// [`ConversionResult::decoded_glyphs`] and the appended
+    /// `<!-- pdf2md: {"undecodable_glyphs":N,"decoded_glyphs":M} -->` comment.
+    #[serde(default)]
+    pub undecodable_glyphs: usize,
+    /// Glyph codes shown on the pages under a font that resolved to a codec.
+    /// Together with [`ConversionResult::undecodable_glyphs`] it gives the loss
+    /// ratio without parsing the markdown. `0` for a document with no text.
+    #[serde(default)]
+    pub decoded_glyphs: usize,
     pub duration_us: u64,
     /// True when at least one page's extraction hit a hard work bound (Form
     /// XObject `Do` invocation count, shared operator/decoded-byte budget, or
@@ -447,6 +463,8 @@ mod tests {
             total_words: 0,
             pages_below_word_floor: 0,
             tables_detected: 0,
+            undecodable_glyphs: 0,
+            decoded_glyphs: 0,
             duration_us: 0,
             budget_exhausted: false,
             media: Vec::new(),

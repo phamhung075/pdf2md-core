@@ -54,50 +54,13 @@ impl Widths {
                 // space detection — fusing words in Identity-H/CID fonts.
                 let mut total = 0.0;
                 let mut any = false;
-                match encoding {
-                    Some(cm) => {
-                        // Custom code->CID CMap: consume the code lengths the
-                        // CMap knows, exactly as `decode_cmap` does.
-                        let mut i = 0usize;
-                        while i < bytes.len() {
-                            let mut matched = false;
-                            for len in 1u8..=4u8 {
-                                let n = len as usize;
-                                if i + n > bytes.len() {
-                                    continue;
-                                }
-                                if let Some(cid) = cm.lookup(&bytes[i..i + n]) {
-                                    let w = map.get(&cid).copied().unwrap_or(*default);
-                                    if w > 0.0 {
-                                        any = true;
-                                        total += w;
-                                    }
-                                    i += n;
-                                    matched = true;
-                                    break;
-                                }
-                            }
-                            if !matched {
-                                i += 1;
-                            }
-                        }
+                for_each_cid(encoding, bytes, |cid| {
+                    let w = map.get(&cid).copied().unwrap_or(*default);
+                    if w > 0.0 {
+                        any = true;
+                        total += w;
                     }
-                    None => {
-                        // Identity-H/V: the code bytes *are* the CID, two
-                        // bytes each.
-                        for chunk in bytes.chunks(2) {
-                            let mut cid = 0u32;
-                            for &b in chunk {
-                                cid = (cid << 8) | b as u32;
-                            }
-                            let w = map.get(&cid).copied().unwrap_or(*default);
-                            if w > 0.0 {
-                                any = true;
-                                total += w;
-                            }
-                        }
-                    }
-                }
+                });
                 if any {
                     Some(total)
                 } else {
@@ -105,6 +68,68 @@ impl Widths {
                 }
             }
             Widths::None => None,
+        }
+    }
+
+    /// Number of character *codes* in `bytes` under this font's code width,
+    /// independent of the advance values. This is the same code segmentation
+    /// [`Self::width`] uses (custom `/Encoding` CMap lengths, else 2-byte
+    /// Identity-H/V chunks; one byte for a simple font), exposed so the
+    /// undecodable-font accounting counts glyphs — not raw bytes — for a font
+    /// whose encoding could not be resolved into a [`Codec`].
+    ///
+    /// [`Codec`]: crate::text_extract::Codec
+    pub(crate) fn code_count(&self, bytes: &[u8]) -> usize {
+        match self {
+            Widths::Byte(_) => bytes.len(),
+            Widths::Cid { encoding, .. } => {
+                let mut codes = 0usize;
+                for_each_cid(encoding, bytes, |_| codes += 1);
+                codes
+            }
+            // Unusable metrics (`/W` or `/DescendantFonts` missing): the callers
+            // fall back to the font subtype's fixed code width.
+            Widths::None => bytes.len(),
+        }
+    }
+}
+
+/// Consume every code in `bytes` under a CID font's code width, visiting the
+/// code's CID. Single source of truth for the CID code segmentation shared by
+/// [`Widths::width`] and [`Widths::code_count`]: a custom `/Encoding` CMap
+/// consumes the code lengths it knows and skips an unmatched byte, while
+/// Identity-H/V (no CMap stream) reads two-byte codes.
+fn for_each_cid(encoding: &Option<CMapCodec>, bytes: &[u8], mut visit: impl FnMut(u32)) {
+    match encoding {
+        Some(cm) => {
+            let mut i = 0usize;
+            while i < bytes.len() {
+                let mut matched = false;
+                for len in 1u8..=4u8 {
+                    let n = len as usize;
+                    if i + n > bytes.len() {
+                        continue;
+                    }
+                    if let Some(cid) = cm.lookup(&bytes[i..i + n]) {
+                        visit(cid);
+                        i += n;
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
+                    i += 1;
+                }
+            }
+        }
+        None => {
+            for chunk in bytes.chunks(2) {
+                let mut cid = 0u32;
+                for &b in chunk {
+                    cid = (cid << 8) | b as u32;
+                }
+                visit(cid);
+            }
         }
     }
 }

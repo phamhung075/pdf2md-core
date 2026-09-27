@@ -258,6 +258,8 @@ fn pdf2md_convert_impl(
                     "words": r.total_words,
                     "pages_below_word_floor": r.pages_below_word_floor,
                     "tables": r.tables_detected,
+                    "undecodable_glyphs": r.undecodable_glyphs,
+                    "decoded_glyphs": r.decoded_glyphs,
                     "media": media_json,
                     "blocks": blocks_json,
                     "duration_us": r.duration_us,
