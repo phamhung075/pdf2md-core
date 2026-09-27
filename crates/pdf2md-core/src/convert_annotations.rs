@@ -19,3 +19,27 @@ pub(crate) fn glyph_encoded_status(total_pages: usize) -> String {
          <!-- pdf2md: {{\"needs_vision_rescue\":true,\"rescue_reason\":\"glyph_encoded\",\"pages\":{total_pages},\"words\":0}} -->\n"
     )
 }
+
+/// Append the partial-glyph-loss marker when some glyph codes were shown under
+/// a font with no Unicode codec **and** the document still produced words.
+///
+/// The `total_words > 0` half is deliberate: a zero-word document already takes
+/// the glyph-encoded status path (and `needs_vision_rescue`), so this marker
+/// covers exactly the *silent* case the status path misses. With no undecodable
+/// glyphs nothing is appended, so an ordinary document stays byte-identical.
+pub(crate) fn append_glyph_loss_comment(
+    markdown: &mut String,
+    undecodable_glyphs: usize,
+    decoded_glyphs: usize,
+    total_words: usize,
+) {
+    if undecodable_glyphs == 0 || total_words == 0 {
+        return;
+    }
+    if !markdown.ends_with('\n') {
+        markdown.push('\n');
+    }
+    markdown.push_str(&format!(
+        "<!-- pdf2md: {{\"undecodable_glyphs\":{undecodable_glyphs},\"decoded_glyphs\":{decoded_glyphs}}} -->\n"
+    ));
+}

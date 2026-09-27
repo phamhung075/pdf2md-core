@@ -293,6 +293,17 @@ pub fn convert_pdf_bytes_to_markdown(
 
     let duration_us = t0.elapsed_us();
 
+    // Silent partial loss under a font with no Unicode codec: total_words is
+    // nonzero, so the glyph-encoded status path above does not fire. Append one
+    // machine-readable marker (same style as the status comment) so a
+    // downstream gate can escalate. No-op when no glyph was dropped.
+    convert_annotations::append_glyph_loss_comment(
+        &mut full_markdown,
+        undecodable_glyphs,
+        decoded_glyphs,
+        total_words,
+    );
+
     // The C ABI/JSON surface (ffi.rs) is frozen, so the Go worker cannot see
     // the flag through `ConversionResult`; make the truncation visible on the
     // debug channel instead of failing silently.
