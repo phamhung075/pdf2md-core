@@ -162,14 +162,17 @@ pub(super) fn extract_page(
         (sig.has_tj_array || sig.has_tj_plain) && (sig.has_td_upper || sig.has_tm);
     let form_plain_td = sig.td_total >= 2 && sig.td_horizontal * 2 >= sig.td_total;
     let route_to_layout = if detect_tables {
-        // `Tj` positioned with `Td` (CAF payslips, Engie bills) and quote
-        // show-ops (`'`/`"`). A quote page is routed only when it also carries
-        // explicit `Td` fragment placements: a page that shows every string
-        // with `'` at one `Tm` and zero leading is one-string-per-line prose
-        // the geometry path would merge into a single run, so it stays on the
-        // string walker.
+        // Every show-operator positioned with fragment `Td` placements — plain
+        // `Tj` (CAF payslips, Engie bills), `TJ` arrays (glyph-positioned
+        // statements such as F0686/F0687/F0688), or quote show-ops (`'`/`"`).
+        // Routing is gated on `has_plain_td` either way: a page that shows
+        // every string with `'`/`Tj`/`TJ` at one `Tm` and only vertical line
+        // advances is one-string-per-line prose the geometry path would merge
+        // into a single run, so it stays on the string walker. The `TJ` arm was
+        // missing, so `TJ`+`Td` pages fell through to the walker, which never
+        // runs table detection and emits each visual column as its own line.
         legacy_geometry
-            || ((has_tj_plain || has_quote) && has_plain_td)
+            || ((has_tj || has_tj_plain || has_quote) && has_plain_td)
             || (form_geometry && !legacy_geometry)
             || ((sig.has_tj_plain || sig.has_quote) && form_plain_td)
     } else {

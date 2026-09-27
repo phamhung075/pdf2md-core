@@ -366,3 +366,43 @@ use super::tests_common::*;
         let page = extract_page_text_report(&doc, 1, true, true, false).expect("page text");
         assert_eq!(page.text.split_whitespace().collect::<Vec<_>>(), ["Bonjour"]);
     }
+
+    #[test]
+    fn tj_td_two_column_table_routes_to_layout_and_keeps_values_detached() {
+        // F0686/F0687/F0688 shape: every cell is drawn with a `TJ` array and a
+        // plain `x y Td` fragment placement (no `Tj`, no `Tm`, no `TD`). Before
+        // the routing fix such a page fell through to the string walker, which
+        // never runs table detection and emits each visual column as its own
+        // line ("detached amount alone on a line"). It must now reach the
+        // layout engine and be recovered as a GFM table.
+        let doc = content_doc(
+            b"BT /F1 12 Tf 50 760 Td [(Reference)] TJ ET\n\
+              BT /F1 12 Tf 320 760 Td [(Montant)] TJ ET\n\
+              BT /F1 12 Tf 50 740 Td [(A1)] TJ ET\n\
+              BT /F1 12 Tf 320 740 Td [(10,00)] TJ ET\n\
+              BT /F1 12 Tf 50 720 Td [(B2)] TJ ET\n\
+              BT /F1 12 Tf 320 720 Td [(20,00)] TJ ET",
+        );
+        let page = extract_page_text_report(&doc, 1, true, true, false).expect("page text");
+        assert!(
+            page.tables >= 1,
+            "TJ+Td grid must be recovered as a table:\n{}",
+            page.text
+        );
+        assert!(
+            page.text.contains("---"),
+            "GFM table separator missing:\n{}",
+            page.text
+        );
+        let row = page
+            .text
+            .lines()
+            .find(|l| l.contains("A1"))
+            .expect("A1 row present");
+        assert!(row.contains("10,00"), "amount detached from its row: {row:?}");
+        assert!(
+            !page.text.lines().any(|l| l.trim() == "10,00"),
+            "amount must not be alone on a line:\n{}",
+            page.text
+        );
+    }
