@@ -8,8 +8,15 @@
 use super::*;
 use super::regression_tests_common::*;
 use super::regression_tests_common2::*;
+use super::robustness_repro_fixtures::{
+    many_glyph_page_pdf, oom_xref_w_4gib_pdf, GLYPH_ABORT_OPS, GLYPH_AMPLIFICATION_OPS,
+};
     use lopdf::dictionary;
-        
+
+/// Upper bound on the Markdown a capped page may produce. Truncation keeps the
+/// first `MAX_PAGE_GLYPHS` (64 000) text-show ops, so the output is a few
+/// hundred KB while the untruncated streams are 14.4 MB (M1) / 5.4 MB (M2).
+const BOUNDED_MARKDOWN_CEILING: usize = 1 << 20;
 
     /// The layout path's overdraw dedup is intentional: it folds only an exact
     /// overstrike (same text, same baseline) and must never merge two distinct
@@ -323,11 +330,11 @@ use super::regression_tests_common2::*;
     /// O1: a 542-byte PDF declaring an xref-stream field of 2^32 bytes used to
     /// make lopdf allocate 4 GiB (`vec![0_u8; field_widths[1]]`) and `abort()`
     /// under an address-space limit. The raw-byte pre-validation must reject it
-    /// with a clean error, before lopdf allocates. The fixture is synthetic.
+    /// with a clean error, before lopdf allocates. The repro is built in code.
     #[test]
     fn xref_stream_with_4gib_w_width_is_rejected_not_aborted() {
-        let bytes = include_bytes!("../tests/fixtures/oom-xref-W-4gib.pdf");
-        match load_pdf_document(bytes) {
+        let bytes = oom_xref_w_4gib_pdf();
+        match load_pdf_document(&bytes) {
             Err(err) => assert!(
                 err.contains("xref stream rejected") && err.contains("/W"),
                 "the rejection must name the /W bound, got: {err}"
@@ -339,27 +346,37 @@ use super::regression_tests_common2::*;
     /// M1: a content stream that packs one `(word) Tj` per glyph made lopdf
     /// materialise 800 000 `Operation`s (~865 MB per decode, twice over) for a
     /// 35 KB input. The per-page content-operator cap must truncate the raw
-    /// bytes before decode and report the truncation.
+    /// bytes before decode and report the truncation with bounded output.
     #[test]
     fn many_glyph_page_is_operator_bounded_and_reports_truncation() {
-        let bytes = include_bytes!("../tests/fixtures/mem-glyph-amplification-1.87GB.pdf");
-        let result = convert_pdf_bytes_to_markdown(bytes, &ConversionOptions::default())
+        let bytes = many_glyph_page_pdf(GLYPH_AMPLIFICATION_OPS);
+        let result = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
             .expect("an operator-bounded conversion must still succeed");
         assert!(
             result.budget_exhausted,
             "hitting the content-operator budget must set budget_exhausted so truncation is visible"
         );
+        assert!(
+            result.markdown.len() < BOUNDED_MARKDOWN_CEILING,
+            "the capped page must stay bounded, got {} bytes",
+            result.markdown.len()
+        );
     }
 
     /// The smaller M2 repro aborted under the 1.6 GB address-space limit the
     /// harness applies; the same content-operator cap must let it finish and
-    /// report the truncation.
+    /// report the truncation with bounded output.
     #[test]
     fn glyph_abort_repro_is_bounded_too() {
-        let bytes = include_bytes!("../tests/fixtures/mem-glyph-abort-under-1.6GB.pdf");
-        let result = convert_pdf_bytes_to_markdown(bytes, &ConversionOptions::default())
+        let bytes = many_glyph_page_pdf(GLYPH_ABORT_OPS);
+        let result = convert_pdf_bytes_to_markdown(&bytes, &ConversionOptions::default())
             .expect("an operator-bounded conversion must still succeed");
         assert!(result.budget_exhausted);
+        assert!(
+            result.markdown.len() < BOUNDED_MARKDOWN_CEILING,
+            "the capped page must stay bounded, got {} bytes",
+            result.markdown.len()
+        );
     }
 
     /// O1 secondary guard: an all-zero `/W` consumes no bytes per xref entry, so

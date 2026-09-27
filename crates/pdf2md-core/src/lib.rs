@@ -108,3 +108,5 @@ mod regression_tests_part3;
 mod regression_tests_part4;
 #[cfg(test)]
 mod glyph_counts_tests;
+#[cfg(test)]
+mod robustness_repro_fixtures;
