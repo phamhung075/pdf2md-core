@@ -112,6 +112,38 @@
         v
     }
 
+    /// The glyph counters are additive fields on the C ABI JSON surface, so an
+    /// older consumer that ignores them keeps working (the symbol set is
+    /// unchanged too).
+    ///
+    /// `ffi_panic_is_converted_to_error_json` flips the process-wide
+    /// `FORCE_CONVERT_PANIC` switch, so a concurrent call can observe the caught
+    /// panic's error JSON; retry the cheap conversion until it succeeds rather
+    /// than assert against that unrelated error shape.
+    #[test]
+    fn ffi_json_carries_the_glyph_counters() {
+        let bytes = synthetic_noise_image_pdf(64, 64);
+        for _ in 0..100 {
+            let v: serde_json::Value =
+                serde_json::from_str(&call_json(&bytes, |p, l| pdf2md_convert(p, l))).unwrap();
+            if v["ok"] != serde_json::Value::Bool(true) {
+                std::thread::yield_now();
+                continue;
+            }
+            assert!(
+                v["undecodable_glyphs"].is_u64(),
+                "undecodable_glyphs must be present and numeric: {v}"
+            );
+            assert!(
+                v["decoded_glyphs"].is_u64(),
+                "decoded_glyphs must be present and numeric: {v}"
+            );
+            assert_eq!(v["undecodable_glyphs"], serde_json::json!(0));
+            return;
+        }
+        panic!("conversion kept observing the test-only forced panic");
+    }
+
     #[test]
     fn media_mode_none_is_default_and_embed_is_opt_in() {
         let bytes = synthetic_noise_image_pdf(300, 240);

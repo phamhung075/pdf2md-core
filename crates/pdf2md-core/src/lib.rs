@@ -106,3 +106,5 @@ mod regression_tests_part2;
 mod regression_tests_part3;
 #[cfg(test)]
 mod regression_tests_part4;
+#[cfg(test)]
+mod glyph_counts_tests;
