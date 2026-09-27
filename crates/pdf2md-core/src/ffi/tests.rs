@@ -7,6 +7,8 @@
     use super::*;
     use std::ffi::CStr;
 
+    use crate::robustness_repro_fixtures::{many_glyph_page_pdf, GLYPH_ABORT_OPS};
+
     /// Build a one-page PDF with a single uncompressed `DeviceRGB` image
     /// XObject (deterministic pseudo-random noise) painted at 250x200 pt on a
     /// 400x400 page, plus a minimal Helvetica text layer so the synthetic page
@@ -139,6 +141,48 @@
                 "decoded_glyphs must be present and numeric: {v}"
             );
             assert_eq!(v["undecodable_glyphs"], serde_json::json!(0));
+            return;
+        }
+        panic!("conversion kept observing the test-only forced panic");
+    }
+
+    /// `budget_exhausted` is additive on the C ABI JSON surface and follows the
+    /// same contract as `ConversionResult`'s serde output: an ordinary document
+    /// that stays inside every budget omits the key entirely.
+    #[test]
+    fn ffi_json_omits_budget_exhausted_for_a_normal_pdf() {
+        let bytes = synthetic_noise_image_pdf(64, 64);
+        let v: serde_json::Value =
+            serde_json::from_str(&call_json(&bytes, |p, l| pdf2md_convert(p, l))).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "got {v}");
+        assert!(
+            v.get("budget_exhausted").is_none(),
+            "a normal PDF must omit budget_exhausted: {v}"
+        );
+    }
+
+    /// A page that exceeds the content-operator cap is truncated by the safety
+    /// budget; the C ABI must surface that as `"budget_exhausted": true` so the
+    /// Go gateway/worker can tell the result was truncated. Reuses the M2 repro
+    /// through the FFI entry point itself.
+    #[test]
+    fn ffi_json_reports_budget_exhausted_for_a_capped_page() {
+        let bytes = many_glyph_page_pdf(GLYPH_ABORT_OPS);
+        // `ffi_panic_is_converted_to_error_json` flips the process-wide
+        // `FORCE_CONVERT_PANIC` switch, so retry the cheap case until the
+        // conversion reaches the success path.
+        for _ in 0..100 {
+            let v: serde_json::Value =
+                serde_json::from_str(&call_json(&bytes, |p, l| pdf2md_convert(p, l))).unwrap();
+            if v["ok"] != serde_json::Value::Bool(true) {
+                std::thread::yield_now();
+                continue;
+            }
+            assert_eq!(
+                v.get("budget_exhausted"),
+                Some(&serde_json::Value::Bool(true)),
+                "a page over the cap must report budget_exhausted: true; got {v}"
+            );
             return;
         }
         panic!("conversion kept observing the test-only forced panic");

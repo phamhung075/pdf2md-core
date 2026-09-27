@@ -56,7 +56,9 @@ fn ffi_panic_error(entry: &str) -> *mut c_char {
 ///   { "ok": true, "markdown": "...", "pages": N, "words": N,
 ///     "pages_below_word_floor": N, "tables": N,
 ///     "media": [ { page, x0,y0,x1,y1, width,height, format, kind, decorative, repeat, data_b64 } ],
-///     "duration_us": N }
+///     "duration_us": N, "budget_exhausted": true }
+/// (the `budget_exhausted` key is additive and omitted when false, matching
+/// [`ConversionResult`](crate::ConversionResult)'s serde contract)
 ///   { "ok": false, "error": "..." }
 #[no_mangle]
 pub extern "C" fn pdf2md_convert(pdf_ptr: *const u8, pdf_len: usize) -> *mut c_char {
@@ -251,7 +253,7 @@ fn pdf2md_convert_impl(
                     serde_json::to_value(&r.media).unwrap_or_else(|_| serde_json::json!([]));
                 let blocks_json =
                     serde_json::to_value(&r.blocks).unwrap_or_else(|_| serde_json::json!([]));
-                serde_json::json!({
+                let mut out = serde_json::json!({
                     "ok": true,
                     "markdown": r.markdown,
                     "pages": r.total_pages,
@@ -265,7 +267,13 @@ fn pdf2md_convert_impl(
                     "duration_us": r.duration_us,
                     "needs_vision_rescue": r.needs_vision_rescue,
                     "rescue_reason": r.rescue_reason,
-                })
+                });
+                // Same contract as `ConversionResult`'s serde output: emitted
+                // only when true, so an ordinary conversion's JSON is unchanged.
+                if r.budget_exhausted {
+                    out["budget_exhausted"] = serde_json::Value::Bool(true);
+                }
+                out
             }
             Err(e) => serde_json::json!({ "ok": false, "error": e }),
         }
