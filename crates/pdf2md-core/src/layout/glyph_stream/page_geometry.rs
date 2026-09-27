@@ -8,7 +8,7 @@ use super::*;
 
 /// Height of the page media box in device points (best effort), accounting for page rotation.
 pub fn page_height_of(doc: &Document, page_id: ObjectId) -> Option<f64> {
-    let (_, h) = page_initial_transform(doc, page_id);
+    let (_, h, _) = page_display_size(doc, page_id);
     Some(h)
 }
 
@@ -43,6 +43,16 @@ pub(super) fn inherited_page_object<'a>(
 /// and /MediaBox / /CropBox boundaries. All three are inherited from the
 /// `/Pages` ancestors when absent on the page itself.
 pub(crate) fn page_initial_transform(doc: &Document, page_id: ObjectId) -> (Mtx, f64) {
+    let (m, h, _) = page_display_size(doc, page_id);
+    (m, h)
+}
+
+/// Initial coordinate transformation matrix plus the page's *display* height
+/// and width in device points, taking into account the page /Rotate attribute
+/// (0, 90, 180, 270 degrees clockwise) and /MediaBox / /CropBox boundaries. All
+/// three are inherited from the `/Pages` ancestors when absent on the page
+/// itself.
+pub(crate) fn page_display_size(doc: &Document, page_id: ObjectId) -> (Mtx, f64, f64) {
     let rotate = inherited_page_object(doc, page_id, b"Rotate")
         .and_then(|o| o.as_i64().ok())
         .unwrap_or(0);
@@ -68,10 +78,10 @@ pub(crate) fn page_initial_transform(doc: &Document, page_id: ObjectId) -> (Mtx,
     let h = (y1 - y0).abs();
 
     match rotate {
-        90 => (Mtx::from_parts(0.0, -1.0, 1.0, 0.0, -y0, x1), w),
-        180 => (Mtx::from_parts(-1.0, 0.0, 0.0, -1.0, x1, y1), h),
-        270 => (Mtx::from_parts(0.0, 1.0, -1.0, 0.0, y1, -x0), w),
-        _ => (Mtx::ID, h),
+        90 => (Mtx::from_parts(0.0, -1.0, 1.0, 0.0, -y0, x1), w, h),
+        180 => (Mtx::from_parts(-1.0, 0.0, 0.0, -1.0, x1, y1), h, w),
+        270 => (Mtx::from_parts(0.0, 1.0, -1.0, 0.0, y1, -x0), w, h),
+        _ => (Mtx::ID, h, w),
     }
 }
 

@@ -75,7 +75,7 @@ pub(super) fn next_visible_style(line: &[Span], after: usize) -> Option<InlineSt
 /// legacy plain-text renderer (`render_cluster`), so a line of unstyled spans
 /// produces byte-identical output; only runs whose style is non-plain gain
 /// emphasis delimiters.
-pub(crate) fn render_spans(line: &[Span]) -> String {
+pub(crate) fn render_spans(line: &[Span], page_width: Option<f64>) -> String {
     let mut out = String::new();
     let mut prev_x: Option<f64> = None;
     let mut prev_word_advance = 0.0f64;
@@ -109,7 +109,7 @@ pub(crate) fn render_spans(line: &[Span]) -> String {
                 }
             }
             if !is_space {
-                if gap > 2.5 * size {
+                if wide_gap_breaks(gap, size, 0.0, &line[..i], &line[i..], page_width) {
                     // A distinct column / element on the same row: break the
                     // line AND close any open emphasis first.
                     close_style(&mut out, cur);
@@ -183,7 +183,7 @@ pub(crate) fn render_spans(line: &[Span]) -> String {
 
 /// Render pre-built visual lines to plain text (block/paragraph separation +
 /// word gaps). Line model must come from `build_lines`.
-pub fn render_cluster(lines: &[Vec<Span>]) -> String {
+pub fn render_cluster(lines: &[Vec<Span>], page_width: Option<f64>) -> String {
     if lines.is_empty() {
         return String::new();
     }
@@ -194,7 +194,7 @@ pub fn render_cluster(lines: &[Vec<Span>]) -> String {
     let mut prev_line_y: Option<f64> = None;
 
     for line in lines {
-        push_line(&mut out, line, &mut prev_line_y, &mut list_state, body_size);
+        push_line(&mut out, line, &mut prev_line_y, &mut list_state, body_size, page_width);
     }
 
     out.trim_end().to_string()
@@ -202,20 +202,20 @@ pub fn render_cluster(lines: &[Vec<Span>]) -> String {
 
 /// Render page text in human reading order. When the page is a single column
 /// and nothing was removed, output equals `render_cluster` byte-for-byte.
-pub fn render_human_order(lines: &[Vec<Span>], page_height: f64, drop_furniture: bool) -> String {
+pub fn render_human_order(lines: &[Vec<Span>], page_height: f64, drop_furniture: bool, page_width: Option<f64>) -> String {
     let streams = page_read_order(lines);
     if streams.len() == 1 {
         // Single column: identical to the plain renderer unless we strip
         // furniture lines (page numbers).
         if !drop_furniture {
-            return render_cluster(lines);
+            return render_cluster(lines, page_width);
         }
         let keep: Vec<Vec<Span>> = lines
             .iter()
             .filter(|l| !is_page_number_line(l, page_height))
             .cloned()
             .collect();
-        return render_cluster(&keep);
+        return render_cluster(&keep, page_width);
     }
     let body_size = body_size_for(lines);
     let mut out = String::new();
@@ -229,7 +229,7 @@ pub fn render_human_order(lines: &[Vec<Span>], page_height: f64, drop_furniture:
             if drop_furniture && is_page_number_line(line, page_height) {
                 continue;
             }
-            push_line(&mut out, line, &mut prev_y, &mut list_state, body_size);
+            push_line(&mut out, line, &mut prev_y, &mut list_state, body_size, page_width);
         }
     }
     out.trim_end().to_string()

@@ -209,7 +209,7 @@ pub(super) fn is_plausible_script(cell: &Cell) -> bool {
 /// Rebuild a single visual line's spans into a [`LatexExpr`], recognising simple
 /// super/subscripts. When nothing looks like a script the result is a plain
 /// `Text` node whose string is byte-identical to the legacy line renderer.
-pub fn synthesize_line_expr(line: &[Span]) -> LatexExpr {
+pub fn synthesize_line_expr(line: &[Span], page_width: Option<f64>) -> LatexExpr {
     if line.is_empty() {
         return LatexExpr::Text(String::new());
     }
@@ -308,7 +308,7 @@ pub fn synthesize_line_expr(line: &[Span]) -> LatexExpr {
     if !consumed {
         // No script recognised: fall back to the byte-identical legacy renderer
         // so enabling detection never alters plain text.
-        return LatexExpr::Text(render_spans(line));
+        return LatexExpr::Text(render_spans(line, page_width));
     }
     LatexExpr::seq(parts)
 }
@@ -316,8 +316,8 @@ pub fn synthesize_line_expr(line: &[Span]) -> LatexExpr {
 /// Render a visual line to inline text, honouring super/subscripts as `$...$`
 /// math. When no script is present this is byte-identical to the legacy
 /// `render_spans` output.
-pub fn render_math_line(line: &[Span]) -> String {
-    let expr = synthesize_line_expr(line);
+pub fn render_math_line(line: &[Span], page_width: Option<f64>) -> String {
+    let expr = synthesize_line_expr(line, page_width);
     match expr {
         LatexExpr::Text(s) => s,
         other => other.render_inline_mixed(),
@@ -328,7 +328,7 @@ pub fn render_math_line(line: &[Span]) -> String {
 /// detected, else `None`. Callers use this to keep the *original* text for
 /// plain lines (byte-identity) and only synthesise math where it exists.
 pub fn math_inline_for_line(line: &[Span]) -> Option<String> {
-    match synthesize_line_expr(line) {
+    match synthesize_line_expr(line, None) {
         LatexExpr::Text(_) => None,
         other => Some(other.render_inline_mixed()),
     }

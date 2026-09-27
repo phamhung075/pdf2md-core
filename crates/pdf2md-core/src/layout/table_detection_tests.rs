@@ -211,7 +211,7 @@
             is_vertical: false,
         }];
         let lines = build_lines(&spans);
-        let blocks = build_doc_blocks(&lines, 842.0);
+        let blocks = build_doc_blocks(&lines, 842.0, None);
         assert_eq!(blocks.len(), 1);
         let block = &blocks[0];
         assert_eq!(block.text, "**Bold Section Heading**", "Bold run must be wrapped in **emphasis**");

@@ -33,7 +33,7 @@ pub(super) fn staggered_columns_region(rows: &[Vec<Span>]) -> Option<(usize, usi
     let body = body_size_for(rows).max(1.0);
     let merge_gap = 0.6 * body;
     let max_spread = 2.5 * body;
-    let segs: Vec<Vec<Vec<Span>>> = rows.iter().map(|r| split_line_segments(r)).collect();
+    let segs: Vec<Vec<Vec<Span>>> = rows.iter().map(|r| split_line_segments(r, None)).collect();
 
     // Only a row that itself splits into >= 2 segments can anchor a staggered
     // block: the block's first row must carry at least two of its columns.

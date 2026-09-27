@@ -422,3 +422,205 @@ use super::regression_tests_common2::*;
             "stopword-dense grid was collapsed into prose:\n{md}"
         );
     }
+
+    // ---- Detached right-aligned amount: the wide-gap exception --------------
+
+    /// A label and its lone right-aligned monetary value share one PDF baseline;
+    /// the wide-gap hard break must keep them on one Markdown line. Uses only
+    /// synthetic placeholder text.
+    #[test]
+    fn synthetic_right_aligned_amount_stays_with_its_label() {
+        let page = [
+            tm_text(72.0, 600.0, "Total a payer"),
+            tm_text(430.0, 600.0, "1 234,56"),
+        ]
+        .join("\n");
+        let md = convert_synth(&[page]);
+        assert!(
+            md.lines()
+                .any(|l| l.contains("Total a payer") && l.contains("1 234,56")),
+            "right-aligned amount was detached from its label:\n{md}"
+        );
+    }
+
+    /// Two genuine prose columns must still be split: the exception is limited
+    /// to a lone monetary right segment.
+    #[test]
+    fn synthetic_two_prose_columns_still_split() {
+        let page = [
+            tm_text(72.0, 600.0, "Premiere colonne de texte."),
+            tm_text(320.0, 600.0, "Deuxieme colonne de texte."),
+            tm_text(72.0, 584.0, "Suite de la premiere colonne."),
+            tm_text(320.0, 584.0, "Suite de la deuxieme colonne."),
+            tm_text(72.0, 568.0, "Fin de la premiere colonne."),
+            tm_text(320.0, 568.0, "Fin de la deuxieme colonne."),
+        ]
+        .join("\n");
+        let md = convert_synth(&[page]);
+        assert!(
+            !md.lines()
+                .any(|l| l.contains("premiere colonne") && l.contains("deuxieme colonne")),
+            "two prose columns were welded onto one line:\n{md}"
+        );
+        assert!(md.contains("premiere colonne") && md.contains("deuxieme colonne"));
+    }
+
+    /// A bare non-amount number (a page reference) is not a monetary token, so
+    /// the right margin alone must not fuse it to the label.
+    #[test]
+    fn synthetic_bare_page_reference_number_still_splits() {
+        let page = [
+            tm_text(72.0, 600.0, "Article"),
+            tm_text(540.0, 600.0, "12"),
+        ]
+        .join("\n");
+        let md = convert_synth(&[page]);
+        assert!(
+            !md.lines()
+                .any(|l| l.contains("Article") && l.contains("12")),
+            "bare page reference was joined to its label:\n{md}"
+        );
+    }
+
+    /// A two-column table-ish row of amounts has no letter on the left, so the
+    /// exception does not apply and the columns stay split.
+    #[test]
+    fn synthetic_two_amount_columns_still_split() {
+        let page = [
+            tm_text(72.0, 600.0, "45,00"),
+            tm_text(430.0, 600.0, "120,00"),
+        ]
+        .join("\n");
+        let md = convert_synth(&[page]);
+        assert!(
+            !md.lines()
+                .any(|l| l.contains("45,00") && l.contains("120,00")),
+            "two amount columns were welded onto one line:\n{md}"
+        );
+    }
+
+    /// A label followed by *two* wide-separated amount columns: the right
+    /// remainder is not a single value, so the exception must not fire and the
+    /// row must split exactly as it did before the exception existed.
+    #[test]
+    fn synthetic_label_with_two_amount_columns_still_splits() {
+        let page = [
+            tm_text(72.0, 600.0, "Total a payer"),
+            tm_text(300.0, 600.0, "1 234,56"),
+            tm_text(480.0, 600.0, "9 876,54"),
+        ]
+        .join("\n");
+        let md = convert_synth(&[page]);
+        assert!(
+            !md.lines()
+                .any(|l| l.contains("1 234,56") && l.contains("9 876,54")),
+            "two amount columns were welded together:\n{md}"
+        );
+        assert!(
+            !md.lines()
+                .any(|l| l.contains("Total a payer") && l.contains("1 234,56")),
+            "the label swallowed a two-column amount row:\n{md}"
+        );
+    }
+
+    /// A French/ISO date (`dd.mm.yyyy`) carries a second separator, so the
+    /// monetary-amount shape rejects it and the wide gap still breaks.
+    #[test]
+    fn synthetic_label_with_date_still_splits() {
+        let page = [
+            tm_text(72.0, 600.0, "Echeance"),
+            tm_text(430.0, 600.0, "12.01.2026"),
+        ]
+        .join("\n");
+        let md = convert_synth(&[page]);
+        assert!(
+            !md.lines()
+                .any(|l| l.contains("Echeance") && l.contains("12.01.2026")),
+            "date was kept on its label line:\n{md}"
+        );
+    }
+
+    /// A 2-decimal percentage is not money: the `%` is rejected by the shape.
+    #[test]
+    fn synthetic_label_with_percentage_still_splits() {
+        let page = [
+            tm_text(72.0, 600.0, "Taux"),
+            tm_text(430.0, 600.0, "12,50 %"),
+        ]
+        .join("\n");
+        let md = convert_synth(&[page]);
+        assert!(
+            !md.lines()
+                .any(|l| l.contains("Taux") && l.contains("12,50")),
+            "percentage was kept on its label line:\n{md}"
+        );
+    }
+
+    /// A bare 4-digit reference has no mandatory decimal part, so it is not a
+    /// monetary amount and stays detached from the label.
+    #[test]
+    fn synthetic_label_with_four_digit_reference_still_splits() {
+        let page = [
+            tm_text(72.0, 600.0, "Reference"),
+            tm_text(430.0, 600.0, "1234"),
+        ]
+        .join("\n");
+        let md = convert_synth(&[page]);
+        assert!(
+            !md.lines()
+                .any(|l| l.contains("Reference") && l.contains("1234")),
+            "four-digit reference was joined to its label:\n{md}"
+        );
+    }
+
+    /// A label whose last token ends in a bare 1..=3-digit number could be read
+    /// as the leading thousands group of the right-side amount once joined
+    /// ("12 345,67"), so the exception must not fire and the gap still splits.
+    #[test]
+    fn synthetic_label_with_trailing_number_still_splits() {
+        let page = [
+            tm_text(72.0, 600.0, "Label 12"),
+            tm_text(430.0, 600.0, "345,67"),
+        ]
+        .join("\n");
+        let md = convert_synth(&[page]);
+        assert!(
+            !md.lines()
+                .any(|l| l.contains("Label 12") && l.contains("345,67")),
+            "a trailing label number was welded to the amount:\n{md}"
+        );
+    }
+
+    /// Same fusion risk when the label's last token is an alphanumeric code
+    /// ending in digits ("AB12 345,67"), so the gap still splits.
+    #[test]
+    fn synthetic_label_with_trailing_alphanumeric_code_still_splits() {
+        let page = [
+            tm_text(72.0, 600.0, "Code AB12"),
+            tm_text(430.0, 600.0, "345,67"),
+        ]
+        .join("\n");
+        let md = convert_synth(&[page]);
+        assert!(
+            !md.lines()
+                .any(|l| l.contains("Code AB12") && l.contains("345,67")),
+            "a trailing code was welded to the amount:\n{md}"
+        );
+    }
+
+    /// A label without any trailing digit run carries no grouping ambiguity, so
+    /// the lone right-aligned amount is still kept on its line.
+    #[test]
+    fn synthetic_label_without_trailing_digit_keeps_amount() {
+        let page = [
+            tm_text(72.0, 600.0, "Total TTC"),
+            tm_text(430.0, 600.0, "345,67"),
+        ]
+        .join("\n");
+        let md = convert_synth(&[page]);
+        assert!(
+            md.lines()
+                .any(|l| l.contains("Total TTC") && l.contains("345,67")),
+            "amount was detached from a digit-free label:\n{md}"
+        );
+    }

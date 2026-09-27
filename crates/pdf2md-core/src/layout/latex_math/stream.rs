@@ -29,6 +29,7 @@ pub(super) fn render_math_stream(
     page_height: f64,
     drop_furniture: bool,
     body_size: f64,
+    page_width: Option<f64>,
 ) -> String {
     let mut fractions = detect_fractions(stream, bars);
     fractions.extend(detect_stacked_fractions(stream));
@@ -91,12 +92,12 @@ pub(super) fn render_math_stream(
             // within-line script renderer re-welded such a row into one line —
             // `render_math_line` does not apply `render_spans`'s hard break — so
             // a page whose columns `page_read_order` left fused stayed fused.
-            for seg in split_hard_breaks(line) {
+            for seg in split_hard_breaks(line, page_width) {
                 if seg.is_empty() {
                     continue;
                 }
                 let (role, render_slice) = classify_line(&seg, body_size, &mut list_state);
-                let text = render_math_line(render_slice);
+                let text = render_math_line(render_slice, page_width);
                 out.push_str(&format_structured_line(&role, text.trim_end()));
                 out.push('\n');
             }
@@ -116,18 +117,19 @@ pub fn render_math(
     bars: &[RuleSeg],
     page_height: f64,
     drop_furniture: bool,
+    page_width: Option<f64>,
 ) -> String {
     let body_size = crate::layout::reading_order::body_size_for(lines);
     let streams = crate::layout::reading_order::page_read_order(lines);
     if streams.len() == 1 {
-        return render_math_stream(&streams[0], bars, page_height, drop_furniture, body_size);
+        return render_math_stream(&streams[0], bars, page_height, drop_furniture, body_size, page_width);
     }
     let mut out = String::new();
     for (ci, stream) in streams.iter().enumerate() {
         if ci > 0 && !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(&render_math_stream(stream, bars, page_height, drop_furniture, body_size));
+        out.push_str(&render_math_stream(stream, bars, page_height, drop_furniture, body_size, page_width));
     }
     out.trim_end().to_string()
 }

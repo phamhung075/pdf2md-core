@@ -321,7 +321,7 @@ use super::structural_tests_common::*;
             one_span_line("language models. arXiv preprint arXiv:2108.07732, 2021.", BODY, false),
             bracketed(11, "Michael Collins"),
         ];
-        let md = render_cluster(&lines);
+        let md = render_cluster(&lines, None);
         assert!(md.contains("1. Joshua Ainslie"), "{md}");
         assert!(md.contains("2. Jacob Austin"), "{md}");
         assert!(md.contains("11. Michael Collins"), "{md}");
@@ -346,7 +346,7 @@ use super::structural_tests_common::*;
             one_span_line("Body between three and four.", BODY, false),
             bulleted_line("5."),
         ];
-        let md = render_cluster(&lines);
+        let md = render_cluster(&lines, None);
         assert!(md.contains("1. Item text"), "{md}");
         assert!(md.contains("2. Item text"), "{md}");
         assert!(md.contains("3. Item text"), "{md}");
@@ -360,7 +360,7 @@ use super::structural_tests_common::*;
         // the same "1." on every item must still emit 1, 2, 3 (adopting a
         // literal number only when it runs *ahead* never fires here).
         let lines = vec![bulleted_line("1."), bulleted_line("1."), bulleted_line("1.")];
-        let md = render_cluster(&lines);
+        let md = render_cluster(&lines, None);
         assert!(md.contains("1. Item text"), "{md}");
         assert!(md.contains("2. Item text"), "{md}");
         assert!(md.contains("3. Item text"), "{md}");

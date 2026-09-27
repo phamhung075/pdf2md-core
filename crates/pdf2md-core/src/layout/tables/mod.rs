@@ -62,7 +62,7 @@ fn spans_outside(line: &[Span], x0: f64, x1: f64) -> Vec<Span> {
 
 /// Render a page's visual lines to text, replacing detected table blocks with
 /// GFM pipe tables. Non-table lines use the exact same rules as `render_cluster`.
-pub fn render_with_tables(lines: &[Vec<Span>], tables: &[TableHit]) -> String {
+pub fn render_with_tables(lines: &[Vec<Span>], tables: &[TableHit], page_width: Option<f64>) -> String {
     let mut out = String::new();
     let mut prev_line_y: Option<f64> = None;
     let tables = de_overlap_tables(tables);
@@ -98,7 +98,7 @@ pub fn render_with_tables(lines: &[Vec<Span>], tables: &[TableHit]) -> String {
                 .collect();
             if side_content.iter().any(|l| !l.is_empty()) {
                 let bands = detect_column_bands(&side_content);
-                push_band_lines(&mut out, &bands, &mut prev_line_y, &mut list_state, body_size);
+                push_band_lines(&mut out, &bands, &mut prev_line_y, &mut list_state, body_size, page_width);
             }
             // Blank line before the table (markdown block separation).
             if !out.is_empty() && !out.ends_with("\n\n") {
@@ -131,7 +131,7 @@ pub fn render_with_tables(lines: &[Vec<Span>], tables: &[TableHit]) -> String {
             lines.len()
         };
         let bands = detect_column_bands(&lines[i..seg_end]);
-        push_band_lines(&mut out, &bands, &mut prev_line_y, &mut list_state, body_size);
+        push_band_lines(&mut out, &bands, &mut prev_line_y, &mut list_state, body_size, page_width);
         i = seg_end;
     }
 
@@ -196,7 +196,7 @@ mod tests {
         ];
         // Table A occupies lines 0..=0; table B occupies lines 2..=2.
         let tables = vec![table(0, 0), table(2, 2)];
-        let md = render_with_tables(&lines, &tables);
+        let md = render_with_tables(&lines, &tables, None);
         assert_eq!(table_blocks(&md), 2, "both disjoint tables must render:\n{md}");
         // The prose lines in between remain.
         assert!(md.contains("r1"));
@@ -211,7 +211,7 @@ mod tests {
         // Outer [1..=2] contains inner [2..=2]: the outer is emitted, the inner
         // is a duplicate of the same region and must be dropped (not double).
         let tables = vec![table(1, 2), table(2, 2)];
-        let md = render_with_tables(&lines, &tables);
+        let md = render_with_tables(&lines, &tables, None);
         assert_eq!(table_blocks(&md), 1, "nested candidates collapse to one table:\n{md}");
     }
 
@@ -226,7 +226,7 @@ mod tests {
         // Overlapping candidates [1..=2] and [2..=3]: the first is emitted as a
         // table; the row the second claimed must not be silently lost.
         let tables = vec![table(1, 2), table(2, 3)];
-        let md = render_with_tables(&lines, &tables);
+        let md = render_with_tables(&lines, &tables, None);
         assert_eq!(table_blocks(&md), 1, "overlap collapses to the first table:\n{md}");
         assert!(
             md.contains("r3"),
@@ -240,7 +240,7 @@ mod tests {
         // Two candidates sharing a start: the wider/earliest wins; duplicates
         // must not produce a second (staled) table.
         let tables = vec![table(0, 1), table(0, 2)];
-        let md = render_with_tables(&lines, &tables);
+        let md = render_with_tables(&lines, &tables, None);
         assert_eq!(table_blocks(&md), 1, "same-start candidates render once:\n{md}");
     }
 
@@ -280,7 +280,7 @@ mod tests {
             ],
             bbox: BoundingBox::new(300.0, 680.0, 400.0, 710.0),
         };
-        let md = render_with_tables(&lines, &[hit]);
+        let md = render_with_tables(&lines, &[hit], None);
         assert!(
             md.contains("left prose one") && md.contains("left prose two"),
             "prose beside the side table was dropped:\n{md}"

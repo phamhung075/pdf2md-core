@@ -52,7 +52,7 @@
             span("Hello", 100.0, (false, false, false)),
             span("world", 133.0, (false, false, false)),
         ];
-        assert_eq!(render_spans(&line), "Hello world");
+        assert_eq!(render_spans(&line, None), "Hello world");
     }
 
     #[test]
@@ -63,13 +63,13 @@
             span("Hello", 100.0, (false, false, false)),
             span("world", 170.0, (false, false, false)),
         ];
-        assert_eq!(render_spans(&line), "Hello\nworld");
+        assert_eq!(render_spans(&line, None), "Hello\nworld");
     }
 
     #[test]
     fn unstyled_line_has_no_markers() {
         let line = words_spaced(&[("Hello", (false, false, false)), ("world", (false, false, false))]);
-        assert_eq!(render_spans(&line), "Hello world");
+        assert_eq!(render_spans(&line, None), "Hello world");
     }
 
     #[test]
@@ -81,7 +81,7 @@
             ("Bold", (true, false, false)),
             ("text", (true, false, false)),
         ]);
-        assert_eq!(render_spans(&line), "**Bold text**");
+        assert_eq!(render_spans(&line, None), "**Bold text**");
     }
 
     #[test]
@@ -93,7 +93,7 @@
             span("Word1", 100.0, (true, false, false)),
             span("Word2", 133.0, (true, false, false)),
         ];
-        assert_eq!(render_spans(&line), "**Word1 Word2**");
+        assert_eq!(render_spans(&line, None), "**Word1 Word2**");
     }
 
     #[test]
@@ -103,7 +103,7 @@
             ("Word1", (true, false, false)),
             ("Word2", (true, false, false)),
         ]);
-        assert_eq!(render_spans(&line), "**Word1 Word2**");
+        assert_eq!(render_spans(&line, None), "**Word1 Word2**");
     }
 
     #[test]
@@ -112,7 +112,7 @@
             ("Bold", (true, false, false)),
             ("normal", (false, false, false)),
         ]);
-        assert_eq!(render_spans(&line), "**Bold** normal");
+        assert_eq!(render_spans(&line, None), "**Bold** normal");
     }
 
     #[test]
@@ -121,7 +121,7 @@
             ("Bold", (true, false, false)),
             ("Italic", (false, true, false)),
         ]);
-        assert_eq!(render_spans(&line), "**Bold** *Italic*");
+        assert_eq!(render_spans(&line, None), "**Bold** *Italic*");
     }
 
     #[test]
@@ -133,19 +133,19 @@
             span("Hello", 100.0, (true, false, false)),
             span("world", 170.0, (true, false, false)),
         ];
-        assert_eq!(render_spans(&line), "**Hello**\n**world**");
+        assert_eq!(render_spans(&line, None), "**Hello**\n**world**");
     }
 
     #[test]
     fn italic_run_uses_single_asterisk() {
         let line = words_spaced(&[("Note", (false, true, false))]);
-        assert_eq!(render_spans(&line), "*Note*");
+        assert_eq!(render_spans(&line, None), "*Note*");
     }
 
     #[test]
     fn underline_run_uses_html_u() {
         let line = words_spaced(&[("Link", (false, false, true))]);
-        assert_eq!(render_spans(&line), "<u>Link</u>");
+        assert_eq!(render_spans(&line, None), "<u>Link</u>");
     }
 
     #[test]
@@ -155,7 +155,7 @@
             ("normal", (false, false, false)),
             ("Italic", (false, true, false)),
         ]);
-        assert_eq!(render_spans(&line), "**Bold** normal *Italic*");
+        assert_eq!(render_spans(&line, None), "**Bold** normal *Italic*");
     }
 
     #[test]
@@ -165,7 +165,7 @@
             span(" ", 160.0, (true, false, false)), // space glyph, style ignored
             span("After", 165.0, (false, false, false)),
         ];
-        assert_eq!(render_spans(&line), "**BoldTail** After");
+        assert_eq!(render_spans(&line, None), "**BoldTail** After");
     }
 
     #[test]
@@ -181,7 +181,7 @@
             span("2 ", 130.0, (true, false, false)),
             span("mail", 142.0, (false, false, false)),
         ];
-        let rendered = render_spans(&line);
+        let rendered = render_spans(&line, None);
         assert_eq!(rendered, "dans **2** mail");
         assert!(
             !rendered.contains("2 **"),
@@ -198,7 +198,7 @@
             span("2 ", 130.0, (true, false, false)),
             span("mail", 142.0, (false, true, false)),
         ];
-        let rendered = render_spans(&line);
+        let rendered = render_spans(&line, None);
         assert_eq!(rendered, "dans **2** *mail*");
         assert!(!rendered.contains("2 **"), "{rendered:?}");
     }
@@ -212,7 +212,7 @@
             span(" 2", 100.0, (true, false, false)),
             span("mail", 120.0, (false, false, false)),
         ];
-        let rendered = render_spans(&line);
+        let rendered = render_spans(&line, None);
         assert_eq!(rendered, "**2** mail");
         assert!(
             !rendered.starts_with("** "),

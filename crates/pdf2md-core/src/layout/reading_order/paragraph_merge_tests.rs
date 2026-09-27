@@ -108,7 +108,7 @@
             }]
         }
         let lines = vec![line("Description", 100.0, 700.0), line("-20,48 €", 200.0, 660.0)];
-        let blocks = build_doc_blocks(&lines, 842.0);
+        let blocks = build_doc_blocks(&lines, 842.0, None);
         let neg_block = blocks
             .iter()
             .find(|b| b.text.contains("20,48"))
@@ -138,7 +138,7 @@
             }]
         }
         let lines = vec![line("Description", 100.0, 700.0), line("- Item text", 100.0, 660.0)];
-        let blocks = build_doc_blocks(&lines, 842.0);
+        let blocks = build_doc_blocks(&lines, 842.0, None);
         let list_block = blocks
             .iter()
             .find(|b| b.text.contains("Item text"))
@@ -348,10 +348,10 @@
                 &[("France", 300.0), ("web", 344.0), ("site", 370.0)]),
         ];
         let pc = page_two_columns_rows(&lines).expect("two consistent columns must be detected");
-        let bottom: Vec<String> = pc.bottom_full.iter().map(|l| render_line_text(l)).collect();
+        let bottom: Vec<String> = pc.bottom_full.iter().map(|l| render_line_text(l, None)).collect();
         assert!(bottom.is_empty(), "no unpaired column line may be dumped to the footer: {bottom:?}");
         assert!(pc.top_full.is_empty(), "nothing sits above the column block");
-        let left: Vec<String> = pc.left.iter().map(|l| render_line_text(l)).collect();
+        let left: Vec<String> = pc.left.iter().map(|l| render_line_text(l, None)).collect();
         let idx = left
             .iter()
             .position(|t| t.contains("intercontinentaux."))
@@ -382,8 +382,8 @@
             col_span("Abbaye", 128.0, 300.0),
             col_span("250g", 170.0, 300.0),
         ];
-        let segs = split_hard_breaks(&line);
-        let rendered: Vec<String> = segs.iter().map(|s| render_spans(s)).collect();
+        let segs = split_hard_breaks(&line, None);
+        let rendered: Vec<String> = segs.iter().map(|s| render_spans(s, None)).collect();
         assert_eq!(
             segs.len(),
             1,
@@ -392,10 +392,10 @@
         // The whole-row render agrees: it emits no hard newline, so the
         // pre-split must not either.
         assert!(
-            !render_spans(&line).contains('\n'),
+            !render_spans(&line, None).contains('\n'),
             "render_spans keeps the row on one line"
         );
-        assert!(render_spans(&line).contains("Abbaye 250g"));
+        assert!(render_spans(&line, None).contains("Abbaye 250g"));
     }
 
     #[test]
@@ -412,12 +412,12 @@
             col_span("Abbaye", 128.0, 300.0),
             col_span("250g", 170.0, 300.0),
         ];
-        let segs = split_line_segments(&line);
+        let segs = split_line_segments(&line, None);
         assert_eq!(
             segs.len(),
             1,
             "flush spans must stay one segment: {:?}",
-            segs.iter().map(|s| render_spans(s)).collect::<Vec<_>>()
+            segs.iter().map(|s| render_spans(s, None)).collect::<Vec<_>>()
         );
 
         // A genuine 30pt empty gutter (previous span ends 24pt in, next starts
@@ -427,7 +427,7 @@
             col_span("right", 104.0, 300.0),
         ];
         assert_eq!(
-            split_line_segments(&gutter).len(),
+            split_line_segments(&gutter, None).len(),
             2,
             "a real column gutter must still split"
         );

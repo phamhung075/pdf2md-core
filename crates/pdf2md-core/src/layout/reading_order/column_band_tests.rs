@@ -33,8 +33,8 @@ use super::column_band_tests_common::*;
         assert_eq!(bands.len(), 2, "one Columns band, then the Full heading band");
         match &bands[0] {
             ColumnBand::Columns { left, right } => {
-                let lt: Vec<String> = left.iter().map(|l| render_line_text(l)).collect();
-                let rt: Vec<String> = right.iter().map(|l| render_line_text(l)).collect();
+                let lt: Vec<String> = left.iter().map(|l| render_line_text(l, None)).collect();
+                let rt: Vec<String> = right.iter().map(|l| render_line_text(l, None)).collect();
                 assert_eq!(lt.len(), 5, "all five prose rows stay in the left stream: {lt:?}");
                 assert_eq!(rt.len(), 5, "all five grid/caption rows stay in the right stream: {rt:?}");
                 assert!(
@@ -54,7 +54,7 @@ use super::column_band_tests_common::*;
             ColumnBand::Stacks(_) => panic!("mixed prose/table block was merged instead of split"),
         }
         match &bands[1] {
-            ColumnBand::Full(rows) => assert_eq!(render_line_text(&rows[0]), "Heading"),
+            ColumnBand::Full(rows) => assert_eq!(render_line_text(&rows[0], None), "Heading"),
             ColumnBand::Columns { .. } | ColumnBand::Stacks(_) => {
                 panic!("a full-width heading must not be a column")
             }
@@ -116,8 +116,8 @@ use super::column_band_tests_common::*;
         });
         assert_eq!(left.len(), 6, "body rows must stay in the left stream");
         assert_eq!(right.len(), 6, "side-column rows must stay in the right stream");
-        let lt: Vec<String> = left.iter().map(|l| render_line_text(l)).collect();
-        let rt: Vec<String> = right.iter().map(|l| render_line_text(l)).collect();
+        let lt: Vec<String> = left.iter().map(|l| render_line_text(l, None)).collect();
+        let rt: Vec<String> = right.iter().map(|l| render_line_text(l, None)).collect();
         assert!(
             lt[0].contains("alpha") && !lt[0].contains("caption"),
             "side column woven into the body: {lt:?}"
@@ -172,7 +172,7 @@ use super::column_band_tests_common::*;
         let mut out = String::new();
         let mut prev = None;
         let mut ls = ListRunState::default();
-        push_band_lines(&mut out, &bands, &mut prev, &mut ls, 10.0);
+        push_band_lines(&mut out, &bands, &mut prev, &mut ls, 10.0, None);
         assert!(
             out.contains("\n\n"),
             "no blank line between column streams: {out:?}"
@@ -246,8 +246,8 @@ use super::column_band_tests_common::*;
         assert_eq!(bands.len(), 3, "leading Full, Columns, trailing Full");
         match &bands[1] {
             ColumnBand::Columns { left, right } => {
-                let lt: Vec<String> = left.iter().map(|l| render_line_text(l)).collect();
-                let rt: Vec<String> = right.iter().map(|l| render_line_text(l)).collect();
+                let lt: Vec<String> = left.iter().map(|l| render_line_text(l, None)).collect();
+                let rt: Vec<String> = right.iter().map(|l| render_line_text(l, None)).collect();
                 assert_eq!(lt.len(), 6, "all six prose rows stay left: {lt:?}");
                 assert_eq!(rt.len(), 4, "all four grid rows stay right: {rt:?}");
                 assert!(
@@ -264,7 +264,7 @@ use super::column_band_tests_common::*;
         }
         match &bands[0] {
             ColumnBand::Full(rows) => {
-                assert!(render_line_text(&rows[0]).contains("abcdefghij"))
+                assert!(render_line_text(&rows[0], None).contains("abcdefghij"))
             }
             ColumnBand::Columns { .. } | ColumnBand::Stacks(_) => {
                 panic!("full-width caption must not be a column")
@@ -366,8 +366,8 @@ use super::column_band_tests_common::*;
         let (left, right) = cols[1];
         assert_eq!(left.len(), 6, "the French lines must stay left: {left:?}");
         assert_eq!(right.len(), 6, "the English lines must stay right: {right:?}");
-        let lt: Vec<String> = left.iter().map(|l| render_line_text(l)).collect();
-        let rt: Vec<String> = right.iter().map(|l| render_line_text(l)).collect();
+        let lt: Vec<String> = left.iter().map(|l| render_line_text(l, None)).collect();
+        let rt: Vec<String> = right.iter().map(|l| render_line_text(l, None)).collect();
         assert!(
             lt[0].contains("Le texte francais") && !lt[0].contains("Site internet"),
             "English woven into the French column: {lt:?}"

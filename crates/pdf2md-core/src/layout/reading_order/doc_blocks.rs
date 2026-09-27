@@ -7,7 +7,7 @@
 use super::*;
 
 /// Build the structured block list for a glyph page in reading order.
-pub fn build_doc_blocks(lines: &[Vec<Span>], page_height: f64) -> Vec<DocBlock> {
+pub fn build_doc_blocks(lines: &[Vec<Span>], page_height: f64, page_width: Option<f64>) -> Vec<DocBlock> {
     let sizes: Vec<f64> = lines
         .iter()
         .map(|l| l.iter().map(|s| s.size).fold(0.0f64, f64::max))
@@ -26,7 +26,7 @@ pub fn build_doc_blocks(lines: &[Vec<Span>], page_height: f64) -> Vec<DocBlock> 
             if is_page_number_line(&line, page_height) {
                 continue;
             }
-            for seg in split_line_segments(&line) {
+            for seg in split_line_segments(&line, page_width) {
                 let size = seg.iter().map(|s| s.size).fold(0.0f64, f64::max).max(1.0);
                 let x0 = seg.iter().map(|s| s.x).fold(f64::INFINITY, f64::min);
                 let x1 = seg
@@ -38,7 +38,7 @@ pub fn build_doc_blocks(lines: &[Vec<Span>], page_height: f64) -> Vec<DocBlock> 
                 // Real typographic bounding box centered on visual baseline
                 let y0 = baseline_min - 0.5 * size;
                 let y1 = baseline_max + 0.5 * size;
-                let text = render_line_text(&seg);
+                let text = render_line_text(&seg, page_width);
                 if text.trim().is_empty() {
                     continue;
                 }

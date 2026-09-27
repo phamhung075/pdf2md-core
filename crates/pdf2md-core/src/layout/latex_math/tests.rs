@@ -78,9 +78,9 @@
             span("x", 100.0, 700.0, 12.0, 8.0),
             span("2", 110.0, 712.0, 8.0, 5.0),
         ];
-        let expr = synthesize_line_expr(&line);
+        let expr = synthesize_line_expr(&line, None);
         assert_eq!(expr.to_latex(), r"x^{2}");
-        assert_eq!(render_math_line(&line), r"$x^{2}$");
+        assert_eq!(render_math_line(&line, None), r"$x^{2}$");
     }
 
     /// "a" baseline 700, subscript "i" baseline 694.
@@ -90,7 +90,7 @@
             span("a", 100.0, 700.0, 12.0, 8.0),
             span("i", 108.0, 694.0, 8.0, 5.0),
         ];
-        assert_eq!(synthesize_line_expr(&line).to_latex(), r"a_{i}");
+        assert_eq!(synthesize_line_expr(&line, None).to_latex(), r"a_{i}");
     }
 
     /// A decorative whitespace-only spacer must never be treated as a
@@ -107,7 +107,7 @@
             // Trailing spacer: smaller size, ~4pt above the text baseline.
             span(" ", 302.0, 704.0, 9.96, 3.0),
         ];
-        let rendered = render_math_line(&line);
+        let rendered = render_math_line(&line, None);
         assert!(
             !rendered.contains('$'),
             "a whitespace spacer must not synthesize math, got {rendered}"
@@ -133,7 +133,7 @@
                 200.0,
             ),
         ];
-        let rendered = render_math_line(&line);
+        let rendered = render_math_line(&line, None);
         assert!(
             !rendered.contains('$'),
             "a long offset run must not synthesize math, got {rendered}"
@@ -154,7 +154,7 @@
             span("1", 100.0, 700.0, 12.0, 8.0),
             span("ère", 108.0, 712.0, 8.0, 12.0),
         ];
-        assert_eq!(render_math_line(&line), r"$1^{ère}$");
+        assert_eq!(render_math_line(&line, None), r"$1^{ère}$");
     }
 
     /// Plain body text must remain byte-identical (no false positives).
@@ -167,7 +167,7 @@
             span("caf", 124.0, 700.0, 10.0, 14.0),
             span("total", 146.0, 700.0, 10.0, 20.0),
         ];
-        let rendered = render_math_line(&line);
+        let rendered = render_math_line(&line, None);
         // The legacy renderer joins words with a single space.
         assert!(rendered.contains("Estim caf total"), "got {rendered}");
         assert!(!rendered.contains('$'), "got {rendered}");
@@ -185,7 +185,7 @@
             span("note", 134.0, 700.0, 12.0, 40.0),
             span("1", 176.0, 712.0, 8.0, 5.0),
         ];
-        let rendered = render_math_line(&line);
+        let rendered = render_math_line(&line, None);
         assert!(
             !rendered.contains("$See"),
             "leading prose must stay plain, got {rendered}"
@@ -206,7 +206,7 @@
             span("implementation", 100.0, 700.0, 12.0, 90.0),
             span("1", 192.0, 712.0, 8.0, 5.0),
         ];
-        let rendered = render_math_line(&line);
+        let rendered = render_math_line(&line, None);
         assert!(
             rendered.contains("implementation$^{1}$"),
             "prose word must stay plain, got {rendered}"
@@ -227,7 +227,7 @@
             span("2", 152.0, 712.0, 8.0, 5.0),
             span(".", 160.0, 700.0, 12.0, 4.0),
         ];
-        let rendered = render_math_line(&line);
+        let rendered = render_math_line(&line, None);
         assert_eq!(rendered, "SkyPilot$^{2}$.", "got {rendered}");
     }
 
@@ -239,7 +239,7 @@
             span("x", 100.0, 700.0, 12.0, 8.0),
             span("2", 110.0, 712.0, 8.0, 5.0),
         ];
-        assert_eq!(render_math_line(&line), r"$x^{2}$");
+        assert_eq!(render_math_line(&line, None), r"$x^{2}$");
     }
 
     /// A numeric base is genuine math, so it stays inside the inline math
@@ -250,7 +250,7 @@
             span("10", 100.0, 700.0, 12.0, 14.0),
             span("5", 116.0, 712.0, 8.0, 5.0),
         ];
-        assert_eq!(render_math_line(&line), r"$10^{5}$");
+        assert_eq!(render_math_line(&line, None), r"$10^{5}$");
     }
 
     #[test]
@@ -444,7 +444,7 @@
             vec![span("2", 150.0, 701.0, 8.0, 5.0)],
         ];
         let bars: Vec<RuleSeg> = vec![(708.0, 150.0, 170.0)];
-        let text = render_math(&stream, &bars, 842.0, true);
+        let text = render_math(&stream, &bars, 842.0, true, None);
         assert!(text.contains(r"$\frac{1}{2}$"), "got {text}");
     }
 

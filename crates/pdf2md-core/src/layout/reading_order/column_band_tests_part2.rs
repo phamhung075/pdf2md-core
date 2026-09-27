@@ -45,7 +45,7 @@ use super::column_band_tests_common::*;
             .iter()
             .flatten()
             .flat_map(|l| {
-                render_line_text(l)
+                render_line_text(l, None)
                     .split('\n')
                     .map(|s| s.trim().to_string())
                     .collect::<Vec<_>>()
@@ -156,8 +156,8 @@ use super::column_band_tests_common::*;
         assert_eq!(bands.len(), 3, "Full list preamble, Columns block, Full heading");
         match &bands[1] {
             ColumnBand::Columns { left, right } => {
-                let lt: Vec<String> = left.iter().map(|l| render_line_text(l)).collect();
-                let rt: Vec<String> = right.iter().map(|l| render_line_text(l)).collect();
+                let lt: Vec<String> = left.iter().map(|l| render_line_text(l, None)).collect();
+                let rt: Vec<String> = right.iter().map(|l| render_line_text(l, None)).collect();
                 assert!(lt[0].contains("4."), "list item 4 stays left: {lt:?}");
                 assert!(lt[1].contains("5."), "list item 5 stays left: {lt:?}");
                 assert!(
@@ -174,7 +174,7 @@ use super::column_band_tests_common::*;
         }
         // And the flattened page order must read 1..5 before the box heading.
         let streams = page_read_order(&lines);
-        let seq: Vec<String> = streams.iter().flatten().map(|l| render_line_text(l)).collect();
+        let seq: Vec<String> = streams.iter().flatten().map(|l| render_line_text(l, None)).collect();
         let pos = |needle: &str| {
             seq.iter()
                 .position(|t| t.contains(needle))

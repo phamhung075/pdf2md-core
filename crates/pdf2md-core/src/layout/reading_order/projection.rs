@@ -49,7 +49,7 @@ pub fn detect_projection_two_columns(lines: &[Vec<Span>]) -> Option<PageColumns>
         if b.x1 > min_x + 50.0 && b.x1 < max_x - 50.0 {
             candidate_xs.push(b.x1 + 5.0);
         }
-        for seg in split_line_segments(&b.line) {
+        for seg in split_line_segments(&b.line, None) {
             let seg_x1 = seg.iter().map(|s| s.x + s.advance).fold(f64::NEG_INFINITY, f64::max);
             if seg_x1 > min_x + 50.0 && seg_x1 < max_x - 50.0 {
                 candidate_xs.push(seg_x1 + 5.0);

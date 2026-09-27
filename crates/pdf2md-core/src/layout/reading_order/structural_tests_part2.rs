@@ -41,7 +41,7 @@ use super::structural_tests_common::*;
             bulleted_line("-"),
             bulleted_line("-"),
         ];
-        let md = render_cluster(&lines);
+        let md = render_cluster(&lines, None);
         assert!(md.contains("# Document Title"), "got:\n{md}");
         assert!(md.contains("- Item text"), "got:\n{md}");
         assert!(

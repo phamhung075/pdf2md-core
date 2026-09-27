@@ -25,7 +25,7 @@ pub fn extract_page_glyphs(
     let content: Content<Vec<Operation>> = crate::text_extract::decode_page_content(doc, page_id)
         .map_err(|e| e.to_string())?;
 
-    let (init_ctm, mut page_height) = page_initial_transform(doc, page_id);
+    let (init_ctm, mut page_height, mut page_width) = page_display_size(doc, page_id);
 
     let font_key = chain
         .first()
@@ -63,7 +63,10 @@ pub fn extract_page_glyphs(
     let total_chars: usize = spans.iter().map(|s| s.text.chars().count()).sum();
     let vertical_chars = vertical_up_chars + vertical_down_chars;
     if total_chars > 0 && vertical_chars * 5 >= total_chars * 3 {
+        let old_height = page_height;
         page_height = rotate_spans_upright(&mut spans, vertical_up_chars >= vertical_down_chars);
+        // Rotating a dominantly-vertical page upright swaps its display box.
+        page_width = old_height;
     }
 
     let (horizontal_spans, vertical_spans): (Vec<Span>, Vec<Span>) =
@@ -221,22 +224,22 @@ pub fn extract_page_glyphs(
     let table_rendered = !hits.is_empty();
     let mut text = if table_rendered {
         // Byte-identical to the plain text renderer when no table is found.
-        render_with_tables(&lines, &hits)
+        render_with_tables(&lines, &hits, Some(page_width))
     } else if detect_layout {
         if detect_math {
-            render_math(&lines, &underline_segs, page_height, true)
+            render_math(&lines, &underline_segs, page_height, true, Some(page_width))
         } else {
-            render_human_order(&lines, page_height, true)
+            render_human_order(&lines, page_height, true, Some(page_width))
         }
     } else if detect_math {
-        render_math(&lines, &underline_segs, page_height, false)
+        render_math(&lines, &underline_segs, page_height, false, Some(page_width))
     } else {
-        render_cluster(&lines)
+        render_cluster(&lines, Some(page_width))
     };
 
 
     let mut blocks = if detect_layout {
-        build_doc_blocks(&lines, page_height)
+        build_doc_blocks(&lines, page_height, Some(page_width))
     } else {
         Vec::new()
     };
