@@ -406,3 +406,22 @@ use super::tests_common::*;
             page.text
         );
     }
+
+    #[test]
+    fn a_blank_line_after_a_content_comment_does_not_drop_the_page() {
+        // PReS/PrintSoft writes a `%` metadata header followed by a blank line.
+        // lopdf's content parser stops there, so the page looked text-free and
+        // every numeric token after the header was lost (the F0694-F0705
+        // walker-page "true numeric loss" class). The sanitised decode must
+        // recover the operators and keep the amount.
+        let doc = content_doc(
+            b"1 0 0 1 0 0 cm\n% generated header\n\n\
+              BT /F1 12 Tf 50 760 Td [(1234,56)] TJ ET",
+        );
+        let page = extract_page_text_report(&doc, 1, true, true, false).expect("page text");
+        assert!(
+            page.text.contains("1234,56"),
+            "amount after a comment header was lost: {:?}",
+            page.text
+        );
+    }

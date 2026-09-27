@@ -71,7 +71,7 @@ pub(crate) fn decode_page_content(
         }
         data.push(b'\n');
     }
-    Content::decode(&data)
+    decode_with_comment_fallback(&data)
 }
 
 pub(super) fn extract_page(
