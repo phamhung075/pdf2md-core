@@ -5,9 +5,43 @@
 //! Table cell bucketing, multi-line row consolidation, and complementary column merging.
 
 use crate::layout::glyph_stream::Span;
+use crate::layout::reading_order::is_monetary_amount;
 use crate::layout::tables::rulers::{RowInfo, WordTok};
 use crate::layout::tables::validation::has_data_tokens;
-use crate::models::CanvasTable;
+use crate::models::{CanvasTable, CELL_LINE_BREAK, CELL_LINE_BREAK_PENDING};
+
+/// Join one matrix cell's same-line `words` into its text.
+///
+/// Adjacent words are joined with a single space exactly as before, except
+/// when *both* are complete monetary amounts and the x-gap between them
+/// reaches the table's `min_gutter`: those are two visual columns that the
+/// ruler pass filed into one cell (a single sparse ruler), so an in-cell line
+/// break is inserted and the two amounts read as separate lines of the cell.
+///
+/// The break is inserted in its deferred form, [`CELL_LINE_BREAK_PENDING`],
+/// which every structural pass already reads as the whitespace it replaces; the
+/// Markdown renderer swaps it for [`CELL_LINE_BREAK`] at emission. This keeps
+/// the join purely a render-time change. Every other pair — including a
+/// space-grouped amount split into several tokens by a sub-`min_gutter`
+/// thousands gap — keeps today's space.
+fn join_cell_words(words: &[&WordTok], min_gutter: f64) -> String {
+    let mut out = String::new();
+    let mut prev: Option<&WordTok> = None;
+    for w in words {
+        if let Some(p) = prev {
+            let separate_columns =
+                is_monetary_amount(&p.text) && is_monetary_amount(&w.text) && w.x0 - p.x1 >= min_gutter;
+            if separate_columns {
+                out.push(CELL_LINE_BREAK_PENDING);
+            } else {
+                out.push(' ');
+            }
+        }
+        out.push_str(&w.text);
+        prev = Some(w);
+    }
+    out
+}
 
 /// Assign every word of row `ri` to a column, using the ruler midpoints.
 ///
@@ -93,11 +127,18 @@ pub fn bucket(info: &[RowInfo], ri: usize, rulers: &[f64]) -> Vec<String> {
 ///   * it begins to the right of the previous column's content edge and is
 ///     geometrically closer to that edge than to this column's ruler, so a long
 ///     value whose start dips left of the ruler is not moved.
+///
+/// `min_gutter` is the window's own minimum column gutter (`min_gutter_for` of
+/// its largest font), the same value the ruler pass used. It is threaded into
+/// [`join_cell_words`] so two complete monetary amounts separated by at least
+/// that gutter — i.e. two real columns the sparse ruler filed into one cell —
+/// are emitted on separate in-cell lines.
 pub fn bucket_rows_content_aware(
     info: &[RowInfo],
     win_rows: &[usize],
     rulers: &[f64],
     tol: f64,
+    min_gutter: f64,
 ) -> Vec<Vec<String>> {
     let ncol = rulers.len();
     let bounds: Vec<f64> = rulers.windows(2).map(|p| (p[0] + p[1]) / 2.0).collect();
@@ -141,7 +182,7 @@ pub fn bucket_rows_content_aware(
                 have_number
             };
 
-            let mut cells: Vec<Vec<String>> = vec![Vec::new(); ncol];
+            let mut cells: Vec<Vec<&WordTok>> = vec![Vec::new(); ncol];
             for (wi, w) in words.iter().enumerate() {
                 let mut col = assigned[wi];
                 while col > 0 && is_leading_unit(wi) {
@@ -162,9 +203,12 @@ pub fn bucket_rows_content_aware(
                         break;
                     }
                 }
-                cells[col].push(w.text.clone());
+                cells[col].push(w);
             }
-            cells.into_iter().map(|c| c.join(" ")).collect()
+            cells
+                .into_iter()
+                .map(|c| join_cell_words(&c, min_gutter))
+                .collect()
         })
         .collect()
 }
@@ -350,7 +394,7 @@ pub fn consolidate_table_rows(
                 if s_prev.is_empty() {
                     merged_header[c] = s_curr.to_string();
                 } else if !s_curr.is_empty() && s_curr != s_prev {
-                    merged_header[c] = format!("{}<br>{}", s_prev, s_curr);
+                    merged_header[c] = format!("{}{}{}", s_prev, CELL_LINE_BREAK, s_curr);
                 }
             }
         }
@@ -440,7 +484,7 @@ pub fn consolidate_table_rows(
                     if s_prev.ends_with('/') || s_prev.ends_with('-') {
                         curr[c] = format!("{} {}", s_prev, s_curr);
                     } else {
-                        curr[c] = format!("{}<br>{}", s_prev, s_curr);
+                        curr[c] = format!("{}{}{}", s_prev, CELL_LINE_BREAK, s_curr);
                     }
                 }
             }

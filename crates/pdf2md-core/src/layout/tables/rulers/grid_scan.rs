@@ -415,7 +415,7 @@ pub(super) fn scan_aligned_grids_opts(
                         }
 
                         let table_rows: Vec<Vec<String>> =
-                            bucket_rows_content_aware(&info, &win_rows, &rulers, tol);
+                            bucket_rows_content_aware(&info, &win_rows, &rulers, tol, min_gutter);
                         let (table_rows, rulers) =
                             merge_complementary_columns(table_rows, &win_rows, &info, &rulers, tol);
                         // Drop fully-empty edge columns.

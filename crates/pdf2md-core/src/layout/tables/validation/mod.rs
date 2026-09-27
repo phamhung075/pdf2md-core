@@ -386,7 +386,10 @@ pub fn is_tabular_rows(rows: &[Vec<String>]) -> bool {
         for ch in t.chars() {
             if ch.is_ascii_digit() {
                 digit = true;
-            } else if !matches!(ch, '.' | ',' | '-' | '+' | '%' | '/' | '\'' | ' ' | '\u{00a0}') {
+            } else if !matches!(
+                ch,
+                '.' | ',' | '-' | '+' | '%' | '/' | '\'' | ' ' | '\u{00a0}' | '\u{2028}'
+            ) {
                 return false;
             }
         }

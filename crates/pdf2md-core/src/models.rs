@@ -55,6 +55,17 @@ pub enum ColumnAlignment {
     Right,
 }
 
+/// The engine's in-cell line separator, as emitted in the final Markdown.
+pub(crate) const CELL_LINE_BREAK: &str = "<br>";
+
+/// Deferred form of [`CELL_LINE_BREAK`] carried inside a cell string while the
+/// structural passes run. U+2028 LINE SEPARATOR is already whitespace to every
+/// word / shape / header test (`split_whitespace`, `trim`), so a deferred break
+/// is invisible to them (exactly as the space it replaces), yet it is distinct
+/// from a producer's real `\n`, which stays neutralised to a space. `md_cell`
+/// swaps it for the real separator at emission.
+pub(crate) const CELL_LINE_BREAK_PENDING: char = '\u{2028}';
+
 /// Reconstructed 2D table grid from text positions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanvasTable {
@@ -97,6 +108,10 @@ impl CanvasTable {
             match ch {
                 '|' => s.push_str("\\|"),
                 '\\' => s.push_str("\\\\"),
+                // The deferred in-cell line break becomes the engine's GFM
+                // in-cell separator at emission. A real carriage return from
+                // some other producer is still just whitespace.
+                c if c == CELL_LINE_BREAK_PENDING => s.push_str(CELL_LINE_BREAK),
                 '\n' | '\r' => s.push(' '),
                 _ => s.push(ch),
             }
@@ -120,7 +135,10 @@ impl CanvasTable {
         for ch in t.chars() {
             if ch.is_ascii_digit() {
                 has_digit = true;
-            } else if !matches!(ch, '.' | ',' | '-' | '+' | '%' | '/' | '\'' | ' ' | '\u{00a0}') {
+            } else if !matches!(
+                ch,
+                '.' | ',' | '-' | '+' | '%' | '/' | '\'' | ' ' | '\u{00a0}' | '\u{2028}'
+            ) {
                 return false;
             }
         }

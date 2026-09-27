@@ -194,7 +194,11 @@ fn visible_inline_text(s: &str) -> String {
 /// than 3), and pure integers (no mandatory decimal part). Once the sign and
 /// currency wrappers are peeled off, the table engine's `is_numeric_cell`
 /// recogniser gates the remaining digit/separator vocabulary.
-fn is_monetary_amount(text: &str) -> bool {
+///
+/// Shared with the table consumer that separates two visual amount columns
+/// sharing one matrix cell (`layout::tables::consolidation`), so both agree on
+/// exactly the same amounts. Keep this the single recogniser.
+pub(crate) fn is_monetary_amount(text: &str) -> bool {
     let mut s = text.trim();
     if s.contains('%') || s.contains('/') || s.contains(':') {
         return false;
