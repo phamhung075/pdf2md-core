@@ -408,6 +408,37 @@ use super::tests_common::*;
     }
 
     #[test]
+    fn tj_td_page_keeps_a_one_off_vertical_margin_code() {
+        // Same `TJ`+`Td` shape as the test above, plus a rotated margin code
+        // drawn with a `cm` rotation (no `Tm`, so the page is still a
+        // `new_geometry` route). 0.2.8 read this page with the string walker,
+        // which emitted the code; the layout engine keeps vertical runs out of
+        // the horizontal body, so moving the page to the table engine must put
+        // the one-off code back instead of losing it. A page that was already on
+        // the layout engine in 0.2.8 keeps its exact old output.
+        let doc = content_doc(
+            b"BT /F1 12 Tf 50 760 Td [(Reference)] TJ ET\n\
+              BT /F1 12 Tf 320 760 Td [(Montant)] TJ ET\n\
+              BT /F1 12 Tf 50 740 Td [(A1)] TJ ET\n\
+              BT /F1 12 Tf 320 740 Td [(10,00)] TJ ET\n\
+              BT /F1 12 Tf 50 720 Td [(B2)] TJ ET\n\
+              BT /F1 12 Tf 320 720 Td [(20,00)] TJ ET\n\
+              q 0 1 -1 0 560 150 cm BT /F1 12 Tf 0 0 Td [(VERTCODE)] TJ ET Q",
+        );
+        let page = extract_page_text_report(&doc, 1, true, true, false).expect("page text");
+        assert!(
+            page.tables >= 1,
+            "the grid must still be recovered:\n{}",
+            page.text
+        );
+        assert!(
+            page.text.contains("VERTCODE"),
+            "a one-off vertical margin code was dropped by the layout path:\n{}",
+            page.text
+        );
+    }
+
+    #[test]
     fn a_blank_line_after_a_content_comment_does_not_drop_the_page() {
         // PReS/PrintSoft writes a `%` metadata header followed by a blank line.
         // lopdf's content parser stops there, so the page looked text-free and

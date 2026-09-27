@@ -161,23 +161,32 @@ pub(super) fn extract_page(
     let form_geometry =
         (sig.has_tj_array || sig.has_tj_plain) && (sig.has_td_upper || sig.has_tm);
     let form_plain_td = sig.td_total >= 2 && sig.td_horizontal * 2 >= sig.td_total;
-    let route_to_layout = if detect_tables {
-        // Every show-operator positioned with fragment `Td` placements — plain
-        // `Tj` (CAF payslips, Engie bills), `TJ` arrays (glyph-positioned
-        // statements such as F0686/F0687/F0688), or quote show-ops (`'`/`"`).
-        // Routing is gated on `has_plain_td` either way: a page that shows
-        // every string with `'`/`Tj`/`TJ` at one `Tm` and only vertical line
-        // advances is one-string-per-line prose the geometry path would merge
-        // into a single run, so it stays on the string walker. The `TJ` arm was
-        // missing, so `TJ`+`Td` pages fell through to the walker, which never
-        // runs table detection and emits each visual column as its own line.
+    // Every show-operator positioned with fragment `Td` placements — plain
+    // `Tj` (CAF payslips, Engie bills), `TJ` arrays (glyph-positioned
+    // statements such as F0686/F0687/F0688), or quote show-ops (`'`/`"`).
+    // Routing is gated on `has_plain_td` either way: a page that shows
+    // every string with `'`/`Tj`/`TJ` at one `Tm` and only vertical line
+    // advances is one-string-per-line prose the geometry path would merge
+    // into a single run, so it stays on the string walker. The `TJ` arm was
+    // missing, so `TJ`+`Td` pages fell through to the walker, which never
+    // runs table detection and emits each visual column as its own line.
+    //
+    // One source of truth: `with_tj_arm = false` is the exact pre-0.2.9
+    // predicate, `true` adds the `TJ` arm. A page routed only by `true` was
+    // moved off the walker by that arm, so it needs its walker-only vertical
+    // content restored below.
+    let routes_with_tj_arm = |with_tj_arm: bool| {
         legacy_geometry
-            || ((has_tj || has_tj_plain || has_quote) && has_plain_td)
+            || (((with_tj_arm && has_tj) || has_tj_plain || has_quote) && has_plain_td)
             || (form_geometry && !legacy_geometry)
             || ((sig.has_tj_plain || sig.has_quote) && form_plain_td)
+    };
+    let route_to_layout = if detect_tables {
+        routes_with_tj_arm(true)
     } else {
         has_tj && !has_tj_plain && has_td
     };
+    let newly_routed = detect_tables && route_to_layout && !routes_with_tj_arm(false);
     // The `Tj`+`Td` / quote triggers were added by the layout batch. The
     // geometry engine can drop text held in rotated or Form-XObject content
     // that the string walker reaches, so those newly-routed pages are checked
@@ -208,7 +217,7 @@ pub(super) fn extract_page(
                 detect_layout,
                 detect_math,
             ) {
-                Ok(pt) => {
+                Ok(mut pt) => {
                     // No table recovered, or a decoded digit run is missing:
                     // the walker is the lossless output, so keep it (tables
                     // are not worth unique content).
@@ -224,6 +233,33 @@ pub(super) fn extract_page(
                             },
                             marker_hint,
                         ));
+                    }
+                    // A page the `TJ` arm newly moved off the string walker: the
+                    // walker emits vertical runs the horizontal reading-order
+                    // renderer leaves out — a rotated code in the margin is real
+                    // content the walker printed. Put those runs back so
+                    // recovering the table does not regress the walker's
+                    // content; the margin blocks are still emitted for zone
+                    // inspectors. Pages already on the layout engine before the
+                    // routing change keep their exact old output.
+                    if newly_routed {
+                        let vertical: String = pt
+                            .blocks
+                            .iter()
+                            .filter(|b| b.kind == "margin")
+                            .map(|b| b.text.trim())
+                            .filter(|t| !t.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !vertical.is_empty() {
+                            if !pt.text.is_empty() {
+                                if !pt.text.ends_with('\n') {
+                                    pt.text.push('\n');
+                                }
+                                pt.text.push('\n');
+                            }
+                            pt.text.push_str(&vertical);
+                        }
                     }
                     return Ok((
                         PageText {
