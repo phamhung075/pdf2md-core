@@ -481,6 +481,74 @@ use super::tests_common::*;
     }
 
     #[test]
+    fn control_space_code_maps_to_space_by_name_or_width() {
+        // A font's own encoding can define a space glyph while its `/ToUnicode`
+        // maps that code to a C0 control (U+0001 here). The control is unusable
+        // text and is stripped downstream, welding the words around it, so the
+        // font's meaning must win. U+0000 is a producer's "unmapped/symbol"
+        // target and must stay as it is, or a word gains a break inside it.
+        use lopdf::Stream;
+        let mut enc = Dictionary::new();
+        enc.set(b"Type", Object::Name(b"Encoding".to_vec()));
+        enc.set(
+            b"Differences",
+            Object::Array(vec![
+                Object::Integer(1),
+                Object::Name(b"g1".to_vec()),
+                Object::Name(b"g2".to_vec()),
+                Object::Name(b"space".to_vec()),
+            ]),
+        );
+        let cmap = b"beginbfchar\n<01> <0001>\n<02> <0000>\n<03> <0001>\nendbfchar\n".to_vec();
+        let mut font = Dictionary::new();
+        font.set(b"Subtype", Object::Name(b"Type3".to_vec()));
+        font.set(
+            b"FontMatrix",
+            Object::Array(vec![
+                Object::Real(0.001),
+                Object::Real(0.0),
+                Object::Real(0.0),
+                Object::Real(0.001),
+                Object::Real(0.0),
+                Object::Real(0.0),
+            ]),
+        );
+        font.set(
+            b"FontBBox",
+            Object::Array(vec![
+                Object::Real(0.0),
+                Object::Real(0.0),
+                Object::Real(1000.0),
+                Object::Real(1000.0),
+            ]),
+        );
+        font.set(b"FirstChar", Object::Integer(1));
+        font.set(b"Widths", Object::Array(vec![Object::Real(250.0); 3]));
+        font.set(b"Encoding", Object::Dictionary(enc));
+        font.set(
+            b"ToUnicode",
+            Object::Stream(Stream::new(Dictionary::new(), cmap)),
+        );
+        let doc = Document::new();
+        let codec = resolve_codec(&doc, &font).expect("Type3 font resolves");
+        let mut s = String::new();
+        codec.decode(&[0x01], &mut s);
+        assert_eq!(
+            s, " ",
+            "an unnamed space-width code mapped to a control must decode as a space"
+        );
+        let mut t = String::new();
+        codec.decode(&[0x02], &mut t);
+        assert_eq!(t, "\u{0}", "a NULL-mapped symbol glyph must not become a space");
+        let mut u = String::new();
+        codec.decode(&[0x03], &mut u);
+        assert_eq!(
+            u, " ",
+            "a glyph named `space` mapped to a control must decode as a space"
+        );
+    }
+
+    #[test]
     fn consecutive_absolute_tm_lines_do_not_weld() {
         // Producers that place every visual line with an absolute identity
         // `Tm` and no `ET`/`T*` between lines used to have every line

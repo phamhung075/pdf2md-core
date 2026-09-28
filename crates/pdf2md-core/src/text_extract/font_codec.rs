@@ -138,10 +138,92 @@ pub(crate) fn resolve_codec(doc: &Document, font: &Dictionary) -> Option<Codec> 
         }
     };
 
-    if let Some(cm) = font_to_unicode(doc, font) {
+    // Some producers point a code's `/ToUnicode` at a C0 control instead of
+    // U+0020 for the glyph the font itself defines as a space. The raw control
+    // is unusable text and is stripped downstream, fusing the words on either
+    // side. Where the font's own encoding (or a space-sized `/Widths` entry)
+    // identifies the code as a space, that meaning wins over the broken map.
+    let mut cm = font_to_unicode(doc, font);
+    if let Some(cm) = cm.as_mut() {
+        fix_control_space_codes(doc, font, &table, cm);
+    }
+
+    if let Some(cm) = cm {
         return Some(Codec::CMap(cm, Some(table), pua));
     }
     Some(Codec::Byte8(table, pua))
+}
+
+/// `/Widths` fraction of an em below/above which a code cannot be the space
+/// glyph. Mainstream text faces set a space at roughly 0.2-0.33 em; the band is
+/// widened a little so condensed and wide faces still qualify. Anything
+/// narrower is a mark and anything wider is an ordinary letter.
+const SPACE_WIDTH_EM_MIN: f64 = 0.15;
+const SPACE_WIDTH_EM_MAX: f64 = 0.45;
+
+/// The C0 controls a `/ToUnicode` map may use to name a *space*. U+0000 is
+/// excluded: producers use NULL as the "no character / unmapped glyph" target
+/// (a symbol or `.notdef` glyph drawn from its own outline), so treating it as a
+/// space would inject a break inside a word. The observed space mis-mapping is
+/// the non-NULL U+0001.
+const SPACE_CONTROL_MIN: u16 = 0x01;
+const SPACE_CONTROL_MAX: u16 = 0x1F;
+
+/// Rewrite `/ToUnicode` entries that resolve a code to a C0 control when the
+/// font itself says the code is a space, either because its `/Encoding` (or
+/// base encoding) decodes to U+0020 or because it is an unnamed subset glyph
+/// whose `/Widths` advance is a space's typical width. Any other control target
+/// is left exactly as today, so a symbol glyph is never turned into a space.
+fn fix_control_space_codes(doc: &Document, font: &Dictionary, table: &ByteTable, cm: &mut CMapCodec) {
+    let control: Vec<usize> = (0..256).filter(|&c| cm.space_control_target(c as u32)).collect();
+    if control.is_empty() {
+        return;
+    }
+    // The font's own encoding already names the code a space (a `/Differences`
+    // `space`/`uni0020` entry or a base-encoding space at 0x20).
+    let mut fixes: Vec<usize> = control.iter().copied().filter(|&c| table.0[c] == 0x20).collect();
+    // `0` means the code has no usable glyph name (an unnamed subset glyph such
+    // as `g1`, or `.notdef`). Fall back to its advance width.
+    let unnamed: Vec<usize> = control
+        .iter()
+        .copied()
+        .filter(|&c| table.0[c] == 0 && !fixes.contains(&c))
+        .collect();
+    if !unnamed.is_empty() {
+        let widths = resolve_widths(doc, font);
+        let em = widths.em_scale().max(f64::MIN_POSITIVE);
+        for c in unnamed {
+            let Some(w) = widths.width(&[c as u8]) else {
+                continue;
+            };
+            let frac = w / 1000.0 / em;
+            if (SPACE_WIDTH_EM_MIN..=SPACE_WIDTH_EM_MAX).contains(&frac) {
+                fixes.push(c);
+            }
+        }
+    }
+    for c in fixes {
+        cm.exact.insert((1, c as u32), vec![0x20]);
+    }
+}
+
+impl CMapCodec {
+    /// Whether the 1-byte source `code` maps to a C0 control character in the
+    /// non-NULL space range ([`SPACE_CONTROL_MIN`], [`SPACE_CONTROL_MAX`]).
+    fn space_control_target(&self, code: u32) -> bool {
+        let target = self
+            .exact
+            .get(&(1, code))
+            .and_then(|units| units.first())
+            .copied()
+            .or_else(|| {
+                self.ranges
+                    .iter()
+                    .find(|(len, lo, hi, _)| *len == 1 && code >= *lo && code <= *hi)
+                    .map(|(_, lo, _, dst)| (*dst + (code - lo)) as u16)
+            });
+        matches!(target, Some(t) if (SPACE_CONTROL_MIN..=SPACE_CONTROL_MAX).contains(&t))
+    }
 }
 
 // ---------------------------------------------------------------------------
