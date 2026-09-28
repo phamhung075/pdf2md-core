@@ -132,20 +132,19 @@ impl SpatialClusterer {
             }
         }
 
-        // 2. Sort lines vertically (PDF User Space: descending Y = top to bottom)
+        // 2. Sort lines vertically (PDF User Space: descending Y = top to bottom).
+        // `total_cmp` keeps the ordering total even if a coordinate is NaN.
         line_buckets.sort_by(|a, b| {
             let avg_y_a = a.iter().map(|c| c.origin.1).sum::<f64>() / a.len() as f64;
             let avg_y_b = b.iter().map(|c| c.origin.1).sum::<f64>() / b.len() as f64;
-            avg_y_b.partial_cmp(&avg_y_a).unwrap_or(std::cmp::Ordering::Equal)
+            avg_y_b.total_cmp(&avg_y_a)
         });
 
         // 3. For each line, sort characters along the reading axis (ascending X) and segment into words
         let mut result_lines = Vec::new();
 
         for mut bucket in line_buckets {
-            bucket.sort_by(|a, b| {
-                a.origin.0.partial_cmp(&b.origin.0).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            bucket.sort_by(|a, b| a.origin.0.total_cmp(&b.origin.0));
 
             let line = self.build_line_with_words(bucket);
             result_lines.push(line);
@@ -279,24 +278,29 @@ impl SpatialClusterer {
             }
         }
 
-        // Multi-column reading order sorting:
-        // Group blocks by columns (left-to-right), then sort top-to-bottom within each column
-        blocks.sort_by(|b1, b2| {
-            let bbox1 = b1.iter().fold(b1[0].line_bbox, |acc, l| acc.union_with(&l.line_bbox));
-            let bbox2 = b2.iter().fold(b2[0].line_bbox, |acc, l| acc.union_with(&l.line_bbox));
+        // Multi-column reading order sorting. A pairwise "is this block to the
+        // right of that one" test is not transitive — a wide block can overlap a
+        // left and a right neighbour at once (A<B, B<C, C<A) — so the order is
+        // built from a deterministic column partition instead:
+        //   1. sweep blocks by ascending `min_x` and start a new column only
+        //      when a block clears the running column's right edge by a gutter;
+        //   2. sort by (column, descending `max_y`, ascending `min_x`).
+        // `f64::total_cmp` makes the y/x keys a total order even on NaN.
+        let bboxes: Vec<Rect> = blocks
+            .iter()
+            .map(|b| b.iter().fold(b[0].line_bbox, |acc, l| acc.union_with(&l.line_bbox)))
+            .collect();
+        let gutter = 12.0 * self.config.column_gutter_factor;
+        let columns = assign_columns(&bboxes, gutter);
 
-            // If horizontally distinct with column gutter, sort left-to-right
-            let avg_fs = 12.0;
-            let gutter = avg_fs * self.config.column_gutter_factor;
-            if bbox1.max_x + gutter <= bbox2.min_x {
-                std::cmp::Ordering::Less
-            } else if bbox2.max_x + gutter <= bbox1.min_x {
-                std::cmp::Ordering::Greater
-            } else {
-                // Same column: sort top-to-bottom (descending Y in PDF coordinates)
-                bbox2.max_y.partial_cmp(&bbox1.max_y).unwrap_or(std::cmp::Ordering::Equal)
-            }
+        let mut indexed: Vec<(usize, Vec<TextLine>)> = blocks.into_iter().enumerate().collect();
+        indexed.sort_by(|(i, _), (j, _)| {
+            columns[*i]
+                .cmp(&columns[*j])
+                .then_with(|| bboxes[*j].max_y.total_cmp(&bboxes[*i].max_y))
+                .then_with(|| bboxes[*i].min_x.total_cmp(&bboxes[*j].min_x))
         });
+        let blocks: Vec<Vec<TextLine>> = indexed.into_iter().map(|(_, b)| b).collect();
 
         // Convert to TextBlock structs
         blocks
@@ -321,6 +325,31 @@ impl SpatialClusterer {
             })
             .collect()
     }
+}
+
+/// Partitions block bounding boxes into left-to-right columns.
+///
+/// Blocks are swept in ascending `min_x`; a new column begins only when a
+/// block's left edge clears the running maximum right edge of the current
+/// column by at least `gutter`. The partition is deterministic and transitive,
+/// unlike a per-pair "block A is left of block B" comparison.
+fn assign_columns(bboxes: &[Rect], gutter: f64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..bboxes.len()).collect();
+    order.sort_by(|&a, &b| bboxes[a].min_x.total_cmp(&bboxes[b].min_x));
+
+    let mut column_of = vec![0usize; bboxes.len()];
+    let mut column = 0usize;
+    let mut column_max_x = f64::NEG_INFINITY;
+    for &i in &order {
+        if column_max_x.is_finite() && bboxes[i].min_x >= column_max_x + gutter {
+            column += 1;
+            column_max_x = bboxes[i].max_x;
+        } else {
+            column_max_x = column_max_x.max(bboxes[i].max_x);
+        }
+        column_of[i] = column;
+    }
+    column_of
 }
 
 // ===========================================================================

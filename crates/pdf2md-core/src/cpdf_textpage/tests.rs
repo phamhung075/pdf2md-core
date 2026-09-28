@@ -244,3 +244,62 @@
         assert!(blocks[1].text.contains("Col2 Top"));
         assert!(blocks[1].text.contains("Col2 Bottom"));
     }
+
+    /// Regression for the block-order panic: the old comparator mixed a
+    /// per-pair column test with a same-column y comparison, which is not
+    /// transitive — a wide block `A` bridges a narrow left block `B` and a
+    /// right block `C`, giving `A<B`, `B<C`, `C<A`. On real pages that made
+    /// `sort_by` panic with "comparison function does not correctly implement a
+    /// total order". Thirty blocks is enough to reach the sort's consistency
+    /// check; the fixed column partition must order them without panicking.
+    #[test]
+    fn test_block_ordering_is_total_order() {
+        let clusterer = SpatialClusterer::new(ClusterConfig::default());
+        let font_size = 12.0;
+
+        let make_line = |text: &str, bbox: Rect, baseline: f64| -> TextLine {
+            let chars = vec![CharInfo {
+                unicode: 'x',
+                bbox,
+                font_size,
+                matrix: Matrix3x3::translation(bbox.min_x, baseline),
+                origin: (bbox.min_x, baseline),
+                advance_width: bbox.width(),
+                is_bold: false,
+                is_italic: false,
+            }];
+            TextLine {
+                chars,
+                words: vec![],
+                baseline,
+                line_bbox: bbox,
+                text: text.to_string(),
+            }
+        };
+
+        // A overlaps B and C in x; B is clear of C by more than the gutter.
+        // Distinct baselines keep every line its own block.
+        let mut lines = Vec::new();
+        for k in 0..10 {
+            let off = k as f64 * 1000.0;
+            lines.push(make_line("A", Rect::new(90.0, 510.0 + off, 200.0, 520.0 + off), 510.0 + off));
+            lines.push(make_line("B", Rect::new(100.0, 400.0 + off, 120.0, 410.0 + off), 400.0 + off));
+            lines.push(make_line("C", Rect::new(150.0, 590.0 + off, 250.0, 600.0 + off), 590.0 + off));
+        }
+
+        let blocks = clusterer.cluster_into_blocks(&lines);
+
+        assert_eq!(blocks.len(), 30, "each crafted line must form its own block");
+
+        // A single deterministic column results from A bridging the gutter, so
+        // the total order is (descending max_y, then ascending min_x).
+        for pair in blocks.windows(2) {
+            let (a, b) = (&pair[0].block_bbox, &pair[1].block_bbox);
+            assert!(
+                a.max_y > b.max_y || (a.max_y == b.max_y && a.min_x <= b.min_x),
+                "block order is not (desc max_y, asc min_x): {:?} then {:?}",
+                a,
+                b
+            );
+        }
+    }
