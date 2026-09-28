@@ -229,3 +229,5 @@ mod tests;
 mod tests_common;
 #[cfg(test)]
 mod tests_part2;
+#[cfg(test)]
+mod tests_scaled_tm;

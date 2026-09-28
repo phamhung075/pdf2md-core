@@ -64,11 +64,32 @@ const FINE_STEP_DEG: f64 = 0.1;
 /// we defer to the axis-aligned hypothesis rather than risk a bad deskew.
 const MIN_ANGLE_POINTS: usize = 16;
 
-/// Relative energy gain the best angle must show over the axis-aligned
-/// hypothesis (0°) before it is trusted as a real tilt. A genuine tilt makes
-/// the projection sharply peaky only at the tilt angle, so the peak beats 0°
-/// by a wide margin; a coincidental alignment does not.
+/// Base relative energy gain the best angle must show over the axis-aligned
+/// hypothesis (0°) before it is trusted as a real tilt.
+///
+/// The projection energy is an auto-ranged histogram sum-of-squares, so on a
+/// small or sparse cloud it drifts by a few percent as the bin origin and count
+/// move with the projection range. That noise alone can lift an already-aligned
+/// page's best angle a hair past 0° and deskew it wrongly, scattering rows that
+/// were exactly aligned. A genuine tilt collapses whole rows at the tilt angle,
+/// so its peak beats 0° by a wide factor — a few-degree tilt scores several
+/// times the aligned energy — not by a few percent. This base margin is the
+/// floor of that gap; the angle-proportional term below scales it.
 const MIN_ENERGY_GAIN: f64 = 0.02;
+
+/// Additional required energy gain per degree squared of the claimed tilt.
+///
+/// A genuine tilt of `θ` displaces a row by up to `page_width · sin θ`, so the
+/// 0° hypothesis loses alignment in proportion to `sin² θ`: the energy gain a
+/// real tilt produces grows with `θ²`, not linearly. A sparse cloud can
+/// otherwise yield a *large* spurious angle at the same tiny gain as an aligned
+/// page, and a large rotation is the most damaging kind of false positive. The
+/// flat `MIN_ENERGY_GAIN` floor was compared against that noise (a few percent)
+/// and let a 13.5° "tilt" through on a 3.9 % gain. Requiring the gain to grow
+/// with `θ²` keeps small, plausible corrections while rejecting a large angle
+/// the aligned hypothesis already explains. Calibrated on the corpus: a 4.5°
+/// candidate at a 7 % gain is kept, a 13.5° candidate at 3.9 % is rejected.
+const MIN_ENERGY_GAIN_PER_DEG2: f64 = 0.0015;
 
 /// Tilts below this magnitude are treated as noise and left uncorrected
 /// (degrees). This both avoids needless coordinate movement on clean docs and
@@ -208,9 +229,12 @@ pub fn estimate_skew_angle_deg_from_points(
     // Confidence gate: a tilted page must beat the axis-aligned hypothesis
     // (0°) decisively, otherwise the peak is a spurious alignment of a small /
     // structured cloud and deskewing would rotate a page that is already fine.
+    // The bar rises with the square of the claimed angle (see the constant), so
+    // a large, implausible tilt needs far more evidence than a small one.
     let e_best = projection_energy(points, bin, coarse);
     let e_zero = projection_energy(points, bin, 0.0);
-    if e_zero > 0.0 && e_best <= e_zero * (1.0 + MIN_ENERGY_GAIN) {
+    let required_gain = MIN_ENERGY_GAIN + MIN_ENERGY_GAIN_PER_DEG2 * coarse * coarse;
+    if e_zero > 0.0 && e_best <= e_zero * (1.0 + required_gain) {
         return 0.0;
     }
     if coarse.abs() >= max_deg - coarse_step_deg * 0.5 {

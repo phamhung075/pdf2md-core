@@ -213,6 +213,45 @@
         );
     }
 
+    /// Two exactly axis-aligned columns of short rows, the right one offset by
+    /// one line pitch — the shape a key/value block or a two-column listing
+    /// produces. Such a sparse cloud can be lined up diagonally by accident:
+    /// the auto-ranged projection energy drifts a few percent, and a flat
+    /// confidence gate "detects" a large tilt on that noise, deskewing a page
+    /// that was already aligned and scattering rows that shared an exact
+    /// baseline. The required gain must grow with the claimed angle so a large,
+    /// implausible tilt is rejected.
+    #[test]
+    fn sparse_aligned_two_column_cloud_is_not_deskewed() {
+        let line_pitch = 11.0;
+        let column_offset = 10.0;
+        let spans: Vec<Span> = (0..14)
+            .flat_map(|i| {
+                let y = 700.0 - i as f64 * line_pitch;
+                [60.0_f64, 240.0]
+                    .iter()
+                    .enumerate()
+                    .map(move |(c, &x)| Span {
+                        text: "1".to_string(),
+                        x,
+                        y: y - c as f64 * column_offset,
+                        size: 10.0,
+                        advance: 10.0,
+                        word_advance: 10.0,
+                        is_bold: false,
+                        is_italic: false,
+                        is_underline: false,
+                        is_vertical: false,
+                    })
+            })
+            .collect();
+        let est = estimate_skew_angle_deg_from_spans(&spans, DEFAULT_MAX_SKEW_DEG, COARSE_STEP_DEG);
+        assert!(
+            est.abs() < MIN_SKEW_TO_CORRECT_DEG,
+            "an exactly aligned two-column cloud must not be deskewed, got {est}"
+        );
+    }
+
     #[test]
     fn deskew_spans_restores_row_alignment_for_build_lines() {
         use crate::layout::glyph_stream::build_lines;

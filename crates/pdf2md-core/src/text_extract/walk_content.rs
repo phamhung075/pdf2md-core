@@ -31,6 +31,17 @@
 
 use super::*;
 
+/// A `Tm` baseline move larger than this fraction of the effective em starts a
+/// new visual line. It matches the tolerance the glyph engine's `build_lines`
+/// uses for same-line grouping, so a super/subscript a fraction of an em off
+/// its baseline stays inline.
+const TM_BASELINE_EM_TOLERANCE: f64 = 0.5;
+
+/// Floor on the em used by [`TM_BASELINE_EM_TOLERANCE`] before any `Tf` has
+/// selected a font size, so a malformed stream cannot turn the tolerance into
+/// zero and break on every hairline move.
+const MIN_EM: f64 = 0.1;
+
 impl WalkerBudget {
     pub(crate) fn new() -> Self {
         WalkerBudget {
@@ -185,29 +196,52 @@ pub(super) fn walk_content(
                     let b = op.operands.get(1).and_then(|o| o.as_float().ok());
                     let c = op.operands.get(2).and_then(|o| o.as_float().ok());
                     let d = op.operands.get(3).and_then(|o| o.as_float().ok());
-                    let identity = matches!((a, b, c, d),
+                    // A non-rotated matrix (`b = c = 0`, `a`, `d > 0`) keeps the
+                    // text horizontal; its `a`/`d` scale only resizes the em.
+                    // A baseline move under it therefore starts a new visual
+                    // line exactly as an identity or vertical `Td` move does.
+                    // Treating only the identity matrix as a line source welded
+                    // every line of a producer that writes `Tf 1` plus a scaled
+                    // `Tm` per line (one text object per line) into a single run.
+                    let non_rotated = matches!(
+                        (a, b, c, d),
                         (Some(a), Some(b), Some(c), Some(d))
-                            if (a - 1.0).abs() <= 1e-3
-                                && b.abs() <= 1e-3
-                                && c.abs() <= 1e-3
-                                && (d.abs() - 1.0).abs() <= 1e-3);
-                    if identity {
-                        // An identity `Tm` that moves the baseline starts a new
-                        // visual line, exactly as a vertical `Td` does.
-                        // Producers that place every line with an absolute `Tm`
-                        // and no `ET`/`T*` between them otherwise weld the lines
-                        // into one run. The 0.5-em tolerance matches the glyph
-                        // engine's same-line grouping (`build_lines`), so a
-                        // super/subscript a few points off its baseline stays
-                        // inline.
-                        if !pos_mode
-                            && (y - tp.line_y).abs() > 0.5 * tp.size.max(0.1)
-                        {
+                            if b.abs() <= 1e-3 && c.abs() <= 1e-3 && a > 0.0 && d > 0.0
+                    );
+                    if non_rotated {
+                        let (a, d) = (a.unwrap() as f64, d.unwrap() as f64);
+                        // The em in device points is the `Tf` size scaled by the
+                        // matrix, so both tolerances below are em-relative in
+                        // the same units as the `x`/`y` operands.
+                        let scale = 0.5 * (a + d);
+                        let em = tp.size.max(MIN_EM) * scale;
+                        let same_baseline = (y - tp.line_y).abs() <= TM_BASELINE_EM_TOLERANCE * em;
+                        if !pos_mode && !same_baseline {
                             break_line(out);
+                        } else if !pos_mode
+                            && (scale - 1.0).abs() > 1e-3
+                            && x - tp.line_x > WORD_GAP_EM * em
+                            && !ends_with_ws(out)
+                        {
+                            // A scaled `Tm` repositions the text without moving
+                            // to a new baseline: another object on the same
+                            // visual line. The walker's text-space gap
+                            // heuristic is off for a scaled matrix (its `cur_x`
+                            // advance is not in device units), but the `Tm`
+                            // origin *is*, so a right-hand fragment separated
+                            // from the previous origin by more than a word gap
+                            // needs the separator the strings do not carry.
+                            out.push(' ');
                         }
                         tp.line_x = x;
                         tp.line_y = y;
                         tp.goto_line(false);
+                        // Text space and device points differ by the scale, so
+                        // the advance-based gap heuristic stays off for this
+                        // stream (the two rules above do not need it).
+                        if (scale - 1.0).abs() > 1e-3 {
+                            tp.unusable = true;
+                        }
                     } else {
                         tp.unusable = true;
                     }
