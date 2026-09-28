@@ -18,6 +18,8 @@ mod bands;
 pub use bands::*;
 mod staggered;
 use staggered::*;
+mod zones;
+use zones::*;
 mod lines;
 pub use lines::*;
 mod render;
@@ -170,3 +172,6 @@ mod column_band_tests_part2;
 mod structural_tests_common;
 #[cfg(test)]
 mod structural_tests_part2;
+
+#[cfg(test)]
+mod zone_tests;

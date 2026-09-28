@@ -275,15 +275,17 @@ pub(super) fn detect_column_bands_opts(lines: &[Vec<Span>], allow_stacks: bool) 
 const MAX_BAND_RECURSION_DEPTH: usize = 512;
 
 /// Recursively peel two-column projection regions out of one `Full` band, then
-/// (when `allow_stacks`) a staggered multi-column region.
+/// (when `allow_stacks`) a short geometric side-by-side zone pair or a
+/// staggered multi-column region.
 ///
 /// [`projection_columns_region`] returns only the longest region, and a single
 /// `Full` band can hold several independent two-column blocks (the bilingual
 /// AVANT/PENDANT/APRÈS blocks share one band). Peel one region, then recurse on
 /// the rows before and after it; a slice with no region stays a `Full` band.
-/// The staggered pass runs only when the projection found nothing on this band,
-/// and leaves its surroundings as plain `Full` rows rather than re-projecting
-/// them.
+/// When the projection finds nothing, [`side_by_side_zones`] recovers the
+/// two/three-row zones the projection's six-row floor misses, and the staggered
+/// pass runs last. Both of those run only when `allow_stacks`, and leave their
+/// surroundings as plain `Full` rows rather than re-projecting them.
 pub(super) fn project_full_band(rows: Vec<Vec<Span>>, allow_stacks: bool, out: &mut Vec<ColumnBand>, depth: usize) {
     if depth >= MAX_BAND_RECURSION_DEPTH {
         out.push(ColumnBand::Full(rows));
@@ -298,6 +300,26 @@ pub(super) fn project_full_band(rows: Vec<Vec<Span>>, allow_stacks: bool, out: &
             project_full_band(rows[end + 1..].to_vec(), allow_stacks, out, depth + 1);
         }
         return;
+    }
+    // Short side-by-side zones the projection's six-row floor cannot reach: a
+    // two- or three-row bilingual footer is a real two-zone block but never
+    // grows a six-row clear run, so it fell through to a linear `Full` read and
+    // its rows were woven (French line, English line, French line, ...). The
+    // geometric corridor test in `side_by_side_zones` recovers it. Gated on
+    // `allow_stacks` exactly like the staggered pass: the table scanner must
+    // band the page's own geometry, and splitting a wrapped-cell grid along its
+    // cell gutters would hide the grid from the banded aligned-grid scan.
+    if allow_stacks {
+        if let Some((start, end, left, right)) = side_by_side_zones(&rows) {
+            if start > 0 {
+                project_full_band(rows[..start].to_vec(), allow_stacks, out, depth + 1);
+            }
+            out.push(ColumnBand::Columns { left, right });
+            if end + 1 < rows.len() {
+                project_full_band(rows[end + 1..].to_vec(), allow_stacks, out, depth + 1);
+            }
+            return;
+        }
     }
     if allow_stacks {
         if let Some((start, end, columns)) = staggered_columns_region(&rows) {
