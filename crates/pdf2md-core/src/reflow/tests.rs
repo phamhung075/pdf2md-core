@@ -171,12 +171,83 @@
         assert_eq!(join("a\n"), "a\n");
     }
 
+    #[test]
+    fn emphasis_wrapped_continuation_joins_into_one_run() {
+        // Each visual line is entirely bold; the next opens on `**` so its
+        // first *visible* character is lowercase and the lines continue one
+        // sentence. They must merge into a single `**...**` run.
+        let out = join(
+            "**the quick brown fox**\n**jumps over the lazy**\n**dog.**",
+        );
+        assert_eq!(
+            out,
+            "**the quick brown fox jumps over the lazy dog.**"
+        );
+        assert!(!out.contains("** **"), "two runs must merge: {out}");
+    }
+
+    #[test]
+    fn emphasis_run_does_not_join_an_uppercase_opener() {
+        // The next visible character is uppercase: a new block, not a wrap.
+        let out = join("**FIRST LABEL**\n**Second label**");
+        assert_eq!(out, "**FIRST LABEL**\n**Second label**");
+    }
+
+    #[test]
+    fn different_emphasis_styles_join_but_are_not_merged_into_one_run() {
+        let out = join("**bold line**\n*italic continuation*");
+        assert_eq!(out, "**bold line** *italic continuation*");
+    }
+
+    #[test]
+    fn underline_wrapped_continuation_merges_into_one_run() {
+        let out = join("<u>For more</u>\n<u>information about this</u>");
+        assert_eq!(out, "<u>For more information about this</u>");
+    }
+
+    #[test]
+    fn a_wrapped_clause_ending_in_a_colon_joins_the_line_above() {
+        // The colon fell at the wrap point; it must not split the paragraph.
+        let out = join(
+            "We re-run all benchmarks with our own evaluation pipeline for\nfair comparison across tasks as follows:",
+        );
+        assert_eq!(
+            out,
+            "We re-run all benchmarks with our own evaluation pipeline for fair comparison across tasks as follows:"
+        );
+    }
+
+    #[test]
+    fn an_uppercase_label_ending_in_a_colon_stays_a_boundary() {
+        let out = join("Voici les elements\nListe :");
+        assert_eq!(out, "Voici les elements\nListe :");
+    }
+
+    #[test]
+    fn a_trailing_comma_joins_an_uppercase_continuation() {
+        // A comma-separated run wrapped onto a second line that opens on an
+        // uppercase word must still reflow into one paragraph.
+        let out = join("metrics such as Hellaswag [28], Winogrande [21],\nOpenbookQA [19]");
+        assert_eq!(
+            out,
+            "metrics such as Hellaswag [28], Winogrande [21], OpenbookQA [19]"
+        );
+    }
+
+    #[test]
+    fn a_list_item_absorbs_a_wrapped_continuation_after_a_trailing_comma() {
+        let out = join("- **Reasoning:** Hellaswag [28], SIQA [22],\nOpenbookQA [19], ARC-Easy");
+        assert_eq!(
+            out,
+            "- **Reasoning:** Hellaswag [28], SIQA [22], OpenbookQA [19], ARC-Easy"
+        );
+    }
+
     /// End-to-end: a one-page PDF whose wrapped body line is drawn as two `Tj`
     /// runs must come out of the converter as a single paragraph. Built
     /// programmatically with lopdf — no fixture, no document text.
     #[test]
-    fn reflow_joins_wrapped_lines_end_to_end_in_a_synthetic_pdf() {
-        use lopdf::content::{Content, Operation};
+    fn reflow_joins_wrapped_lines_end_to_end_in_a_synthetic_pdf() {        use lopdf::content::{Content, Operation};
         use lopdf::{dictionary, Document, Object, Stream};
 
         let mut doc = Document::with_version("1.5");

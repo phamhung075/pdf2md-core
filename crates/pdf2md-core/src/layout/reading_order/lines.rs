@@ -442,24 +442,6 @@ pub(crate) fn push_band_lines(
     }
 }
 
-/// Decide whether a visual line is a page-number footer (numeric-only, in the
-/// bottom band of the page).
-pub fn is_page_number_line(spans: &[Span], page_height: f64) -> bool {
-    let y0 = spans.iter().map(|s| s.y).fold(f64::INFINITY, f64::min);
-    let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-    let t = text.trim();
-    if t.is_empty() {
-        return false;
-    }
-    if y0 < page_height * 0.055 {
-        let all_num = t
-            .chars()
-            .all(|c| c.is_ascii_digit() || c.is_whitespace() || c == '/' || c == '-' || c == '.');
-        return all_num && t.len() <= 12;
-    }
-    false
-}
-
 /// Render a single visual line to text (no surrounding blank-line logic).
 pub fn render_line_text(spans: &[Span], page_width: Option<f64>) -> String {
     render_spans(spans, page_width)

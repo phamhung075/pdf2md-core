@@ -7,15 +7,19 @@
 pub mod bordered;
 pub mod borderless;
 pub mod consolidation;
+pub mod ledger;
 pub mod rulers;
 pub mod validation;
 
 pub use bordered::{extract_bordered_tables, extract_tables, recover_borderless_tables, recover_tables_with_grid};
 pub use borderless::extract_borderless_tables;
+pub use ledger::apply_ledger_model;
 pub use rulers::{find_gap_tables, find_tables, scan_aligned_grids, table_rulers, RowInfo, TableHit, WordTok};
 
 use crate::layout::glyph_stream::Span;
-use crate::layout::reading_order::{body_size_for, detect_column_bands, push_band_lines, ListRunState};
+use crate::layout::reading_order::{
+    body_size_for, detect_column_bands, is_bare_page_number_line, push_band_lines, ListRunState,
+};
 use crate::models::CanvasTable;
 
 /// Collapse duplicate / overlapping table candidates for a page into a
@@ -62,12 +66,22 @@ fn spans_outside(line: &[Span], x0: f64, x1: f64) -> Vec<Span> {
 
 /// Render a page's visual lines to text, replacing detected table blocks with
 /// GFM pipe tables. Non-table lines use the exact same rules as `render_cluster`.
-pub fn render_with_tables(lines: &[Vec<Span>], tables: &[TableHit], page_width: Option<f64>) -> String {
+///
+/// Bare page-number footers are dropped from the non-table segments (as the
+/// plain renderer already does); the body-size anchor is still estimated from
+/// the *unfiltered* line list, so removing a footer cannot reclassify a heading.
+pub fn render_with_tables(
+    lines: &[Vec<Span>],
+    tables: &[TableHit],
+    page_height: f64,
+    page_width: Option<f64>,
+) -> String {
     let mut out = String::new();
     let mut prev_line_y: Option<f64> = None;
     let tables = de_overlap_tables(tables);
     let mut t = 0usize;
     let body_size = body_size_for(lines);
+    let is_footer = |l: &Vec<Span>| is_bare_page_number_line(l, page_height, body_size);
     let mut list_state = ListRunState::default();
 
     let mut i = 0usize;
@@ -95,6 +109,7 @@ pub fn render_with_tables(lines: &[Vec<Span>], tables: &[TableHit], page_width: 
             let side_content: Vec<Vec<Span>> = lines[i..=hit.end]
                 .iter()
                 .map(|l| spans_outside(l, hit.bbox.x0, hit.bbox.x1))
+                .map(|l| if is_footer(&l) { Vec::new() } else { l })
                 .collect();
             if side_content.iter().any(|l| !l.is_empty()) {
                 let bands = detect_column_bands(&side_content);
@@ -130,7 +145,21 @@ pub fn render_with_tables(lines: &[Vec<Span>], tables: &[TableHit], page_width: 
         } else {
             lines.len()
         };
-        let bands = detect_column_bands(&lines[i..seg_end]);
+        let seg = &lines[i..seg_end];
+        // Only pay for a filtered copy when the segment actually carries a
+        // footer; the common case renders the slice directly.
+        let filtered;
+        let seg = if seg.iter().any(is_footer) {
+            filtered = seg
+                .iter()
+                .filter(|l| !is_footer(l))
+                .cloned()
+                .collect::<Vec<Vec<Span>>>();
+            &filtered[..]
+        } else {
+            seg
+        };
+        let bands = detect_column_bands(seg);
         push_band_lines(&mut out, &bands, &mut prev_line_y, &mut list_state, body_size, page_width);
         i = seg_end;
     }
@@ -196,7 +225,7 @@ mod tests {
         ];
         // Table A occupies lines 0..=0; table B occupies lines 2..=2.
         let tables = vec![table(0, 0), table(2, 2)];
-        let md = render_with_tables(&lines, &tables, None);
+        let md = render_with_tables(&lines, &tables, 792.0, None);
         assert_eq!(table_blocks(&md), 2, "both disjoint tables must render:\n{md}");
         // The prose lines in between remain.
         assert!(md.contains("r1"));
@@ -211,7 +240,7 @@ mod tests {
         // Outer [1..=2] contains inner [2..=2]: the outer is emitted, the inner
         // is a duplicate of the same region and must be dropped (not double).
         let tables = vec![table(1, 2), table(2, 2)];
-        let md = render_with_tables(&lines, &tables, None);
+        let md = render_with_tables(&lines, &tables, 792.0, None);
         assert_eq!(table_blocks(&md), 1, "nested candidates collapse to one table:\n{md}");
     }
 
@@ -226,7 +255,7 @@ mod tests {
         // Overlapping candidates [1..=2] and [2..=3]: the first is emitted as a
         // table; the row the second claimed must not be silently lost.
         let tables = vec![table(1, 2), table(2, 3)];
-        let md = render_with_tables(&lines, &tables, None);
+        let md = render_with_tables(&lines, &tables, 792.0, None);
         assert_eq!(table_blocks(&md), 1, "overlap collapses to the first table:\n{md}");
         assert!(
             md.contains("r3"),
@@ -240,7 +269,7 @@ mod tests {
         // Two candidates sharing a start: the wider/earliest wins; duplicates
         // must not produce a second (staled) table.
         let tables = vec![table(0, 1), table(0, 2)];
-        let md = render_with_tables(&lines, &tables, None);
+        let md = render_with_tables(&lines, &tables, 792.0, None);
         assert_eq!(table_blocks(&md), 1, "same-start candidates render once:\n{md}");
     }
 
@@ -280,11 +309,30 @@ mod tests {
             ],
             bbox: BoundingBox::new(300.0, 680.0, 400.0, 710.0),
         };
-        let md = render_with_tables(&lines, &[hit], None);
+        let md = render_with_tables(&lines, &[hit], 792.0, None);
         assert!(
             md.contains("left prose one") && md.contains("left prose two"),
             "prose beside the side table was dropped:\n{md}"
         );
         assert_eq!(table_blocks(&md), 1, "side table was not rendered:\n{md}");
+    }
+
+    #[test]
+    fn bare_page_number_footer_is_dropped_beside_a_table() {
+        // A page that carries a table must not leak its bare footer number as a
+        // stray line (the plain renderer already drops it).
+        let lines = vec![
+            line("Intro prose", 700.0),
+            line("molecule count", 690.0),
+            line("2", 20.0),
+        ];
+        let tables = vec![table(1, 1)];
+        let md = render_with_tables(&lines, &tables, 792.0, None);
+        assert!(md.contains("Intro prose"), "intro lost:\n{md}");
+        assert_eq!(table_blocks(&md), 1, "table not rendered:\n{md}");
+        assert!(
+            !md.lines().any(|l| l.trim() == "2"),
+            "bare page number leaked into output:\n{md}"
+        );
     }
 }

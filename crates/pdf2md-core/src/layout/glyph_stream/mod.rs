@@ -49,6 +49,17 @@ pub(crate) struct Mtx {
 pub(crate) enum Widths {
     /// Simple font: byte code -> width in 1/1000 em (`/Widths` + `/FirstChar`).
     Byte([f64; 256]),
+    /// Type3 simple font: byte code -> width in 1/1000 em, already mapped from
+    /// the font's glyph space through its `/FontMatrix` (PDF 32000-1 §9.6.5).
+    ///
+    /// A Type3 font defines its own glyph space, so the `Tf` size operand is
+    /// not an em either; `em_scale` carries the real em the glyphs are set at
+    /// (see `type3_em_scale`) so every gap threshold derived from a run's
+    /// `size` is measured in real points.
+    ByteType3 {
+        table: [f64; 256],
+        em_scale: f64,
+    },
     /// Type0/CID font: CID -> width (`/W` + `/DW`), with an optional code->CID
     /// CMap (Identity-H/V uses None: the code bytes *are* the CID).
     Cid {
@@ -56,7 +67,7 @@ pub(crate) enum Widths {
         default: f64,
         encoding: Option<CMapCodec>,
     },
-    /// No usable metrics (e.g. base-14 fonts without embedded widths, Type3).
+    /// No usable metrics (e.g. base-14 fonts without embedded widths).
     None,
 }
 
@@ -189,3 +200,5 @@ mod tests_part2;
 mod tests_part3;
 #[cfg(test)]
 mod span_api_tests;
+#[cfg(test)]
+mod type3_metrics_tests;

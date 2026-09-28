@@ -55,6 +55,33 @@ impl ListRunState {
     }
 }
 
+/// A heading is a short label, not a sentence. At or below this many
+/// characters a trailing full stop is tolerated (e.g. `Résumé.`); above it the
+/// line is a complete sentence and is never promoted, at any font size.
+const LONG_SENTENCE_HEADING_MAX_CHARS: usize = 50;
+
+/// Maximum baseline pitch, in multiples of the candidate's own font size, for a
+/// heading to count as sitting "directly under" the previous heading. One
+/// single-spaced line of leading is ~1.2x its size; 1.6x leaves room for metric
+/// jitter while still excluding a heading separated by body text or a blank
+/// line.
+const BILINGUAL_MAX_PITCH_EM: f64 = 1.6;
+
+/// Character-weighted average font size of a line's visible spans.
+fn weighted_avg_size(sized: &[&Span]) -> f64 {
+    let total: f64 = sized.iter().map(|s| s.text.chars().count().max(1) as f64).sum();
+    sized
+        .iter()
+        .map(|s| s.size * s.text.chars().count().max(1) as f64)
+        .sum::<f64>()
+        / total.max(1.0)
+}
+
+/// Whether the majority of a line's visible spans are bold.
+fn line_is_bold(sized: &[&Span]) -> bool {
+    sized.iter().filter(|s| s.is_bold).count() * 2 > sized.len()
+}
+
 /// Statistical 3-level heading detector — see this section's module-level
 /// doc comment for provenance. Returns `None` for anything that doesn't look
 /// like a heading, including prose that merely happens to be short or bold.
@@ -77,13 +104,8 @@ pub(super) fn detect_heading_level(line: &[Span], body_size: f64) -> Option<u8> 
         return None;
     }
 
-    let total_chars: f64 = sized.iter().map(|s| s.text.chars().count().max(1) as f64).sum();
-    let avg_fs = sized
-        .iter()
-        .map(|s| s.size * s.text.chars().count().max(1) as f64)
-        .sum::<f64>()
-        / total_chars.max(1.0);
-    let is_bold = sized.iter().filter(|s| s.is_bold).count() * 2 > sized.len();
+    let avg_fs = weighted_avg_size(&sized);
+    let is_bold = line_is_bold(&sized);
 
     // Lowercase continuation guard: a heading in a Latin-script document starts
     // with an uppercase letter or a digit. A line opening with lowercase text
@@ -99,10 +121,11 @@ pub(super) fn detect_heading_level(line: &[Span], body_size: f64) -> Option<u8> 
             }
         }
     }
-    // Long complete-sentence guard: a 50+ character line that ends in a full
-    // stop and sits in the H3 size band (< 1.3x body) is an emphasized body
-    // sentence, not a section heading. Section headings are short labels.
-    if avg_fs < 1.3 * body_size && trimmed.ends_with('.') && trimmed.chars().count() > 50 {
+    // Long complete-sentence guard: a line over half a typical body line and
+    // ending in a full stop is a sentence, not a section heading, at *any*
+    // size. Section headings are short labels; a heading-sized full sentence is
+    // the page's opening line, not its title.
+    if trimmed.ends_with('.') && trimmed.chars().count() > LONG_SENTENCE_HEADING_MAX_CHARS {
         return None;
     }
 
@@ -228,6 +251,46 @@ pub(super) fn explicit_dot_ordinal(line: &[Span]) -> Option<usize> {
     digits.parse().ok()
 }
 
+/// Build the heading geometry remembered for the next visual line.
+fn heading_line_of(line: &[Span], level: u8, size: f64) -> HeadingLine {
+    let x0 = line.iter().map(|s| s.x).fold(f64::INFINITY, f64::min);
+    let x1 = line
+        .iter()
+        .map(|s| s.x + s.advance)
+        .fold(f64::NEG_INFINITY, f64::max);
+    HeadingLine { level, size, x0, x1, y: line[0].y }
+}
+
+/// True when `line` is the translation half of a bilingual heading pair: it
+/// sits directly under the heading above (`prev`), shares its horizontal
+/// extent, and is typographically subordinate — a deeper level, not bold, or a
+/// smaller size than the heading it translates. Such a line is rendered as
+/// plain text so the source heading is not duplicated at a second level.
+fn is_bilingual_translation(
+    prev: &HeadingLine,
+    line: &[Span],
+    level: u8,
+    size: f64,
+    bold: bool,
+) -> bool {
+    if line.is_empty() {
+        return false;
+    }
+    let pitch = prev.y - line[0].y;
+    if !(0.0..=BILINGUAL_MAX_PITCH_EM * size).contains(&pitch) {
+        return false;
+    }
+    let x0 = line.iter().map(|s| s.x).fold(f64::INFINITY, f64::min);
+    let x1 = line
+        .iter()
+        .map(|s| s.x + s.advance)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if x1 < prev.x0 || x0 > prev.x1 {
+        return false;
+    }
+    level > prev.level || !bold || size < prev.size
+}
+
 /// Classifies one visual line, threading `list_state` across consecutive
 /// calls in one render pass. Returns the role plus the span slice the caller
 /// should actually render as the line's text — the marker sliced off for a
@@ -241,11 +304,23 @@ pub(crate) fn classify_line<'a>(
     if line.is_empty() {
         return (LineRole::Body, line);
     }
+    let sized: Vec<&Span> = line.iter().filter(|s| !s.text.trim().is_empty()).collect();
     if let Some(level) = detect_heading_level(line, body_size) {
+        let size = sized.iter().map(|s| s.size).fold(0.0f64, f64::max).max(0.1);
+        let bold = line_is_bold(&sized);
+        let demote = list_state
+            .last_heading
+            .is_some_and(|p| is_bilingual_translation(&p, line, level, size, bold));
         list_state.end_run();
+        if demote {
+            list_state.last_heading = None;
+            return (LineRole::Body, line);
+        }
+        list_state.last_heading = Some(heading_line_of(line, level, size));
         return (LineRole::Heading(level), line);
     }
     if let Some((ordered, skip)) = detect_list_marker(line) {
+        list_state.last_heading = None;
         let depth = list_state.depth_for(line[0].x, body_size);
         // Always advance the run counter so a following dot/paren marker keeps
         // counting on from here, but let an explicit `[N]` citation index win,
@@ -267,6 +342,7 @@ pub(crate) fn classify_line<'a>(
         return (LineRole::List { depth, ordered, ordinal }, &line[skip..]);
     }
     list_state.end_run();
+    list_state.last_heading = None;
     (LineRole::Body, line)
 }
 

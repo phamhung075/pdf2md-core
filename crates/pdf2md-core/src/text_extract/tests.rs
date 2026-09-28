@@ -457,3 +457,42 @@ use super::tests_common::*;
             page.text
         );
     }
+
+    #[test]
+    fn a_rotated_tm_block_does_not_disable_later_gap_inference() {
+        // A rotated `Tm` (an angled watermark or badge) used to set the
+        // walker's `unusable` flag for the rest of the content stream, so
+        // every later `Td`-positioned word boundary lost its separator and
+        // the text welded into long tokens. `BT` resets the text matrix, so
+        // the flag must be scoped to its own text object. Courier's 600/1000
+        // advance makes the numbers exact: at size 10 a glyph advances 6.0,
+        // so a 12.0 `Td` leaves a 6.0 gap past the glyph end — well over the
+        // 0.1625 em word-gap threshold.
+        let doc = content_doc(
+            b"BT /F1 10 Tf 0.940 0.342 -0.342 0.940 259 387 Tm (N) Tj ET\n\
+              BT /F1 10 Tf 100 700 Td (A) Tj 12 0 Td (B) Tj 12 0 Td (C) Tj ET",
+        );
+        let page = extract_page_text_report(&doc, 1, false, false, false).expect("page text");
+        assert!(
+            page.text.contains("A B C"),
+            "gap inference must resume after a rotated Tm block: {:?}",
+            page.text
+        );
+    }
+
+    #[test]
+    fn consecutive_absolute_tm_lines_do_not_weld() {
+        // Producers that place every visual line with an absolute identity
+        // `Tm` and no `ET`/`T*` between lines used to have every line
+        // concatenated: only `Td`/`TD`/`ET` emitted a line break. A vertical
+        // `Tm` must separate the lines like a vertical `Td` does.
+        let doc = content_doc(
+            b"BT /F1 10 Tf 1 0 0 1 50 700 Tm (alpha)Tj 1 0 0 1 50 688 Tm (beta)Tj ET",
+        );
+        let page = extract_page_text_report(&doc, 1, false, false, false).expect("page text");
+        assert!(
+            !page.text.contains("alphabeta"),
+            "an absolute Tm line advance must separate the lines: {:?}",
+            page.text
+        );
+    }

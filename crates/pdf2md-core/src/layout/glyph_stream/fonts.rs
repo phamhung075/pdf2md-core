@@ -266,7 +266,10 @@ pub(crate) fn push_span(
         return None;
     }
     let hscale = tm.h_scale() * ctm.h_scale();
-    let size = tfs * hscale;
+    // A Type3 font's `Tf` operand is a size in the font's own glyph space, not
+    // an em: the font's `/FontMatrix` and `/FontBBox` give the real one, which
+    // travels on the width table. Every other font leaves this 1.0.
+    let size = tfs * hscale * width.em_scale();
     let (ux, uy) = tm.apply(em_offset / 1000.0 * tfs, 0.0);
     let (x, y) = ctm.apply(ux, uy);
     let advance = width

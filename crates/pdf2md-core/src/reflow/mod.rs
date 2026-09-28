@@ -12,13 +12,18 @@
 //!
 //! It is deliberately conservative and purely line-oriented:
 //!
-//! * structural lines (headings, list items, blockquotes, images, table rows,
-//!   fenced code) are never touched and act as hard boundaries;
-//! * a paragraph break (blank line, or a line that ends with `:`) is preserved;
+//! * structural lines (headings, blockquotes, images, table rows, fenced code)
+//!   are never touched and act as hard boundaries; a list item is the one
+//!   exception — it absorbs a wrapped continuation whose wrap point landed on a
+//!   comma;
+//! * a paragraph break (blank line, or a line that ends with `:`) is preserved,
+//!   except that a lowercase clause ending in `:` is a wrapped line, not a
+//!   label, and joins the line above;
 //! * two plain body lines join only when the earlier one has no sentence
-//!   terminator and the later one continues it (starts lowercase or with
-//!   `, ; . )`); a line that ends a sentence is always a paragraph boundary,
-//!   however long it is;
+//!   terminator and the later one continues it (starts lowercase, with
+//!   `, ; . )`, or after a trailing comma); the first *visible* character is
+//!   tested, so a line opening with `**`/`<u>` is classified by its text, and
+//!   two lines wrapped in the same emphasis merge into one run;
 //! * a trailing line-break hyphen is removed only before a lowercase *fragment*
 //!   (not a French clitic / compound tail) **and** when the joined word occurs
 //!   elsewhere in the document as a standalone word, so `infor-` + `mation`
@@ -31,6 +36,12 @@ use std::collections::HashSet;
 
 /// Line prefixes that always mark a structural (non-paragraph) line.
 const STRUCTURAL_STARTS: &[&str] = &["#", "- ", "* ", "> ", "<", "![", "|", "*["];
+
+/// Whole-line inline wrappers the renderer emits, longest opener first so
+/// `**bold**` is not read as an italic `*` wrapping `*bold*`. Used to merge two
+/// consecutive wrapped lines into a single run of the *same* emphasis
+/// (`**a**` + `**b**` -> `**a b**`, not `**a** **b**`).
+const WHOLE_LINE_WRAPPERS: &[(&str, &str)] = &[("**", "**"), ("<u>", "</u>"), ("*", "*")];
 
 /// Second elements of French hyphenated compounds / inversion clitics. A
 /// trailing `-` before one of these is a *real* hyphen, not a line-wrap break.
@@ -85,6 +96,14 @@ fn has_ordered_list_marker(line: &str) -> bool {
     chars.next() == Some('.') && chars.peek().map_or(false, |c| c.is_whitespace())
 }
 
+/// True for an unordered (`- `/`* `) or ordered (`N. `) list-item line at the
+/// start of the line. A list item may absorb one wrapped continuation (see
+/// `reflow_markdown`), unlike the other structural prefixes.
+fn is_list_start(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("- ") || t.starts_with("* ") || has_ordered_list_marker(line)
+}
+
 /// Number of maximal runs of at least three spaces in `line`.
 fn wide_space_runs(line: &str) -> usize {
     let mut runs = 0usize;
@@ -106,21 +125,90 @@ fn wide_space_runs(line: &str) -> usize {
 }
 
 /// A plain body line: content that a paragraph may be built from. Structural
-/// lines, label/`:` lines and form rows with wide gaps are excluded.
+/// lines, label/`:` lines and form rows with wide gaps are excluded. A line
+/// that is a single whole-line `<u>…</u>` run is body text with underline
+/// emphasis, not an HTML block, so it is *not* treated as structural.
 fn is_plain_body(line: &str) -> bool {
     let t = line.trim();
-    if t.is_empty() || is_structural_start(t) || has_ordered_list_marker(line) {
+    if t.is_empty() || has_ordered_list_marker(line) {
         return false;
     }
-    if t.ends_with(':') {
+    let underlined_run = whole_line_wrapper(t) == Some(("<u>", "</u>"));
+    if (is_structural_start(t) && !underlined_run) || t.ends_with(':') {
         return false;
     }
     wide_space_runs(line) < 2
 }
 
-/// Whether `t` ends with a sentence terminator.
+/// Whether `t` ends with a sentence terminator, ignoring any trailing
+/// emphasis/underline markup so a terminator inside `**...**` still counts.
 fn ends_sentence(t: &str) -> bool {
-    matches!(t.chars().last(), Some('.' | '!' | '?' | ':' | ';' | '»'))
+    matches!(
+        trim_trailing_markup(t).chars().last(),
+        Some('.' | '!' | '?' | ':' | ';' | '»')
+    )
+}
+
+/// `s` with any trailing `**`/`*`/`</u>` markup removed, so the last *visible*
+/// character can be tested.
+fn trim_trailing_markup(s: &str) -> &str {
+    let mut t = s.trim_end();
+    loop {
+        if let Some(r) = t.strip_suffix("</u>") {
+            t = r.trim_end();
+            continue;
+        }
+        let stars = t.len() - t.trim_end_matches('*').len();
+        if stars > 0 {
+            t = t[..t.len() - stars].trim_end();
+            continue;
+        }
+        break;
+    }
+    t
+}
+
+/// The first *visible* character of `s`, skipping any leading emphasis or
+/// underline markup the renderer put in front of it (`**en` -> `e`,
+/// `<u>For` -> `F`). A wrapped continuation that opens with `**` or `<u>` is
+/// therefore tested by the character the reader actually sees.
+fn first_visible_char(s: &str) -> Option<char> {
+    let mut rest = s.trim_start();
+    loop {
+        if let Some(r) = rest.strip_prefix("<u>") {
+            rest = r;
+            continue;
+        }
+        let stars = rest.len() - rest.trim_start_matches('*').len();
+        if stars > 0 {
+            rest = &rest[stars..];
+            continue;
+        }
+        break;
+    }
+    rest.chars().next()
+}
+
+/// The single whole-line emphasis/underline wrapper spanning `s`, if any.
+///
+/// Ambiguous shapes are rejected: the closer must be unique to the outer edges
+/// (`<u>a</u> <u>b</u>` is two runs, not one wrapper), and a star wrapper may
+/// not open onto another star (`***x***` is not a `**` wrapper).
+fn whole_line_wrapper(s: &str) -> Option<(&'static str, &'static str)> {
+    let t = s.trim();
+    for &(open, close) in WHOLE_LINE_WRAPPERS {
+        let Some(inner) = t.strip_prefix(open).and_then(|r| r.strip_suffix(close)) else {
+            continue;
+        };
+        if inner.is_empty() || inner.contains(close) {
+            continue;
+        }
+        if open.starts_with('*') && (inner.starts_with('*') || inner.ends_with('*')) {
+            continue;
+        }
+        return Some((open, close));
+    }
+    None
 }
 
 /// First run of alphabetic characters in `s`, or `""` when it does not start
@@ -212,6 +300,9 @@ pub fn reflow_markdown(input: &str) -> String {
 
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut pending: Option<String> = None;
+    // True when `pending` is a list item, which only continues across a wrap
+    // that lands on a comma (see the join test below).
+    let mut pending_list = false;
     let mut last = String::new();
     let mut fence = false;
 
@@ -223,6 +314,7 @@ pub fn reflow_markdown(input: &str) -> String {
             if let Some(p) = pending.take() {
                 out.push(p);
             }
+            pending_list = false;
             out.push(ln.to_string());
             continue;
         }
@@ -232,6 +324,7 @@ pub fn reflow_markdown(input: &str) -> String {
             if let Some(p) = pending.take() {
                 out.push(p);
             }
+            pending_list = false;
             out.push(ln.to_string());
             fence = !fence;
             continue;
@@ -241,61 +334,107 @@ pub fn reflow_markdown(input: &str) -> String {
             continue;
         }
 
-        if trimmed.is_empty() || !is_plain_body(ln) {
+        if trimmed.is_empty() {
             if let Some(p) = pending.take() {
                 out.push(p);
             }
+            pending_list = false;
+            out.push(ln.to_string());
+            continue;
+        }
+
+        // A list item may be continued by a wrapped fragment; every other
+        // structural line is a hard boundary. A line ending in `:` that opens
+        // lowercase is a wrapped clause whose colon fell at the wrap point, not
+        // a standalone label, so it too may join the paragraph above.
+        let list_line = is_list_start(ln);
+        let colon_continuation = !is_structural_start(trimmed)
+            && !list_line
+            && trimmed.ends_with(':')
+            && wide_space_runs(ln) < 2
+            && first_visible_char(trimmed).is_some_and(|c| c.is_lowercase());
+        if !is_plain_body(ln) && !list_line && !colon_continuation {
+            if let Some(p) = pending.take() {
+                out.push(p);
+            }
+            pending_list = false;
             out.push(ln.to_string());
             continue;
         }
 
         if pending.is_none() {
             pending = Some(ln.to_string());
+            pending_list = list_line;
             last.clear();
             last.push_str(ln);
             continue;
         }
 
         let ns = ln.trim_start();
-        let first = ns.chars().next();
-        let a_term = ends_sentence(last.trim_end());
+        let first = first_visible_char(ns);
+        let a_term = ends_sentence(&last);
+        // A comma at a wrap point continues a comma-separated run even when the
+        // next visual line opens on an uppercase word (`…, SIQA,\nOpenbookQA…`).
+        let comma_continuation = trim_trailing_markup(&last).ends_with(',') && !a_term;
         // A line that already ends a sentence is never a wrapped continuation,
         // however long it is: a following lowercase line starts a new
         // paragraph. Only a leading `, ; . )` (the continuation punctuation
-        // itself) joins across the terminator.
-        let join = match first {
-            Some(c) if matches!(c, ',' | ';' | '.' | ')') => true,
-            Some(c) if c.is_lowercase() && !a_term => true,
-            _ => false,
-        };
+        // itself), a lowercase opener, or a trailing comma continues it. A new
+        // list item always starts its own line, and a wrapped list fragment
+        // only continues after the comma case above.
+        let join = !list_line
+            && match first {
+                Some(c) if matches!(c, ',' | ';' | '.' | ')') => true,
+                Some(c) if c.is_lowercase() && !a_term && !pending_list => true,
+                _ => comma_continuation,
+            };
 
         if join {
             let buf = pending.as_mut().expect("pending is set");
-            match classify_hyphen_join(buf, ln) {
-                HyphenJoin::Dehyphenate
-                    if vocab.contains(&dehyphenated_word(buf, ln)) =>
-                {
-                    let n = buf.trim_end().len();
-                    buf.truncate(n - 1); // '-' is one byte
-                    buf.push_str(ns);
+            match whole_line_wrapper(buf).filter(|w| whole_line_wrapper(ln) == Some(*w)) {
+                Some((open, close)) => {
+                    // Both lines carry the same whole-line emphasis: merge them
+                    // into one run rather than leaving `**a** **b**`.
+                    let prev = buf.trim();
+                    let next = ln.trim();
+                    let prev_inner = prev
+                        .strip_prefix(open)
+                        .and_then(|r| r.strip_suffix(close))
+                        .unwrap_or(prev)
+                        .trim();
+                    let next_inner = next
+                        .strip_prefix(open)
+                        .and_then(|r| r.strip_suffix(close))
+                        .unwrap_or(next)
+                        .trim();
+                    *buf = format!("{open}{prev_inner} {next_inner}{close}");
                 }
-                // A real compound / clitic, or a fragment whose joined word
-                // never appears standalone in this document: keep the hyphen.
-                HyphenJoin::Dehyphenate | HyphenJoin::KeepHyphen => {
-                    let n = buf.trim_end().len();
-                    buf.truncate(n);
-                    buf.push_str(ns);
-                }
-                HyphenJoin::None => {
-                    let n = buf.trim_end().len();
-                    buf.truncate(n);
-                    if punct_join_safe(ns) {
-                        buf.push_str(ns);
-                    } else {
-                        buf.push(' ');
+                None => match classify_hyphen_join(buf, ln) {
+                    HyphenJoin::Dehyphenate
+                        if vocab.contains(&dehyphenated_word(buf, ln)) =>
+                    {
+                        let n = buf.trim_end().len();
+                        buf.truncate(n - 1); // '-' is one byte
                         buf.push_str(ns);
                     }
-                }
+                    // A real compound / clitic, or a fragment whose joined word
+                    // never appears standalone in this document: keep the hyphen.
+                    HyphenJoin::Dehyphenate | HyphenJoin::KeepHyphen => {
+                        let n = buf.trim_end().len();
+                        buf.truncate(n);
+                        buf.push_str(ns);
+                    }
+                    HyphenJoin::None => {
+                        let n = buf.trim_end().len();
+                        buf.truncate(n);
+                        if punct_join_safe(ns) {
+                            buf.push_str(ns);
+                        } else {
+                            buf.push(' ');
+                            buf.push_str(ns);
+                        }
+                    }
+                },
             }
             last.clear();
             last.push_str(ln);
@@ -304,6 +443,7 @@ pub fn reflow_markdown(input: &str) -> String {
                 out.push(p);
             }
             pending = Some(ln.to_string());
+            pending_list = list_line;
             last.clear();
             last.push_str(ln);
         }

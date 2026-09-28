@@ -414,54 +414,60 @@ pub(super) fn scan_aligned_grids_opts(
                             continue;
                         }
 
-                        let table_rows: Vec<Vec<String>> =
+                        // Baseline acceptance gate: the *full* window must
+                        // still read as a tabular grid exactly as it did
+                        // before. This keeps the set of accepted windows
+                        // identical to the previous release, so trimming can
+                        // never promote a window the geometry rejected.
+                        let full_rows: Vec<Vec<String>> =
                             bucket_rows_content_aware(&info, &win_rows, &rulers, tol, min_gutter);
-                        let (table_rows, rulers) =
-                            merge_complementary_columns(table_rows, &win_rows, &info, &rulers, tol);
-                        // Drop fully-empty edge columns.
-                        let ncol = rulers.len();
-                        let mut c0 = 0usize;
-                        let mut c1 = ncol;
-                        while c0 < c1 && table_rows.iter().all(|r| r[c0].trim().is_empty()) {
-                            c0 += 1;
-                        }
-                        while c1 > c0 && table_rows.iter().all(|r| r[c1 - 1].trim().is_empty()) {
-                            c1 -= 1;
-                        }
-                        if c1 - c0 >= 2 {
-                            let rows2: Vec<Vec<String>> =
-                                table_rows.iter().map(|r| r[c0..c1].to_vec()).collect();
-                            if !is_tabular_rows(&rows2) {
-                                t(&format!(
-                                    "  REJECT window [{}-{}]: is_tabular_rows false rows2={:?} [not_tabular]",
-                                    band[lo], band[hi], rows2
-                                ));
-                                lo += 1;
-                                continue;
-                            }
-                            let consolidated_rows =
-                                consolidate_table_rows(rows2, &win_rows, lines, &info);
-                            let mut min_x = f64::INFINITY;
-                            let mut max_x = f64::NEG_INFINITY;
-                            let mut min_y = f64::INFINITY;
-                            let mut max_y = f64::NEG_INFINITY;
-                            for &i in &win_rows {
-                                for sp in &lines[i] {
-                                    min_x = min_x.min(sp.x);
-                                    max_x = max_x.max(sp.x + sp.advance);
-                                    min_y = min_y.min(sp.y);
-                                    max_y = max_y.max(sp.y);
-                                }
-                            }
-                            hits.push(TableHit {
-                                start: win_rows[0],
-                                end: *win_rows.last().unwrap(),
-                                rows: consolidated_rows,
-                                bbox: BoundingBox::new(min_x, min_y, max_x, max_y),
-                            });
-                            lo = hi + 1;
+                        let (full_rows, _) =
+                            merge_complementary_columns(full_rows, &win_rows, &info, &rulers, tol);
+                        let full_rows = drop_empty_edge_columns(full_rows);
+                        if !is_tabular_rows(&full_rows) {
+                            t(&format!(
+                                "  REJECT window [{}-{}]: is_tabular_rows false [not_tabular]",
+                                band[lo], band[hi]
+                            ));
+                            lo += 1;
                             continue;
                         }
+
+                        // The window may have grown over leading/trailing
+                        // caption or full-width prose rows: they helped it
+                        // establish its columns, but they are not table rows.
+                        // Trim them from the emitted grid so the paragraph is
+                        // rendered as text instead of being swallowed.
+                        let Some((emit_rows, consolidated_rows)) =
+                            trimmed_table(&info, &win_rows, &rulers, lines, tol, min_gutter)
+                        else {
+                            t(&format!(
+                                "  REJECT window [{}-{}]: no table rows after trim [not_tabular]",
+                                band[lo], band[hi]
+                            ));
+                            lo += 1;
+                            continue;
+                        };
+                        let mut min_x = f64::INFINITY;
+                        let mut max_x = f64::NEG_INFINITY;
+                        let mut min_y = f64::INFINITY;
+                        let mut max_y = f64::NEG_INFINITY;
+                        for &i in &emit_rows {
+                            for sp in &lines[i] {
+                                min_x = min_x.min(sp.x);
+                                max_x = max_x.max(sp.x + sp.advance);
+                                min_y = min_y.min(sp.y);
+                                max_y = max_y.max(sp.y);
+                            }
+                        }
+                        hits.push(TableHit {
+                            start: emit_rows[0],
+                            end: *emit_rows.last().unwrap(),
+                            rows: consolidated_rows,
+                            bbox: BoundingBox::new(min_x, min_y, max_x, max_y),
+                        });
+                        lo = hi + 1;
+                        continue;
                     }
                 }
             }

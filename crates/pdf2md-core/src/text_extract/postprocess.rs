@@ -190,9 +190,18 @@ pub(super) fn is_group_separator(c: char) -> bool {
 /// The page-marker heuristic `convert_pdf_bytes_to_markdown` applies to a
 /// page's first line. Computed here on the string-walker text so a newly
 /// routed page keeps the marker the non-routed path emitted.
-pub(super) fn first_line_looks_like_heading(text: &str) -> bool {
-    text.starts_with("# ")
-        || text.lines().next().map_or(false, |l| {
-            l.len() < 60 && l.chars().all(|c| c.is_alphanumeric() || c.is_whitespace())
-        })
+///
+/// A rendered ATX heading (`#`..`######`) already *is* a page title, so any
+/// level counts as heading-like. Without this, a document whose title the
+/// layout renderer promoted to `## ` lost its `## Page N` marker, because only
+/// the H1 spelling `# ` was recognised.
+pub(crate) fn first_line_looks_like_heading(text: &str) -> bool {
+    let Some(line) = text.lines().next() else {
+        return false;
+    };
+    let hashes = line.bytes().take_while(|&b| b == b'#').count();
+    if (1..=6).contains(&hashes) && line.as_bytes().get(hashes).map_or(true, |&b| b == b' ') {
+        return true;
+    }
+    line.len() < 60 && line.chars().all(|c| c.is_alphanumeric() || c.is_whitespace())
 }

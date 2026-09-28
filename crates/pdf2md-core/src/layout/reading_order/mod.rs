@@ -22,6 +22,8 @@ mod zones;
 use zones::*;
 mod lines;
 pub use lines::*;
+mod page_numbers;
+pub use page_numbers::*;
 mod render;
 pub use render::*;
 mod body_size;
@@ -140,6 +142,18 @@ pub(crate) enum LineRole {
     Body,
 }
 
+/// Geometry of a heading candidate accepted for one visual line, remembered so
+/// the line directly under it can be tested as its bilingual translation
+/// (`detect_heading_level` alone cannot see the line above).
+#[derive(Clone, Copy)]
+pub(crate) struct HeadingLine {
+    pub level: u8,
+    pub size: f64,
+    pub x0: f64,
+    pub x1: f64,
+    pub y: f64,
+}
+
 /// Per-render-pass state so consecutive list items share one indent anchor
 /// and ordered items number consecutively; resets whenever a heading or a
 /// non-list body line breaks the run (mirrors normal Markdown list
@@ -148,6 +162,9 @@ pub(crate) enum LineRole {
 pub(crate) struct ListRunState {
     base_x: Option<f64>,
     counters: Vec<usize>,
+    /// The heading accepted for the immediately preceding visual line, cleared
+    /// by any body/list line so only a directly-adjacent translation matches.
+    last_heading: Option<HeadingLine>,
 }
 
 #[cfg(test)]

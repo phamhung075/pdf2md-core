@@ -34,6 +34,7 @@ pub mod models;
 #[cfg(feature = "vision")]
 pub mod phash;
 pub mod reflow;
+mod spacing;
 mod time;
 pub mod text_extract;
 

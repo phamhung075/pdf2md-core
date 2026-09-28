@@ -192,6 +192,19 @@ pub(super) fn walk_content(
                                 && c.abs() <= 1e-3
                                 && (d.abs() - 1.0).abs() <= 1e-3);
                     if identity {
+                        // An identity `Tm` that moves the baseline starts a new
+                        // visual line, exactly as a vertical `Td` does.
+                        // Producers that place every line with an absolute `Tm`
+                        // and no `ET`/`T*` between them otherwise weld the lines
+                        // into one run. The 0.5-em tolerance matches the glyph
+                        // engine's same-line grouping (`build_lines`), so a
+                        // super/subscript a few points off its baseline stays
+                        // inline.
+                        if !pos_mode
+                            && (y - tp.line_y).abs() > 0.5 * tp.size.max(0.1)
+                        {
+                            break_line(out);
+                        }
                         tp.line_x = x;
                         tp.line_y = y;
                         tp.goto_line(false);
@@ -236,7 +249,11 @@ pub(super) fn walk_content(
             "BT" => {
                 // `BT` resets the text matrix (not the rest of the text
                 // state), so the next line starts at the origin until `Tm`/`Td`
-                // places it.
+                // places it. It also resets `unusable`: a scaled/rotated `Tm`
+                // only invalidates gap inference for its *own* text object,
+                // because this reset puts the following `Td`-positioned runs
+                // back in an unaligned (unit-scale, unrotated) text space.
+                tp.unusable = false;
                 tp.line_x = 0.0;
                 tp.line_y = 0.0;
                 tp.goto_line(false);

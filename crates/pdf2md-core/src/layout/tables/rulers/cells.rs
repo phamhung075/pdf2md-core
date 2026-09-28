@@ -193,6 +193,145 @@ pub(super) fn row_straddles(row: &RowInfo, rulers: &[f64], x: f64, tol: f64, min
     )
 }
 
+/// A running-prose line carries at least this many words: a full-width
+/// justified body line holds roughly twelve to twenty, while a table header of
+/// short labels rarely reaches it, and any row that shows its own column-like
+/// internal gutter is excluded regardless of length.
+const PROSE_MIN_WORDS: usize = 8;
+
+/// A prose line must span at least this fraction of the ruler extent (the
+/// distance from the grid's leftmost to rightmost detected column) to read as
+/// full-width body text rather than a short label or a single cell. A wrapped
+/// paragraph's last line is only partly filled and is handled separately by
+/// [`row_is_body_text`], which follows a paragraph run.
+const PROSE_SPAN_FRAC: f64 = 0.9;
+
+/// Whether `row` opens with a figure/table caption prefix — "Table 2",
+/// "Figure 3", "Fig. 4", or "Tableau 1" followed by a number. A caption labels
+/// the grid it sits beside or below and must never be treated as one of its
+/// rows: its words can accidentally align with the grid's own columns.
+pub(super) fn has_caption_prefix(row: &RowInfo) -> bool {
+    let first = match row.words.first() {
+        Some(w) => w.text.trim().to_ascii_lowercase(),
+        None => return false,
+    };
+    if !matches!(first.as_str(), "table" | "figure" | "fig" | "fig." | "tableau") {
+        return false;
+    }
+    row.words.get(1).map_or(false, |n| {
+        n.text
+            .trim_start_matches(|c: char| !c.is_alphanumeric())
+            .chars()
+            .next()
+            .map_or(false, |c| c.is_ascii_digit())
+    })
+}
+
+/// Whether `row` reads as a full-width running-prose line rather than a table
+/// row: it shows no column-like internal gutter of its own (every word sits
+/// within ordinary word-spacing of the next), carries at least
+/// [`PROSE_MIN_WORDS`] words, and its text spans at least [`PROSE_SPAN_FRAC`]
+/// of the ruler extent. Justified body text whose ragged word edges happen to
+/// align with column positions would otherwise seed, be annexed as a header,
+/// or be grown into a table window and swallow the paragraph.
+///
+/// The gutter threshold is taken from the row's *own* font, not the window's:
+/// a body line set larger than the grid below it has wider word spaces that
+/// must not be mistaken for the smaller grid's column gutters.
+pub(super) fn row_is_prose(row: &RowInfo, rulers: &[f64]) -> bool {
+    if row.words.len() < PROSE_MIN_WORDS {
+        return false;
+    }
+    if row_has_internal_gutter(&row.words, min_gutter_for(row.size)) {
+        return false;
+    }
+    let (Some(&first), Some(&last)) = (rulers.first(), rulers.last()) else {
+        return false;
+    };
+    let extent = last - first;
+    if extent <= 0.0 {
+        return false;
+    }
+    let x0 = row.words.first().map_or(first, |w| w.x0);
+    let x1 = row.words.last().map_or(last, |w| w.x1);
+    (x1 - x0) >= PROSE_SPAN_FRAC * extent
+}
+
+/// [`row_is_prose`] plus the caption-prefix veto: neither a running-prose line
+/// nor a figure/table caption may seed a table window, be annexed as its
+/// header, or be grown into its body.
+pub(super) fn row_is_prose_or_caption(row: &RowInfo, rulers: &[f64]) -> bool {
+    has_caption_prefix(row) || row_is_prose(row, rulers)
+}
+
+/// Whether `row` is body text (prose or caption) that must not be emitted as a
+/// table row, given whether the body-text run it may continue is already open.
+///
+/// A wrapped paragraph's last line is only partly filled, so it fails the
+/// full-width test in [`row_is_prose`] on its own; a no-gutter, wordy line that
+/// follows (or precedes) body text is still that paragraph's continuation.
+pub(super) fn row_is_body_text(row: &RowInfo, rulers: &[f64], continues_body: bool) -> bool {
+    if row_is_prose_or_caption(row, rulers) {
+        return true;
+    }
+    continues_body
+        && row.words.len() >= PROSE_MIN_WORDS
+        && !row_has_internal_gutter(&row.words, min_gutter_for(row.size))
+}
+
+/// Drop fully-empty leading and trailing columns from a rectangular cell grid.
+pub(super) fn drop_empty_edge_columns(rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    let ncol = rows.first().map_or(0, |r| r.len());
+    let mut c0 = 0usize;
+    let mut c1 = ncol;
+    while c0 < c1 && rows.iter().all(|r| r.get(c0).map_or(true, |c| c.trim().is_empty())) {
+        c0 += 1;
+    }
+    while c1 > c0 && rows.iter().all(|r| r.get(c1 - 1).map_or(true, |c| c.trim().is_empty())) {
+        c1 -= 1;
+    }
+    rows.into_iter().map(|r| r[c0..c1].to_vec()).collect()
+}
+
+/// Cells to emit for an already-accepted grid window, with the leading and
+/// trailing body-text rows (see [`row_is_body_text`]) removed. Returns the
+/// emitted line indices and the consolidated cells, or `None` when fewer than
+/// two table rows remain or the trimmed rows no longer read as a table.
+///
+/// Detection and validation stay with the caller over the *full* window; only
+/// the emission is trimmed, so no grid is invented and no accepted one is
+/// dropped — the paragraph inside the window simply renders as text.
+pub(super) fn trimmed_table(
+    info: &[RowInfo],
+    win_rows: &[usize],
+    rulers: &[f64],
+    lines: &[Vec<Span>],
+    tol: f64,
+    min_gutter: f64,
+) -> Option<(Vec<usize>, Vec<Vec<String>>)> {
+    let mut is_body: Vec<bool> = Vec::with_capacity(win_rows.len());
+    let mut prev_body = false;
+    for &ri in win_rows {
+        let body = row_is_body_text(&info[ri], rulers, prev_body);
+        is_body.push(body);
+        prev_body = body;
+    }
+    let e0 = is_body.iter().position(|&b| !b).unwrap_or(win_rows.len());
+    let e1 = is_body.iter().rposition(|&b| !b).map(|i| i + 1).unwrap_or(0);
+    if e1 <= e0 + 1 {
+        return None;
+    }
+    let emit_rows: Vec<usize> = win_rows[e0..e1].to_vec();
+    let table_rows = bucket_rows_content_aware(info, &emit_rows, rulers, tol, min_gutter);
+    let (table_rows, _) = merge_complementary_columns(table_rows, &emit_rows, info, rulers, tol);
+    let rows2 = drop_empty_edge_columns(table_rows);
+    if !is_tabular_rows(&rows2) {
+        return None;
+    }
+    let consolidated = consolidate_table_rows(rows2, &emit_rows, lines, info);
+    Some((emit_rows, consolidated))
+}
+
 /// Whether the row at `row_idx` is a plausible table header that sits directly
 /// above a detected grid and may be annexed to it.
 ///

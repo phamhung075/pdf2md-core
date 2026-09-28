@@ -51,3 +51,5 @@ mod tests;
 mod tests_common;
 #[cfg(test)]
 mod tests_part2;
+#[cfg(test)]
+mod prose_veto_tests;

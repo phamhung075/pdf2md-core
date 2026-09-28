@@ -193,11 +193,9 @@ pub fn convert_pdf_bytes_to_markdown(
         let mut chunk = String::new();
         // A newly-routed page reports the marker decision from the string
         // walker (`marker_hint`), so routing does not move its page boundary.
+        // The non-routed path shares the one predicate with the walker.
         let heading_like = marker_hint.unwrap_or_else(|| {
-            text.starts_with("# ")
-                || text.lines().next().map_or(false, |l| {
-                    l.len() < 60 && l.chars().all(|c| c.is_alphanumeric() || c.is_whitespace())
-                })
+            crate::text_extract::first_line_looks_like_heading(&text)
         });
         if options.detect_headings && heading_like {
             chunk.push_str(&format!("\n## Page {}\n\n", page_num));
@@ -290,6 +288,11 @@ pub fn convert_pdf_bytes_to_markdown(
         let reflowed = reflow::reflow_markdown(&chunk);
         full_markdown.push_str(&reflowed);
     }
+
+    // Whitespace normalization runs once on the whole document, after reflow:
+    // the reflow pass relies on wide (3+ space) runs to recognise aligned form
+    // rows, so their collapse must come later. See `spacing`.
+    full_markdown = spacing::collapse_interior_spaces(&full_markdown);
 
     let duration_us = t0.elapsed_us();
 

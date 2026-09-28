@@ -292,6 +292,17 @@ pub fn extract_page_glyphs(
             });
         }
     }
+    // A statement operations ledger is not always a ruler-aligned grid: its
+    // header labels can sit off-baseline and off-centre, so the generic passes
+    // above either miss it or split it into 2/3-column fragments. When a ledger
+    // header is present, rebuild the whole ledger region from it as one table,
+    // replacing the fragment hits inside that region. Gated on `detect_tables`
+    // so `--no-tables` still renders the page as plain text.
+    let hits = if detect_tables {
+        crate::layout::tables::apply_ledger_model(&lines, hits)
+    } else {
+        hits
+    };
     // Underline: match collected thin horizontal rules to spans, skipping any
     // visual line already claimed by a recovered table (whose row borders are
     // the same sort of thin rule).
@@ -303,7 +314,7 @@ pub fn extract_page_glyphs(
     let table_rendered = !hits.is_empty();
     let mut text = if table_rendered {
         // Byte-identical to the plain text renderer when no table is found.
-        render_with_tables(&lines, &hits, Some(page_width))
+        render_with_tables(&lines, &hits, page_height, Some(page_width))
     } else if detect_layout {
         if detect_math {
             render_math(&lines, &underline_segs, page_height, true, Some(page_width))

@@ -114,6 +114,18 @@ use super::structural_tests_common::*;
     }
 
     #[test]
+    fn long_complete_sentence_is_never_a_heading_at_any_size() {
+        // A heading-sized line that is a full sentence (> 50 chars, ends in a
+        // period) is prose, not a title, however large the producer drew it.
+        let sentence = "This deliberately long sentence must never be promoted to a heading at all.";
+        assert!(sentence.chars().count() > 50);
+        for ratio in [1.4, 1.6, 2.0] {
+            let line = one_span_line(sentence, BODY * ratio, true);
+            assert_eq!(detect_heading_level(&line, BODY), None, "ratio {ratio}");
+        }
+    }
+
+    #[test]
     fn uniform_small_table_text_does_not_become_the_body_size() {
         // Regression: a page whose small (7pt) table/caption cells are perfectly
         // uniform while the real 10pt prose carries ordinary metric jitter
@@ -283,6 +295,51 @@ use super::structural_tests_common::*;
             LineRole::List { ordinal, .. } => assert_eq!(ordinal, 1),
             other => panic!("expected a fresh list run, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bilingual_translation_directly_under_a_heading_is_demoted() {
+        let mut state = ListRunState::default();
+        let heading = one_span_line("MAIN SECTION TITLE", BODY * 1.6, true);
+        let (role, _) = classify_line(&heading, BODY, &mut state);
+        assert!(matches!(role, LineRole::Heading(1)));
+
+        // Directly under (1.5 em pitch), horizontally overlapping, and
+        // subordinate: deeper level and not bold. This is the translation line.
+        let mut translation = one_span_line("TRANSLATED SECTION TITLE", BODY * 1.35, false);
+        translation[0].y = heading[0].y - BODY * 1.5;
+        let (role, _) = classify_line(&translation, BODY, &mut state);
+        assert!(
+            matches!(role, LineRole::Body),
+            "the translation line must be demoted: {role:?}"
+        );
+    }
+
+    #[test]
+    fn second_heading_separated_by_a_blank_line_is_not_demoted() {
+        let mut state = ListRunState::default();
+        let first = one_span_line("Section A", BODY * 1.6, true);
+        let (role, _) = classify_line(&first, BODY, &mut state);
+        assert!(matches!(role, LineRole::Heading(1)));
+
+        let mut second = one_span_line("Section B", BODY * 1.6, true);
+        second[0].y = first[0].y - BODY * 4.0;
+        let (role, _) = classify_line(&second, BODY, &mut state);
+        assert!(matches!(role, LineRole::Heading(1)));
+    }
+
+    #[test]
+    fn a_body_line_between_headings_prevents_demotion() {
+        let mut state = ListRunState::default();
+        let first = one_span_line("Section A", BODY * 1.6, true);
+        let _ = classify_line(&first, BODY, &mut state);
+        let body = one_span_line("ordinary body text", BODY, false);
+        let _ = classify_line(&body, BODY, &mut state);
+
+        let mut second = one_span_line("Section B", BODY * 1.6, true);
+        second[0].y = first[0].y - BODY * 1.5;
+        let (role, _) = classify_line(&second, BODY, &mut state);
+        assert!(matches!(role, LineRole::Heading(1)));
     }
 
     #[test]
