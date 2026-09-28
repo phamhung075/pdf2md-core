@@ -302,7 +302,7 @@ pub(super) fn walk_glyphs(
             }
             // --- Underline-candidate path tracking (thin horizontal rules) ---
             "m" => {
-                flush_path_segs(&mut path_pts, path_start, &mut underline_segs, false);
+                flush_path_segs(&mut path_pts, path_start, &mut underline_segs, &mut vertical_segs, false);
                 if let (Some(x), Some(y)) =
                     (op.operands.first().and_then(num), op.operands.get(1).and_then(num))
                 {
@@ -338,7 +338,7 @@ pub(super) fn walk_glyphs(
                 }
             }
             "re" => {
-                flush_path_segs(&mut path_pts, path_start, &mut underline_segs, false);
+                flush_path_segs(&mut path_pts, path_start, &mut underline_segs, &mut vertical_segs, false);
                 if let (Some(x), Some(y), Some(w), Some(h)) = (
                     op.operands.first().and_then(num),
                     op.operands.get(1).and_then(num),
@@ -365,10 +365,10 @@ pub(super) fn walk_glyphs(
                 }
             }
             "S" | "s" | "B" | "B*" | "b" | "b*" => {
-                flush_path_segs(&mut path_pts, path_start, &mut underline_segs, true);
+                flush_path_segs(&mut path_pts, path_start, &mut underline_segs, &mut vertical_segs, true);
             }
             "f" | "F" | "f*" => {
-                flush_path_segs(&mut path_pts, path_start, &mut underline_segs, true);
+                flush_path_segs(&mut path_pts, path_start, &mut underline_segs, &mut vertical_segs, true);
             }
             "n" => path_pts.clear(),
             // Form XObject text. Fonts come from the form's own resource chain

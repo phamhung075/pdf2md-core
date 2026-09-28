@@ -11,6 +11,7 @@ pub mod key_value;
 pub mod ledger;
 pub mod ledger_columns;
 pub mod ledger_rows;
+pub mod ruled_frame;
 pub mod rulers;
 pub mod validation;
 
@@ -18,6 +19,7 @@ pub use bordered::{extract_bordered_tables, extract_tables, recover_borderless_t
 pub use borderless::extract_borderless_tables;
 pub use key_value::append_key_value_boxes;
 pub use ledger::{apply_ledger_model, apply_ledger_model_with_rules};
+pub use ruled_frame::apply_ruled_frame_model;
 pub use rulers::{find_gap_tables, find_tables, scan_aligned_grids, table_rulers, RowInfo, TableHit, WordTok};
 
 use crate::layout::glyph_stream::Span;
@@ -25,6 +27,17 @@ use crate::layout::reading_order::{
     body_size_for, detect_column_bands, is_bare_page_number_line, push_band_lines, ListRunState,
 };
 use crate::models::CanvasTable;
+
+/// Baseline-to-baseline line pitch as a multiple of the body font size.
+const LINE_PITCH_MULT: f64 = 1.2;
+/// Neighboring content whose first line sits within this many line pitches of
+/// the line above the table continues that prose (side-by-side column); content
+/// starting further down is a separate sidebar emitted after the table.
+const SIDE_CONTINUATION_PITCH_MULT: f64 = 3.0;
+/// A block of neighboring content must have at least this many lines to count
+/// as a sidebar eligible for the table-first order; a handful of side amounts
+/// beside individual rows keeps the original order.
+const MIN_SIDEBAR_LINES: usize = 5;
 
 /// Collapse duplicate / overlapping table candidates for a page into a
 /// non-overlapping, line-disjoint list sorted by `start`.
@@ -106,33 +119,73 @@ pub fn render_with_tables(
                 continue;
             }
             // A side table shares its visual lines with a neighboring column's
-            // prose. Those lines are skipped below when the table is spliced, so
-            // render whatever lies outside the table's own x-band first
-            // (continuing the surrounding prose); for a full-width table this is
-            // empty and nothing changes.
+            // prose. When that neighbor runs beside the table's own first line
+            // (a genuine side-by-side layout) it continues the prose above the
+            // table, so it is emitted first as before. When it instead begins
+            // *below* the table's top — a sidebar to the right whose first box
+            // starts a few rows down — the table must be emitted first, at its
+            // frame's position, or it is pushed below the sidebar.
             let side_content: Vec<Vec<Span>> = lines[i..=hit.end]
                 .iter()
                 .map(|l| spans_outside(l, hit.bbox.x0, hit.bbox.x1))
                 .map(|l| if is_footer(&l) { Vec::new() } else { l })
                 .collect();
-            if side_content.iter().any(|l| !l.is_empty()) {
-                let bands = detect_column_bands(&side_content);
-                push_band_lines(&mut out, &bands, &mut prev_line_y, &mut list_state, body_size, page_width);
+            // Neighboring content that begins on or just below the table's first
+            // line continues the prose above the table (a side-by-side column),
+            // so it must keep the original order: paragraph first, table after.
+            // A *substantial* block that starts several rows down is a separate
+            // sidebar to the right; the table is emitted first, at its frame's
+            // position. A couple of side amounts beside individual rows is not a
+            // sidebar and keeps the original order.
+            let first_side = side_content.iter().position(|l| !l.is_empty());
+            let side_lines = side_content.iter().filter(|l| !l.is_empty()).count();
+            let side_below = match first_side {
+                Some(off) if i > 0 => {
+                    let prev_y = lines[i - 1].first().map(|s| s.y);
+                    let side_y = lines[i + off].first().map(|s| s.y).or(prev_y);
+                    match (prev_y, side_y) {
+                        (Some(py), Some(sy)) => {
+                            let pitch = (body_size * LINE_PITCH_MULT).max(1.0);
+                            py - sy > SIDE_CONTINUATION_PITCH_MULT * pitch
+                        }
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+            let side_first = !(side_below && side_lines >= MIN_SIDEBAR_LINES);
+            let had_side = side_lines > 0;
+            let emit_side = |out: &mut String,
+                             prev_line_y: &mut Option<f64>,
+                             list_state: &mut ListRunState| {
+                if had_side {
+                    let bands = detect_column_bands(&side_content);
+                    push_band_lines(out, &bands, prev_line_y, list_state, body_size, page_width);
+                }
+            };
+            let emit_table = |out: &mut String| {
+                // Blank line before the table (markdown block separation).
+                if !out.is_empty() && !out.ends_with("\n\n") {
+                    out.push('\n');
+                }
+                let table = CanvasTable::new(hit.rows.clone(), hit.bbox.clone());
+                out.push_str(&table.to_markdown());
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push('\n'); // blank line after the table
+            };
+            if side_first {
+                emit_side(&mut out, &mut prev_line_y, &mut list_state);
+                emit_table(&mut out);
+                prev_line_y = Some(lines[hit.end][0].y);
+            } else {
+                emit_table(&mut out);
+                emit_side(&mut out, &mut prev_line_y, &mut list_state);
+                // A sidebar emitted after the table is a separate block: the
+                // prose that follows must not join onto its last line.
+                prev_line_y = if had_side { None } else { Some(lines[hit.end][0].y) };
             }
-            // Blank line before the table (markdown block separation).
-            if !out.is_empty() && !out.ends_with("\n\n") {
-                out.push('\n');
-            }
-            let table = CanvasTable::new(
-                hit.rows.clone(),
-                hit.bbox.clone(),
-            );
-            out.push_str(&table.to_markdown());
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push('\n'); // blank line after the table
-            prev_line_y = Some(lines[hit.end][0].y);
             list_state = ListRunState::default(); // a table interrupts any list run
             t += 1;
             i = hit.end + 1; // skip the table's own lines

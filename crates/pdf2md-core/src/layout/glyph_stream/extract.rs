@@ -296,6 +296,17 @@ pub fn extract_page_glyphs(
             });
         }
     }
+    // A region enclosed by drawn rules (an outer left/right pair plus >= 2
+    // interior vertical rules spanning most of the region height) defines its
+    // own columns exactly. Rebuild it as one table before the ledger re-anchors
+    // on a statement header: this keeps a sidebar outside the right rule out of
+    // the grid, carries rows across an empty ruled gap to the frame bottom, and
+    // joins a multi-line header cell instead of emitting it as headings.
+    let hits = if detect_tables {
+        crate::layout::tables::apply_ruled_frame_model(&lines, hits, &vertical_segs)
+    } else {
+        hits
+    };
     // A statement operations ledger is not always a ruler-aligned grid: its
     // header labels can sit off-baseline and off-centre, so the generic passes
     // above either miss it or split it into 2/3-column fragments. When a ledger

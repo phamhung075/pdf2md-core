@@ -85,24 +85,20 @@ pub(super) fn line_pitch(ys: &[f64]) -> f64 {
     gaps[gaps.len() / 2]
 }
 
-/// The internal column separators given by drawn thin vertical rules.
+/// The distinct x positions of drawn thin vertical rules that sit strictly
+/// inside the `[left, right]` x-span and overlap the `[band_lo, band_hi]`
+/// y-band. Collinear rules drawn row by row are merged within
+/// [`RULE_MERGE_TOL_PT`]. Sorted ascending; may be empty.
 ///
-/// A rule qualifies when it spans part of the ledger band `[band_lo, band_hi]`
-/// and sits strictly inside the ledger's own x-span (an edge rule at the outer
-/// border is not a separator). When the surviving rules number exactly one per
-/// internal boundary they are returned sorted; otherwise `None`, so a page
-/// whose rules are partial or carry a stray line falls back to the
-/// label/data-derived boundaries.
-pub(super) fn rule_boundaries(
+/// This is the single source of truth for "which drawn rules are column
+/// separators", shared by the header-anchored ledger ([`rule_boundaries`]) and
+/// the ruled-frame model.
+pub(crate) fn interior_rule_xs(
     rules: &[(f64, f64, f64)],
-    ncols: usize,
     left: f64,
     right: f64,
     band: (f64, f64),
-) -> Option<Vec<f64>> {
-    if rules.is_empty() || ncols < 2 {
-        return None;
-    }
+) -> Vec<f64> {
     let (band_lo, band_hi) = band;
     let mut xs: Vec<f64> = Vec::new();
     for &(x, y0, y1) in rules {
@@ -118,5 +114,24 @@ pub(super) fn rule_boundaries(
         }
     }
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    xs
+}
+
+/// The internal column separators given by drawn thin vertical rules.
+///
+/// When the surviving rules number exactly one per internal boundary they are
+/// returned sorted; otherwise `None`, so a page whose rules are partial or
+/// carry a stray line falls back to the label/data-derived boundaries.
+pub(super) fn rule_boundaries(
+    rules: &[(f64, f64, f64)],
+    ncols: usize,
+    left: f64,
+    right: f64,
+    band: (f64, f64),
+) -> Option<Vec<f64>> {
+    if rules.is_empty() || ncols < 2 {
+        return None;
+    }
+    let xs = interior_rule_xs(rules, left, right, band);
     (xs.len() == ncols - 1).then_some(xs)
 }

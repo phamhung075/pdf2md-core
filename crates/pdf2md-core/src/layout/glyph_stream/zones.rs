@@ -109,43 +109,88 @@ pub(super) fn record_horiz_seg(out: &mut Vec<(f64, f64, f64)>, p: (f64, f64), q:
     }
 }
 
-/// Flush the current path as consecutive line segments into `out`, keeping only
-/// thin horizontal rules. `close` wraps the last point back to the path start.
+/// Record a thin vertical rule between device points `p` and `q` as a column
+/// rule `(x, y0, y1)`. Only strokes at least [`MIN_VERT_RULE_PT`] long qualify;
+/// shorter vertical hairlines are cell border ticks, not column separators.
+pub(super) fn record_vert_seg(out: &mut Vec<(f64, f64, f64)>, p: (f64, f64), q: (f64, f64)) {
+    let (x0, y0) = p;
+    let (x1, y1) = q;
+    if (x1 - x0).abs() < 0.6 {
+        let h = (y1 - y0).abs();
+        if h >= MIN_VERT_RULE_PT {
+            out.push((x0, y0.min(y1), y0.max(y1)));
+        }
+    }
+}
+
+/// Minimum length of a vertical stroke for it to count as a column rule rather
+/// than a glyph-size tick or a table cell's short border segment.
+const MIN_VERT_RULE_PT: f64 = 4.0;
+/// Maximum width of a path for it to be a vertical (not horizontal, not box)
+/// rule: the same < 2pt thinness the filled-rectangle branch applies.
+const MAX_RULE_THICKNESS_PT: f64 = 2.0;
+
+/// Flush the current path as consecutive line segments, keeping only thin
+/// horizontal rules (`hout`, `(y, x0, x1)`) and thin tall vertical rules
+/// (`vout`, `(x, y0, y1)`). `close` wraps the last point back to the path start.
+///
+/// A genuine underline is a *thin* horizontal rule. A taller path is a
+/// rectangle border — e.g. the hyperlink annotation box a producer draws with
+/// `m`/`l` around a link — whose top and bottom edges would otherwise each be
+/// recorded as an "underline". On the FR "Statut EI" ACRE slide the URL link
+/// box's top edge sat a couple of points below the *previous* text line's
+/// baseline, so it underlined " au plus tard dans les 45 jours suiv" even
+/// though only `l'URSSAF` and the URL are underlined on the page. Reject a
+/// path whose overall vertical extent is not that of a rule, using the same
+/// < 2pt threshold the thin-filled-`re` branch already applies.
+///
+/// A column rule is the same shape turned 90°: a single `m`/`l` stroke of
+/// negligible x-extent. A box border (large extent in both axes) is neither.
 pub(super) fn flush_path_segs(
     path: &mut Vec<(f64, f64)>,
     start: Option<(f64, f64)>,
-    out: &mut Vec<(f64, f64, f64)>,
+    hout: &mut Vec<(f64, f64, f64)>,
+    vout: &mut Vec<(f64, f64, f64)>,
     close: bool,
 ) {
-    // A genuine underline is a *thin* horizontal rule. A taller path is a
-    // rectangle border — e.g. the hyperlink annotation box a producer draws with
-    // `m`/`l` around a link — whose top and bottom edges would otherwise each be
-    // recorded as an "underline". On the FR "Statut EI" ACRE slide the URL link
-    // box's top edge sat a couple of points below the *previous* text line's
-    // baseline, so it underlined " au plus tard dans les 45 jours suiv" even
-    // though only `l'URSSAF` and the URL are underlined on the page. Reject a
-    // path whose overall vertical extent is not that of a rule, using the same
-    // < 2pt threshold the thin-filled-`re` branch already applies.
     let mut ymin = f64::INFINITY;
     let mut ymax = f64::NEG_INFINITY;
-    for &(_, y) in path.iter() {
+    let mut xmin = f64::INFINITY;
+    let mut xmax = f64::NEG_INFINITY;
+    for &(x, y) in path.iter() {
+        xmin = xmin.min(x);
+        xmax = xmax.max(x);
         ymin = ymin.min(y);
         ymax = ymax.max(y);
     }
     if close {
-        if let Some((_, y)) = start {
+        if let Some((x, y)) = start {
+            xmin = xmin.min(x);
+            xmax = xmax.max(x);
             ymin = ymin.min(y);
             ymax = ymax.max(y);
         }
     }
-    if !path.is_empty() && ymax - ymin < 2.0 {
+    if !path.is_empty() && ymax - ymin < MAX_RULE_THICKNESS_PT {
         for w in path.windows(2) {
-            record_horiz_seg(out, w[0], w[1]);
+            record_horiz_seg(hout, w[0], w[1]);
         }
         if close {
             if let Some(s) = start {
                 if let Some(&last) = path.last() {
-                    record_horiz_seg(out, last, s);
+                    record_horiz_seg(hout, last, s);
+                }
+            }
+        }
+    }
+    if !path.is_empty() && xmax - xmin < MAX_RULE_THICKNESS_PT {
+        for w in path.windows(2) {
+            record_vert_seg(vout, w[0], w[1]);
+        }
+        if close {
+            if let Some(s) = start {
+                if let Some(&last) = path.last() {
+                    record_vert_seg(vout, last, s);
                 }
             }
         }
