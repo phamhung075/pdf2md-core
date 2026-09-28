@@ -14,6 +14,8 @@ mod banded;
 use banded::*;
 mod grid_scan;
 use grid_scan::*;
+mod header_spine;
+use header_spine::*;
 mod window_rules;
 use window_rules::*;
 mod scan;

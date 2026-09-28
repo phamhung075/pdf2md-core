@@ -308,6 +308,7 @@ pub(super) fn trimmed_table(
     lines: &[Vec<Span>],
     tol: f64,
     min_gutter: f64,
+    spine: bool,
 ) -> Option<(Vec<usize>, Vec<Vec<String>>)> {
     let mut is_body: Vec<bool> = Vec::with_capacity(win_rows.len());
     let mut prev_body = false;
@@ -328,7 +329,7 @@ pub(super) fn trimmed_table(
     if !is_tabular_rows(&rows2) {
         return None;
     }
-    let consolidated = consolidate_table_rows(rows2, &emit_rows, lines, info);
+    let consolidated = consolidate_table_rows(rows2, &emit_rows, lines, info, rulers, spine);
     Some((emit_rows, consolidated))
 }
 

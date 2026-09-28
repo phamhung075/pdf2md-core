@@ -300,6 +300,15 @@ pub(super) fn scan_aligned_grids_opts(
                 }
                 win_lo -= 1;
             }
+            // When the window opens with a two-line header, its columns are the
+            // spine row's cells; deriving them from this row and growing over a
+            // tall first-column cell keeps wrapped continuation lines inside
+            // the row instead of letting them seed phantom rulers (and lets a
+            // header column whose label starts on only one line survive).
+            let spine_rulers =
+                header_spine_refine(&info, lines, &band, win_lo, &mut hi, tol, min_gutter);
+            let spine_active = spine_rulers.is_some();
+            let rulers = spine_rulers.unwrap_or(rulers);
             let win_rows: Vec<usize> = band[win_lo..=hi].to_vec();
             t(&format!(
                 "  WINDOW lo={} (line {}, '{}') hi={} (line {}, '{}') rulers={:?}",
@@ -439,7 +448,7 @@ pub(super) fn scan_aligned_grids_opts(
                         // Trim them from the emitted grid so the paragraph is
                         // rendered as text instead of being swallowed.
                         let Some((emit_rows, consolidated_rows)) =
-                            trimmed_table(&info, &win_rows, &rulers, lines, tol, min_gutter)
+                            trimmed_table(&info, &win_rows, &rulers, lines, tol, min_gutter, spine_active)
                         else {
                             t(&format!(
                                 "  REJECT window [{}-{}]: no table rows after trim [not_tabular]",

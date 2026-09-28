@@ -49,7 +49,7 @@
             vec!["".to_string(), "15/11".to_string()],
             vec!["Nombre de tests réalisés".to_string(), "34155".to_string()],
         ];
-        let out = consolidate_table_rows(rows, &win_rows, &lines, &info);
+        let out = consolidate_table_rows(rows, &win_rows, &lines, &info, &[], false);
         assert_eq!(
             out.len(),
             3,
@@ -92,7 +92,7 @@
             vec!["".to_string(), "10:05".to_string()],
             vec!["28MAR".to_string(), "Marseille".to_string()],
         ];
-        let out = consolidate_table_rows(rows, &win_rows, &lines, &info);
+        let out = consolidate_table_rows(rows, &win_rows, &lines, &info, &[], false);
         assert_eq!(
             out.len(),
             2,
@@ -140,7 +140,7 @@
             vec!["".to_string(), "".to_string(), "".to_string(), "coordonnées".to_string()],
             vec!["Place Standard".to_string(), "".to_string(), "".to_string(), "".to_string()],
         ];
-        let out = consolidate_table_rows(rows, &win_rows, &lines, &info);
+        let out = consolidate_table_rows(rows, &win_rows, &lines, &info, &[], false);
         assert_eq!(
             out.len(),
             2,
@@ -156,6 +156,149 @@
             "last-column continuation was lost: {out:?}"
         );
         assert_eq!(out[1][0], "Place Standard", "a fresh col-0 row started a new record: {out:?}");
+    }
+
+    /// One visual line as `(text, x0, x1)` runs plus its `RowInfo`.
+    fn mkline(parts: &[(&str, f64, f64)], y: f64) -> (Vec<Span>, RowInfo) {
+        let spans: Vec<Span> = parts
+            .iter()
+            .map(|(t, x0, x1)| Span {
+                text: t.to_string(),
+                x: *x0,
+                y,
+                size: 10.0,
+                advance: x1 - x0,
+                word_advance: x1 - x0,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_vertical: false,
+            })
+            .collect();
+        let words: Vec<WordTok> = parts
+            .iter()
+            .map(|(t, x0, x1)| WordTok {
+                text: t.to_string(),
+                x0: *x0,
+                x1: *x1,
+            })
+            .collect();
+        let mut starts: Vec<f64> = words.iter().map(|w| w.x0).collect();
+        starts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut ends: Vec<f64> = words.iter().map(|w| w.x1).collect();
+        ends.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        (
+            spans,
+            RowInfo {
+                words,
+                starts,
+                ends,
+                size: 10.0,
+            },
+        )
+    }
+
+    const TEST_RULERS: [f64; 3] = [10.0, 100.0, 200.0];
+
+    /// A column-0 line whose previous line ran to the column edge (wrapped) is
+    /// the continuation of that row's first cell.
+    #[test]
+    fn wrapped_col0_line_joins_the_row_above() {
+        let specs: Vec<(&[(&str, f64, f64)], f64)> = vec![
+            (&[("Description", 10.0, 60.0), ("Qty", 110.0, 120.0), ("Price", 210.0, 230.0)], 700.0),
+            (&[("Long product text that wrapped", 10.0, 95.0), ("1", 110.0, 115.0), ("8.99", 210.0, 230.0)], 686.0),
+            (&[("continuation tail", 10.0, 70.0)], 672.0),
+            (&[("Shipping", 10.0, 60.0), ("2", 110.0, 115.0), ("3.99", 210.0, 230.0)], 658.0),
+        ];
+        let pairs: Vec<(Vec<Span>, RowInfo)> = specs.iter().map(|(p, y)| mkline(p, *y)).collect();
+        let lines: Vec<Vec<Span>> = pairs.iter().map(|(l, _)| l.clone()).collect();
+        let info: Vec<RowInfo> = pairs.into_iter().map(|(_, i)| i).collect();
+        let rows = vec![
+            vec!["Description".to_string(), "Qty".to_string(), "Price".to_string()],
+            vec!["Long product text that wrapped".to_string(), "1".to_string(), "8.99".to_string()],
+            vec!["continuation tail".to_string(), String::new(), String::new()],
+            vec!["Shipping".to_string(), "2".to_string(), "3.99".to_string()],
+        ];
+        let win_rows: Vec<usize> = (0..4).collect();
+        let out = consolidate_table_rows(rows, &win_rows, &lines, &info, &TEST_RULERS, true);
+        assert_eq!(out.len(), 3, "wrapped continuation was not joined: {out:?}");
+        assert!(
+            out[1][0].contains("Long product text") && out[1][0].contains("continuation tail"),
+            "tall cell did not take its continuation: {out:?}"
+        );
+    }
+
+    /// A short first-column line that stops well short of the column edge did
+    /// not wrap: the next column-0-only line is a new record (a section label).
+    #[test]
+    fn short_col0_line_does_not_take_a_section_label() {
+        let specs: Vec<(&[(&str, f64, f64)], f64)> = vec![
+            (&[("Description", 10.0, 60.0), ("Qty", 110.0, 120.0), ("Price", 210.0, 230.0)], 700.0),
+            (&[("AB", 10.0, 25.0), ("1", 110.0, 115.0), ("8.99", 210.0, 230.0)], 686.0),
+            (&[("Téléphone Fixe", 10.0, 60.0)], 672.0),
+        ];
+        let pairs: Vec<(Vec<Span>, RowInfo)> = specs.iter().map(|(p, y)| mkline(p, *y)).collect();
+        let lines: Vec<Vec<Span>> = pairs.iter().map(|(l, _)| l.clone()).collect();
+        let info: Vec<RowInfo> = pairs.into_iter().map(|(_, i)| i).collect();
+        let rows = vec![
+            vec!["Description".to_string(), "Qty".to_string(), "Price".to_string()],
+            vec!["AB".to_string(), "1".to_string(), "8.99".to_string()],
+            vec!["Téléphone Fixe".to_string(), String::new(), String::new()],
+        ];
+        let win_rows: Vec<usize> = (0..3).collect();
+        let out = consolidate_table_rows(rows, &win_rows, &lines, &info, &TEST_RULERS, true);
+        assert_eq!(out.len(), 3, "section label was glued to the row above: {out:?}");
+        assert_eq!(out[1][0], "AB", "row above absorbed the label: {out:?}");
+    }
+
+    /// A footnote/reference line never joins the row above, even when that
+    /// row's first cell ran to the column edge.
+    #[test]
+    fn footnote_marker_line_is_never_a_continuation() {
+        let specs: Vec<(&[(&str, f64, f64)], f64)> = vec![
+            (&[("Description", 10.0, 60.0), ("Qty", 110.0, 120.0), ("Price", 210.0, 230.0)], 700.0),
+            (&[("Long product text that wrapped", 10.0, 95.0), ("1", 110.0, 115.0), ("8.99", 210.0, 230.0)], 686.0),
+            (&[("(*) Solde correspondant au prêt", 10.0, 90.0)], 672.0),
+        ];
+        let pairs: Vec<(Vec<Span>, RowInfo)> = specs.iter().map(|(p, y)| mkline(p, *y)).collect();
+        let lines: Vec<Vec<Span>> = pairs.iter().map(|(l, _)| l.clone()).collect();
+        let info: Vec<RowInfo> = pairs.into_iter().map(|(_, i)| i).collect();
+        let rows = vec![
+            vec!["Description".to_string(), "Qty".to_string(), "Price".to_string()],
+            vec!["Long product text that wrapped".to_string(), "1".to_string(), "8.99".to_string()],
+            vec!["(*) Solde correspondant au prêt".to_string(), String::new(), String::new()],
+        ];
+        let win_rows: Vec<usize> = (0..3).collect();
+        let out = consolidate_table_rows(rows, &win_rows, &lines, &info, &TEST_RULERS, true);
+        assert_eq!(out.len(), 3, "footnote was glued to the row above: {out:?}");
+        assert_eq!(out[1][0], "Long product text that wrapped", "{out:?}");
+        assert!(
+            out[2][0].contains("(*)"),
+            "footnote did not stay its own row: {out:?}"
+        );
+    }
+
+    /// A line that only *looks* like it reaches the column edge because it runs
+    /// out in a dot leader is not wrapping; a second row with the same label is
+    /// not folded into it.
+    #[test]
+    fn dot_leader_line_is_not_wrapping() {
+        let specs: Vec<(&[(&str, f64, f64)], f64)> = vec![
+            (&[("Description", 10.0, 60.0), ("Qty", 110.0, 120.0), ("Price", 210.0, 230.0)], 700.0),
+            (&[("Statut .................", 10.0, 95.0), ("1", 110.0, 115.0), ("8.99", 210.0, 230.0)], 686.0),
+            (&[("Statut .................", 10.0, 95.0)], 672.0),
+        ];
+        let pairs: Vec<(Vec<Span>, RowInfo)> = specs.iter().map(|(p, y)| mkline(p, *y)).collect();
+        let lines: Vec<Vec<Span>> = pairs.iter().map(|(l, _)| l.clone()).collect();
+        let info: Vec<RowInfo> = pairs.into_iter().map(|(_, i)| i).collect();
+        let rows = vec![
+            vec!["Description".to_string(), "Qty".to_string(), "Price".to_string()],
+            vec!["Statut .................".to_string(), "1".to_string(), "8.99".to_string()],
+            vec!["Statut .................".to_string(), String::new(), String::new()],
+        ];
+        let win_rows: Vec<usize> = (0..3).collect();
+        let out = consolidate_table_rows(rows, &win_rows, &lines, &info, &TEST_RULERS, true);
+        assert_eq!(out.len(), 3, "dot-leader row was folded into the row above: {out:?}");
     }
 
     // -----------------------------------------------------------------------

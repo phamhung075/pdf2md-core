@@ -62,7 +62,7 @@ fn join_cell_words(words: &[&WordTok], min_gutter: f64) -> String {
 /// keep the plain per-word midpoint `bucket`/`bucket_words`, because
 /// collapsing a dense grid's tight columns there would disarm the `flowing`
 /// prose veto and annex whole pages of prose into a spurious table.
-fn assign_columns(info: &[RowInfo], ri: usize, rulers: &[f64]) -> Vec<usize> {
+pub(crate) fn assign_columns(info: &[RowInfo], ri: usize, rulers: &[f64]) -> Vec<usize> {
     let ncol = rulers.len();
     let bounds: Vec<f64> = rulers.windows(2).map(|p| (p[0] + p[1]) / 2.0).collect();
     let words = &info[ri].words;
@@ -315,6 +315,102 @@ fn is_compact_row_anchor(cell: &str) -> bool {
         && t.chars().any(|ch| ch.is_ascii_digit())
 }
 
+/// A cell of a genuine *text* column: it carries at least one word of three or
+/// more letters. Used to tell a wrapped description line (which continues the
+/// row above) from a sparse date/code row in a numeric first column (which is
+/// its own logical record).
+fn is_text_column_cell(cell: &str) -> bool {
+    cell.split_whitespace().any(|t| {
+        t.trim_matches(|ch: char| !ch.is_alphabetic())
+            .chars()
+            .count()
+            >= 3
+    })
+}
+
+/// Whether `header` reads as a row of short column labels rather than a data
+/// record: every non-empty cell holds at most four words. Used to gate the
+/// tall-first-cell continuation join to grids that actually have a header.
+fn header_cells_are_short(header: &[String]) -> bool {
+    let mut filled = 0usize;
+    for c in header.iter() {
+        if c.trim().is_empty() {
+            continue;
+        }
+        filled += 1;
+        if c.split_whitespace().count() > 4 {
+            return false;
+        }
+    }
+    filled >= 2
+}
+
+/// How close (in em of the line's font size) a first-column line's right edge
+/// must come to the next column's ruler for the cell to read as *wrapped*.
+const WRAP_EDGE_EM: f64 = 1.5;
+
+/// Whether the first-column cell of line `ri` ran to the column edge: its last
+/// column-0 word ends within [`WRAP_EDGE_EM`] em of the next column's ruler. A
+/// short label that stops well short of the edge did not wrap, so a following
+/// column-0-only line is a new record, not a continuation. A line whose text
+/// runs out in a dot leader (`...` / `…`) only *looks* like it reaches the edge;
+/// it is a table-of-contents/notice leader, never a wrapped sentence.
+fn col0_reached_the_edge(info: &[RowInfo], ri: usize, rulers: &[f64]) -> bool {
+    if rulers.len() < 2 {
+        return false;
+    }
+    let mut end = f64::NEG_INFINITY;
+    let mut text = String::new();
+    for (wi, &col) in assign_columns(info, ri, rulers).iter().enumerate() {
+        if col == 0 {
+            end = end.max(info[ri].words[wi].x1);
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(&info[ri].words[wi].text);
+        }
+    }
+    if !end.is_finite() || ends_in_dot_leader(&text) {
+        return false;
+    }
+    end >= rulers[1] - WRAP_EDGE_EM * info[ri].size.max(0.1)
+}
+
+/// Whether `text` ends in a dot leader: an ellipsis character, or three or more
+/// trailing dots (optionally separated by spaces).
+fn ends_in_dot_leader(text: &str) -> bool {
+    let t = text.trim_end();
+    if t.ends_with('…') {
+        return true;
+    }
+    t.chars()
+        .rev()
+        .take_while(|c| *c == '.' || *c == ' ')
+        .filter(|c| *c == '.')
+        .count()
+        >= 3
+}
+
+/// Whether a line opens with a footnote/reference marker — `(*)`, `*`, `(1)`,
+/// `1)` or a leading superscript digit. Such a line is never a wrapped
+/// continuation of the row above; it stays outside the table.
+fn starts_with_footnote_marker(cell: &str) -> bool {
+    let t = cell.trim_start();
+    if t.starts_with("(*") || t.starts_with('*') {
+        return true;
+    }
+    if let Some(rest) = t.strip_prefix('(') {
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() && rest[digits.len()..].starts_with(')') {
+            return true;
+        }
+    }
+    matches!(
+        t.chars().next(),
+        Some('¹' | '²' | '³' | '⁴' | '⁵' | '⁶' | '⁷' | '⁸' | '⁹' | '⁰')
+    )
+}
+
 /// Consolidates multi-line table rows and multi-line headers into single logical rows.
 /// Uses the table's own natural line pitch (median baseline difference) to cleanly distinguish
 /// intra-row continuation lines from inter-row paragraph / row margins.
@@ -323,6 +419,8 @@ pub fn consolidate_table_rows(
     win_rows: &[usize],
     lines: &[Vec<Span>],
     info: &[RowInfo],
+    rulers: &[f64],
+    spine: bool,
 ) -> Vec<Vec<String>> {
     if table_rows.len() <= 1 {
         return table_rows;
@@ -374,7 +472,22 @@ pub fn consolidate_table_rows(
         let complementary = filled >= 1
             && (0..num_cols)
                 .all(|c| table_rows[0][c].trim().is_empty() || candidate_row[c].trim().is_empty());
-        if gap <= row_break_threshold && !has_data_tokens(candidate_row) && (filled >= 2 || complementary) {
+        // A two-line header may instead repeat the *same* column's label
+        // vertically ("Item subtotal" over "(excl. VAT)"): the lone cell then
+        // sits in a column the first line already fills, which is a vertical
+        // continuation of that label, not a one-cell data row. Only a
+        // header-spine window may take this path; elsewhere consolidation must
+        // behave exactly as before. A footnote/reference line is never a header
+        // continuation.
+        let vertical_continuation = spine
+            && filled >= 1
+            && !starts_with_footnote_marker(&candidate_row[0])
+            && (0..num_cols)
+                .all(|c| candidate_row[c].trim().is_empty() || !table_rows[0][c].trim().is_empty());
+        if gap <= row_break_threshold
+            && !has_data_tokens(candidate_row)
+            && (filled >= 2 || complementary || vertical_continuation)
+        {
             header_rows_count = 2;
         }
     }
@@ -443,7 +556,7 @@ pub fn consolidate_table_rows(
                     let curr_has_col0 = !curr[0].trim().is_empty();
                     let row_has_col0 = !row_cells[0].trim().is_empty();
 
-                    if is_parenthetical {
+                    if is_parenthetical && !(spine && starts_with_footnote_marker(&row_cells[0])) {
                         true
                     } else if curr_has_col0 && !row_has_col0 {
                         true
@@ -460,6 +573,30 @@ pub fn consolidate_table_rows(
                         true
                     } else if first_col_curr == first_col_row && filled_count >= 2 && filled_count >= curr_filled {
                         false
+                    } else if spine
+                        && num_cols >= 3
+                        && row0_is_header
+                        && header_cells_are_short(&table_rows[0])
+                        && row_has_col0
+                        && first_col_row == Some(0)
+                        && filled_count == 1
+                        && curr_filled >= 2
+                        && is_text_column_cell(&curr[0])
+                        && is_text_column_cell(&row_cells[0])
+                        && !starts_with_footnote_marker(&row_cells[0])
+                        && (curr[0].contains(CELL_LINE_BREAK)
+                            || col0_reached_the_edge(info, win_rows[r_idx - 1], rulers))
+                    {
+                        // A column-0-only line continues the open row's first
+                        // cell only when that cell is *wrapping*: either the
+                        // row already carries a wrapped continuation, or the
+                        // previous line ran to the column edge. This is
+                        // restricted to header-spine windows; every other grid
+                        // consolidates exactly as before. A section label under
+                        // a short row, and any footnote/reference line, is its
+                        // own record; the sample's trailing reference line joins
+                        // on the first clause.
+                        true
                     } else {
                         // A continuation row carries no fresh first-column value
                         // of its own; a row that starts its own first cell is a

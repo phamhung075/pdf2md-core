@@ -193,7 +193,7 @@ use super::tests_common::*;
             vec!["C".into(), "5".into(), "6".into(), "".into()],
             vec!["D".into(), "7".into(), "8".into(), "".into()],
         ];
-        let out = consolidate_table_rows(rows, &win_rows, &lines, &info);
+        let out = consolidate_table_rows(rows, &win_rows, &lines, &info, &[], false);
         assert_eq!(
             out.len(),
             5,
