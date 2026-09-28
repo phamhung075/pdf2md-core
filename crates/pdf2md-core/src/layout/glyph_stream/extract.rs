@@ -6,16 +6,26 @@
 
 use super::*;
 
-/// Extract text for a glyph-positioned page using geometry reconstruction.
-/// When `detect_tables` is false, returns the plain reading-order text with
-/// no table recovery (byte-identical to the table-less renderer).
-pub fn extract_page_glyphs(
-    doc: &Document,
-    page_id: ObjectId,
-    detect_tables: bool,
-    detect_layout: bool,
-    detect_math: bool,
-) -> Result<PageText, String> {
+/// Raw glyph-extraction result shared by [`extract_page_glyphs`] and
+/// [`page_glyph_spans`], produced by exactly the same prefix so both entry
+/// points observe byte-identical spans.
+struct GlyphPrefix {
+    spans: Vec<Span>,
+    underline_segs: Vec<(f64, f64, f64)>,
+    vertical_up_chars: usize,
+    vertical_down_chars: usize,
+    page_height: f64,
+    page_width: f64,
+    has_fonts: bool,
+    text_ops_seen: bool,
+    /// True when the walk hit a work bound or the content stream was truncated.
+    budget_exhausted: bool,
+}
+
+/// Runs the shared glyph prefix: resource chain, font table, bounded content
+/// decode, page display size, and the glyph walk — stopping before any vertical
+/// rotation, partitioning, table or layout work.
+fn extract_glyph_prefix(doc: &Document, page_id: ObjectId) -> Result<GlyphPrefix, String> {
     let chain = crate::text_extract::resource_dicts(doc, page_id);
     let mut raw_fonts: std::collections::BTreeMap<Vec<u8>, &Dictionary> =
         std::collections::BTreeMap::new();
@@ -25,7 +35,7 @@ pub fn extract_page_glyphs(
     let (content, content_truncated) =
         crate::text_extract::decode_page_content_bounded(doc, page_id).map_err(|e| e.to_string())?;
 
-    let (init_ctm, mut page_height, mut page_width) = page_display_size(doc, page_id);
+    let (init_ctm, page_height, page_width) = page_display_size(doc, page_id);
 
     let font_key = chain
         .first()
@@ -47,11 +57,80 @@ pub fn extract_page_glyphs(
         &mut font_cache,
     );
     let GlyphWalk {
-        mut spans,
+        spans,
         underline_segs,
         vertical_up_chars,
         vertical_down_chars,
     } = walk;
+    Ok(GlyphPrefix {
+        spans,
+        underline_segs,
+        vertical_up_chars,
+        vertical_down_chars,
+        page_height,
+        page_width,
+        has_fonts,
+        text_ops_seen,
+        budget_exhausted: budget.exhausted || content_truncated,
+    })
+}
+
+/// Positioned glyph runs for one page, exactly as the engine's glyph walker
+/// produced them, before any layout reconstruction.
+///
+/// `Span.x` / `Span.y` are the run's device-space origin in PDF points with a
+/// **bottom-left origin (PDF user space, y grows upward)**, already transformed
+/// by the page's initial CTM (so `/Rotate` and the media/crop box are applied).
+/// `width` / `height` are the page's display size in points under that
+/// transform.
+#[derive(Debug, Clone)]
+pub struct PageSpans {
+    /// Positioned text runs in PDF user space (bottom-left origin, y upward).
+    pub spans: Vec<Span>,
+    /// Page display width in points.
+    pub width: f64,
+    /// Page display height in points.
+    pub height: f64,
+    /// True when the page's content stream issued a text-show operator.
+    pub text_ops_seen: bool,
+}
+
+/// Returns the raw positioned spans of one page, before any vertical rotation,
+/// partitioning, table or layout work — i.e. exactly what the engine's glyph
+/// walker saw. Callers that need the reconstructed text should use
+/// [`extract_page_glyphs`].
+pub fn page_glyph_spans(doc: &Document, page_id: ObjectId) -> Result<PageSpans, String> {
+    let prefix = extract_glyph_prefix(doc, page_id)?;
+    Ok(PageSpans {
+        spans: prefix.spans,
+        width: prefix.page_width,
+        height: prefix.page_height,
+        text_ops_seen: prefix.text_ops_seen,
+    })
+}
+
+/// Extract text for a glyph-positioned page using geometry reconstruction.
+/// When `detect_tables` is false, returns the plain reading-order text with
+/// no table recovery (byte-identical to the table-less renderer).
+pub fn extract_page_glyphs(
+    doc: &Document,
+    page_id: ObjectId,
+    detect_tables: bool,
+    detect_layout: bool,
+    detect_math: bool,
+) -> Result<PageText, String> {
+    let prefix = extract_glyph_prefix(doc, page_id)?;
+    let GlyphPrefix {
+        mut spans,
+        underline_segs,
+        vertical_up_chars,
+        vertical_down_chars,
+        mut page_height,
+        mut page_width,
+        has_fonts,
+        text_ops_seen,
+        budget_exhausted,
+    } = prefix;
 
     // A page whose text is dominantly vertical (a sideways OCR layer, or a
     // producer that draws the whole page rotated 90° with a text matrix instead
@@ -266,6 +345,6 @@ pub fn extract_page_glyphs(
         has_fonts,
         tables: if table_rendered { hits.len() } else { 0 },
         blocks,
-        budget_exhausted: budget.exhausted || content_truncated,
+        budget_exhausted,
     })
 }

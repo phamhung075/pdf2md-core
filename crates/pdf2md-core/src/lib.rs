@@ -48,9 +48,10 @@ pub use ffi::{
 pub use layout::{
     analyze_char_stream, analyze_layout, analyze_pages_parallel, correct_skew, deskew_lines,
     deskew_spans, estimate_skew_angle_deg, estimate_skew_angle_deg_from_spans, extract_tables,
-    math_inline_for_line, render_math, render_math_line, spans_from_textline, synthesize_block_text,
-    synthesize_line_expr, synthesize_spans_math, AstNode, DocumentStatistics, LatexExpr, LayoutAST,
-    LineSegment, MIN_SKEW_TO_CORRECT_DEG, ModernLayoutEngine, TableCell, XyCutOptions,
+    math_inline_for_line, page_glyph_spans, render_math, render_math_line, spans_from_textline,
+    synthesize_block_text, synthesize_line_expr, synthesize_spans_math, AstNode, DocumentStatistics,
+    LatexExpr, LayoutAST, LineSegment, MIN_SKEW_TO_CORRECT_DEG, ModernLayoutEngine, PageSpans,
+    TableCell, XyCutOptions,
 };
 pub use media::{extract_page_media, extract_page_vector_figures, MediaItem, MediaKind};
 pub use models::{

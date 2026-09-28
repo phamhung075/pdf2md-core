@@ -15,7 +15,9 @@ pub mod tables;
 pub mod xy_cut;
 
 pub use ast::{AstNode, LayoutAST};
-pub use glyph_stream::{build_lines, extract_page_glyphs, page_height_of, Span};
+pub use glyph_stream::{
+    build_lines, extract_page_glyphs, page_glyph_spans, page_height_of, PageSpans, Span,
+};
 pub(crate) use glyph_stream::{mtx_from, num, Mtx};
 pub use latex_math::{
     detect_fractions, math_inline_for_line, render_math, render_math_line, spans_from_textline,

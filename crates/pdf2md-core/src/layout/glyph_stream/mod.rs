@@ -63,7 +63,11 @@ pub(crate) enum Widths {
 #[derive(Clone, Debug)]
 pub struct Span {
     pub text: String,
+    /// Device-space origin x of the run, in PDF points with a **bottom-left
+    /// origin (PDF user space, y grows upward)**, after the page's initial CTM.
     pub x: f64,
+    /// Device-space origin y of the run, in PDF points with a **bottom-left
+    /// origin (PDF user space, y grows upward)**, after the page's initial CTM.
     pub y: f64,
     /// Effective device font size (used to scale all gap thresholds).
     pub size: f64,
@@ -183,3 +187,5 @@ mod tests_common;
 mod tests_part2;
 #[cfg(test)]
 mod tests_part3;
+#[cfg(test)]
+mod span_api_tests;
