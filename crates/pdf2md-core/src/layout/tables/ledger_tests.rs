@@ -251,3 +251,66 @@ fn repeated_header_on_the_next_page_derives_the_same_columns() {
     );
     assert_eq!(first[0].rows[0].len(), 5);
 }
+
+#[test]
+fn a_label_or_subtotal_does_not_absorb_the_line_below_it() {
+    let mut lines = header_lines();
+    // A balance row: label plus a credit amount, no date/value cell.
+    lines.push(line(
+        688.0,
+        &[("OPENING BALANCE", 170.0, 96.0), ("500,00", 410.0, 46.0)],
+    ));
+    // A section label directly below, at the normal line pitch.
+    lines.push(line(676.0, &[("SECTION ONE", 170.0, 74.0)]));
+    // An operation: date, a wrapped two-line description, a debit amount.
+    lines.push(line(
+        664.0,
+        &[
+            ("01.01", 60.0, 30.0),
+            ("01.01", 110.0, 30.0),
+            ("PAYMENT ONE", 170.0, 72.0),
+            ("10,00", 330.0, 40.0),
+        ],
+    ));
+    lines.push(line(652.0, &[("SECOND PART", 170.0, 70.0)]));
+    // A sub-total row: amount, no date/value cell.
+    lines.push(line(
+        640.0,
+        &[("Sous-total", 250.0, 55.0), ("10,00", 330.0, 40.0)],
+    ));
+    // Another section label directly below, at the normal line pitch.
+    lines.push(line(628.0, &[("SECTION TWO", 170.0, 74.0)]));
+    lines.push(line(
+        616.0,
+        &[
+            ("02.01", 60.0, 30.0),
+            ("02.01", 110.0, 30.0),
+            ("PAYMENT TWO", 170.0, 72.0),
+            ("20,00", 410.0, 46.0),
+        ],
+    ));
+
+    let t = &apply_ledger_model(&lines, Vec::new())[0];
+    let titles: Vec<&str> = t.rows.iter().map(|r| r[2].as_str()).collect();
+    for label in ["OPENING BALANCE", "SECTION ONE", "Sous-total", "SECTION TWO"] {
+        assert!(
+            titles.contains(&label),
+            "{label} must be its own row: {titles:?}"
+        );
+    }
+    let balance = t.rows.iter().find(|r| r[2] == "OPENING BALANCE").unwrap();
+    assert_eq!(balance[4], "500,00");
+    let sub = t.rows.iter().find(|r| r[2] == "Sous-total").unwrap();
+    assert_eq!(sub[3], "10,00");
+    let op = t
+        .rows
+        .iter()
+        .find(|r| r[2].starts_with("PAYMENT ONE"))
+        .expect("operation row");
+    assert!(op[2].contains("SECOND PART"), "wrapped description stays joined");
+    assert!(
+        op[2].contains(CELL_LINE_BREAK_PENDING),
+        "wrapped description keeps its in-cell break"
+    );
+    assert_eq!(op[3], "10,00");
+}

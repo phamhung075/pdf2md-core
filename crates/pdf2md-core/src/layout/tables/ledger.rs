@@ -387,6 +387,7 @@ fn build_ledger(
     let mut rows: Vec<Vec<String>> = Vec::with_capacity(data.len() + 1);
     rows.push(header.iter().map(|c| c.label.clone()).collect());
     let mut cur: Vec<String> = Vec::new();
+    let mut cur_is_operation = false;
     let mut prev_y: Option<f64> = None;
     let mut first = true;
     for (_, y, words) in &data {
@@ -399,11 +400,14 @@ fn build_ledger(
             .any(|&c| matches!(header[c].kind, ColumnKind::Date | ColumnKind::Value));
         let has_amount = cols.iter().any(|&c| header[c].kind == ColumnKind::Amount);
         let gap = prev_y.map(|py| py - y).unwrap_or(f64::INFINITY);
-        if first || has_date || has_amount || gap > threshold {
+        // A continuation line may only extend an operation row; a section label
+        // or a sub-total must not absorb the line that follows it.
+        if first || has_date || has_amount || gap > threshold || !cur_is_operation {
             if !cur.is_empty() {
                 rows.push(std::mem::take(&mut cur));
             }
             cur = vec![String::new(); ncols];
+            cur_is_operation = has_date;
         }
         let mut line_cells = vec![String::new(); ncols];
         for (w, &c) in words.iter().zip(&cols) {
