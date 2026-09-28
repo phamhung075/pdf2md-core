@@ -14,6 +14,8 @@
 //! sub-total becomes its own row, a wrapped description stays in the
 //! description cell.
 
+use super::ledger_columns::{line_pitch, refine_boundaries, rule_boundaries};
+use super::ledger_rows::opening_balance_row;
 use super::rulers::{line_words, min_gutter_for, TableHit, WordTok};
 use crate::layout::glyph_stream::Span;
 use crate::models::{BoundingBox, CELL_LINE_BREAK_PENDING};
@@ -35,19 +37,11 @@ const LEDGER_LEFT_TOL_PT: f64 = 2.5;
 /// A vertical gap larger than this multiple of the ledger's line pitch starts a
 /// new row, separating a section label from the entry above it.
 const ROW_GAP_PITCH_MULT: f64 = 1.7;
-/// Line pitch assumed when the window is too short to measure one.
-const FALLBACK_LINE_PITCH_PT: f64 = 12.0;
-/// A text word may widen its column's extent only when its centre lies within
-/// this many text sizes of the header label's own x-band.
-const UNANIMOUS_TEXT_MARGIN_SIZE_MULT: f64 = 0.5;
-/// A right-aligned amount value sits to the right of its header label, so it
-/// gets a wider tolerance than a text word.
-const UNANIMOUS_AMOUNT_MARGIN_SIZE_MULT: f64 = 3.0;
 
 /// Which family a header label belongs to. Determines how a row's words are
 /// assigned and which lines begin a new row.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ColumnKind {
+pub(super) enum ColumnKind {
     Date,
     Value,
     Text,
@@ -65,11 +59,11 @@ enum Family {
 /// One derived ledger column: its header label plus the horizontal extent the
 /// label and the data below it agree on.
 #[derive(Clone)]
-struct HeaderColumn {
+pub(super) struct HeaderColumn {
     label: String,
-    x0: f64,
-    x1: f64,
-    kind: ColumnKind,
+    pub(super) x0: f64,
+    pub(super) x1: f64,
+    pub(super) kind: ColumnKind,
 }
 
 /// Header synonyms, matched after accent folding and uppercasing. Kept small
@@ -105,11 +99,15 @@ const SYN_AMOUNT: &[&str] = &[
     "SOLL",
 ];
 
-/// Uppercase and drop accents/punctuation so "DÉBIT" and "DEBIT" compare equal.
+/// Uppercase and drop accents/punctuation so "Débit", "DÉBIT" and "DEBIT"
+/// compare equal. `to_uppercase` (Unicode) folds the lowercase accented letters
+/// a mixed-case header uses — ASCII-only uppercasing leaves `é`/`è` untouched
+/// and the label then never matches its accent-stripped synonym.
 fn normalize(label: &str) -> String {
     label
         .chars()
         .filter(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().next().unwrap_or(c))
         .map(|c| match c {
             'À' | 'Â' | 'Ä' | 'Á' | 'Ã' | 'Å' => 'A',
             'Ç' => 'C',
@@ -119,7 +117,7 @@ fn normalize(label: &str) -> String {
             'Ù' | 'Û' | 'Ü' | 'Ú' => 'U',
             'Ÿ' | 'Ý' => 'Y',
             'Ñ' => 'N',
-            other => other.to_ascii_uppercase(),
+            other => other,
         })
         .collect()
 }
@@ -247,62 +245,8 @@ fn detect_header(lines: &[Vec<Span>]) -> Option<(usize, usize, Vec<HeaderColumn>
 }
 
 /// Column index for a word centre, given the (ascending) boundaries.
-fn column_of(center: f64, boundaries: &[f64]) -> usize {
+pub(super) fn column_of(center: f64, boundaries: &[f64]) -> usize {
     boundaries.iter().take_while(|&&b| center >= b).count()
-}
-
-/// Re-derive the boundaries from the header labels *and* the data words: a
-/// right-aligned amount column widens its extent to its values' right edge, so
-/// the boundary between two columns is the midpoint of the two extents.
-///
-/// Only a word whose centre falls inside the header label's own x-band (plus a
-/// kind-dependent margin) may widen that column. A short word at the left edge
-/// of the wide description column — a section label, a continuation line —
-/// centres well left of the label's band and would otherwise inflate the narrow
-/// value column beside it, pushing the value/description boundary over the
-/// description text. Amount columns take the wider margin because a
-/// right-aligned value sits to the right of its label.
-fn refine_boundaries(header: &[HeaderColumn], data: &[Vec<WordTok>], size: f64) -> Vec<f64> {
-    let margin_for = |kind: ColumnKind| match kind {
-        ColumnKind::Amount => UNANIMOUS_AMOUNT_MARGIN_SIZE_MULT * size,
-        _ => UNANIMOUS_TEXT_MARGIN_SIZE_MULT * size,
-    };
-    let mut left: Vec<f64> = header.iter().map(|c| c.x0).collect();
-    let mut right: Vec<f64> = header.iter().map(|c| c.x1).collect();
-    for words in data {
-        for w in words {
-            let center = 0.5 * (w.x0 + w.x1);
-            for c in 0..header.len() {
-                let m = margin_for(header[c].kind);
-                if center >= header[c].x0 - m && center <= header[c].x1 + m {
-                    left[c] = left[c].min(w.x0);
-                    right[c] = right[c].max(w.x1);
-                    break;
-                }
-            }
-        }
-    }
-    let mut out = Vec::with_capacity(header.len().saturating_sub(1));
-    for i in 0..header.len() - 1 {
-        let mut b = 0.5 * (right[i] + left[i + 1]);
-        if let Some(prev) = out.last() {
-            if b <= *prev {
-                b = *prev + 0.5;
-            }
-        }
-        out.push(b);
-    }
-    out
-}
-
-/// Median vertical pitch of consecutive lines, or [`FALLBACK_LINE_PITCH_PT`].
-fn line_pitch(ys: &[f64]) -> f64 {
-    let mut gaps: Vec<f64> = ys.windows(2).map(|w| w[0] - w[1]).filter(|g| *g > 0.0).collect();
-    if gaps.is_empty() {
-        return FALLBACK_LINE_PITCH_PT;
-    }
-    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    gaps[gaps.len() / 2]
 }
 
 /// A lone short numeric word positioned in the ledger's right-hand (amount)
@@ -345,11 +289,16 @@ fn union_bbox(lines: &[Vec<Span>], start: usize, end: usize) -> BoundingBox {
 
 /// Rebuild the ledger at `[hstart, hend]` as one table, returning `None` when no
 /// rows follow the header.
+///
+/// `vertical_rules` are the page's thin drawn vertical rules as `(x, y0, y1)`;
+/// when they resolve to the ledger's internal column separators they cut the
+/// columns exactly, otherwise the label/data-derived boundaries are kept.
 fn build_ledger(
     lines: &[Vec<Span>],
     hstart: usize,
     hend: usize,
     header: &[HeaderColumn],
+    vertical_rules: &[(f64, f64, f64)],
 ) -> Option<TableHit> {
     let ledger_left = header.first()?.x0;
     let ledger_right = header.iter().map(|c| c.x1).fold(ledger_left, f64::max);
@@ -380,12 +329,41 @@ fn build_ledger(
         .flat_map(|l| l.iter())
         .map(|s| s.size)
         .fold(0.0, f64::max);
-    let boundaries = refine_boundaries(header, &word_rows, size);
+    let mut boundaries = refine_boundaries(header, &word_rows, size);
     let ys: Vec<f64> = data.iter().map(|(_, y, _)| *y).collect();
     let threshold = line_pitch(&ys) * ROW_GAP_PITCH_MULT;
+    // A drawn rule is exact, so adopt the rule x's when they resolve to one
+    // separator per internal column boundary.
+    let band_lo = ys.iter().copied().fold(f64::INFINITY, f64::min);
+    let band_hi = lines[hstart..=hend]
+        .iter()
+        .flat_map(|l| l.iter())
+        .map(|s| s.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if let Some(exact) =
+        rule_boundaries(vertical_rules, ncols, ledger_left, ledger_right, (band_lo, band_hi))
+    {
+        boundaries = exact;
+    }
 
-    let mut rows: Vec<Vec<String>> = Vec::with_capacity(data.len() + 1);
+    // An opening balance sits directly above the header (below the account
+    // band) as one label cell plus one amount cell, with no date/value cell.
+    let pre = (hstart > 0)
+        .then(|| &lines[hstart - 1])
+        .and_then(|line| {
+            let inside = line_words(line)
+                .first()
+                .map(|w| w.x0 >= ledger_left - LEDGER_LEFT_TOL_PT)
+                .unwrap_or(false);
+            inside.then(|| opening_balance_row(line, header, &boundaries)).flatten()
+        });
+    let start = if pre.is_some() { hstart - 1 } else { hstart };
+
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(data.len() + 2);
     rows.push(header.iter().map(|c| c.label.clone()).collect());
+    if let Some(cells) = pre {
+        rows.push(cells);
+    }
     let mut cur: Vec<String> = Vec::new();
     let mut cur_is_operation = false;
     let mut prev_y: Option<f64> = None;
@@ -399,10 +377,17 @@ fn build_ledger(
             .iter()
             .any(|&c| matches!(header[c].kind, ColumnKind::Date | ColumnKind::Value));
         let has_amount = cols.iter().any(|&c| header[c].kind == ColumnKind::Amount);
+        // A wrapped continuation can carry the amount on its own line: a
+        // numeric-only line with an amount extends the operation above it,
+        // while a labelled sub-total (alphabetic text plus an amount) opens
+        // its own row.
+        let has_label = words
+            .iter()
+            .any(|w| w.text.chars().any(|c| c.is_alphabetic()));
         let gap = prev_y.map(|py| py - y).unwrap_or(f64::INFINITY);
         // A continuation line may only extend an operation row; a section label
         // or a sub-total must not absorb the line that follows it.
-        if first || has_date || has_amount || gap > threshold || !cur_is_operation {
+        if first || has_date || (has_amount && has_label) || gap > threshold || !cur_is_operation {
             if !cur.is_empty() {
                 rows.push(std::mem::take(&mut cur));
             }
@@ -434,10 +419,10 @@ fn build_ledger(
 
     let end = data.last()?.0;
     Some(TableHit {
-        start: hstart,
+        start,
         end,
         rows,
-        bbox: union_bbox(lines, hstart, end),
+        bbox: union_bbox(lines, start, end),
     })
 }
 
@@ -447,10 +432,22 @@ fn build_ledger(
 /// header-anchored table, replacing the fragment hits the generic passes found
 /// there. Tables elsewhere on the page are untouched.
 pub fn apply_ledger_model(lines: &[Vec<Span>], hits: Vec<TableHit>) -> Vec<TableHit> {
+    apply_ledger_model_with_rules(lines, hits, &[])
+}
+
+/// [`apply_ledger_model`] with the page's thin drawn vertical rules supplied as
+/// `(x, y0, y1)` in span device space. When those rules resolve to the ledger's
+/// internal column separators, the columns are cut on the drawn lines exactly
+/// instead of on the label/data-derived midpoints.
+pub fn apply_ledger_model_with_rules(
+    lines: &[Vec<Span>],
+    hits: Vec<TableHit>,
+    vertical_rules: &[(f64, f64, f64)],
+) -> Vec<TableHit> {
     let Some((hstart, hend, header)) = detect_header(lines) else {
         return hits;
     };
-    let Some(ledger) = build_ledger(lines, hstart, hend, &header) else {
+    let Some(ledger) = build_ledger(lines, hstart, hend, &header, vertical_rules) else {
         return hits;
     };
     let mut out: Vec<TableHit> = hits

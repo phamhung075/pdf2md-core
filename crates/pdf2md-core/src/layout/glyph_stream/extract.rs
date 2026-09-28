@@ -12,6 +12,7 @@ use super::*;
 struct GlyphPrefix {
     spans: Vec<Span>,
     underline_segs: Vec<(f64, f64, f64)>,
+    vertical_segs: Vec<(f64, f64, f64)>,
     vertical_up_chars: usize,
     vertical_down_chars: usize,
     page_height: f64,
@@ -59,12 +60,14 @@ fn extract_glyph_prefix(doc: &Document, page_id: ObjectId) -> Result<GlyphPrefix
     let GlyphWalk {
         spans,
         underline_segs,
+        vertical_segs,
         vertical_up_chars,
         vertical_down_chars,
     } = walk;
     Ok(GlyphPrefix {
         spans,
         underline_segs,
+        vertical_segs,
         vertical_up_chars,
         vertical_down_chars,
         page_height,
@@ -123,6 +126,7 @@ pub fn extract_page_glyphs(
     let GlyphPrefix {
         mut spans,
         underline_segs,
+        vertical_segs,
         vertical_up_chars,
         vertical_down_chars,
         mut page_height,
@@ -296,10 +300,19 @@ pub fn extract_page_glyphs(
     // header labels can sit off-baseline and off-centre, so the generic passes
     // above either miss it or split it into 2/3-column fragments. When a ledger
     // header is present, rebuild the whole ledger region from it as one table,
-    // replacing the fragment hits inside that region. Gated on `detect_tables`
-    // so `--no-tables` still renders the page as plain text.
+    // replacing the fragment hits inside that region. The page's drawn vertical
+    // rules, when they fully separate the columns, give the exact cuts. Gated on
+    // `detect_tables` so `--no-tables` still renders the page as plain text.
     let hits = if detect_tables {
-        crate::layout::tables::apply_ledger_model(&lines, hits)
+        crate::layout::tables::apply_ledger_model_with_rules(&lines, hits, &vertical_segs)
+    } else {
+        hits
+    };
+    // A key/value summary box (short labels, each with an amount beside or below
+    // it) is not a ruler grid and is not a ledger; detect it on whatever the
+    // passes above did not already claim.
+    let hits = if detect_tables {
+        crate::layout::tables::append_key_value_boxes(&lines, hits)
     } else {
         hits
     };

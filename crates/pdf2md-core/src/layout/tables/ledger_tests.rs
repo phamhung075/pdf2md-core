@@ -314,3 +314,301 @@ fn a_label_or_subtotal_does_not_absorb_the_line_below_it() {
     );
     assert_eq!(op[3], "10,00");
 }
+
+#[test]
+fn numeric_continuation_carrying_the_amount_joins_its_operation() {
+    // A wrapped operation can print the amount on its second line. That line is
+    // numeric only, so it extends the operation above instead of opening an
+    // amount-only row; a *labelled* sub-total still opens its own row.
+    let mut lines = header_lines();
+    lines.push(line(
+        685.0,
+        &[
+            ("02.01", 60.0, 30.0),
+            ("03.01", 110.0, 30.0),
+            ("TRANSFER", 170.0, 60.0),
+        ],
+    ));
+    lines.push(line(673.0, &[("0274536", 170.0, 60.0), ("10,00", 410.0, 40.0)]));
+    lines.push(line(655.0, &[("Sous-total", 250.0, 70.0), ("10,00", 330.0, 40.0)]));
+    let t = &apply_ledger_model(&lines, Vec::new())[0];
+    let op = t
+        .rows
+        .iter()
+        .find(|r| r[2].contains("TRANSFER"))
+        .expect("operation row");
+    assert!(
+        op[2].contains("0274536"),
+        "the numeric continuation joins the description: {:?}",
+        t.rows
+    );
+    assert!(op[2].contains(CELL_LINE_BREAK_PENDING));
+    assert_eq!(op[4], "10,00", "the continuation amount stays with the operation");
+    let sub = t
+        .rows
+        .iter()
+        .find(|r| r[2] == "Sous-total")
+        .expect("sub-total row");
+    assert_eq!(sub[3], "10,00");
+}
+
+#[test]
+fn mixed_case_accented_header_is_recognised() {
+    // A statement prints its header in mixed case with accents ("Débit",
+    // "Crédit"); accent folding must fold the *lowercase* accented letters too,
+    // or no amount column is found and the ledger is rejected.
+    let lines = vec![
+        line(
+            700.0,
+            &[
+                ("Date", 60.0, 34.0),
+                ("Valeur", 110.0, 46.0),
+                ("Nature des opérations", 170.0, 130.0),
+                ("Débit", 340.0, 34.0),
+                ("Crédit", 410.0, 38.0),
+            ],
+        ),
+        line(
+            685.0,
+            &[
+                ("02.01", 60.0, 30.0),
+                ("03.01", 110.0, 30.0),
+                ("TRANSFER OUT", 170.0, 80.0),
+                ("250,00", 330.0, 40.0),
+            ],
+        ),
+        line(
+            673.0,
+            &[
+                ("04.01", 60.0, 30.0),
+                ("05.01", 110.0, 30.0),
+                ("TRANSFER IN", 170.0, 75.0),
+                ("900,00", 410.0, 44.0),
+            ],
+        ),
+    ];
+    let hits = apply_ledger_model(&lines, Vec::new());
+    assert_eq!(hits.len(), 1, "a mixed-case accented header must be a ledger");
+    assert_eq!(hits[0].rows[0][0], "Date");
+    assert_eq!(hits[0].rows[0][3], "Débit");
+    assert_eq!(hits[0].rows[0][4], "Crédit");
+    assert_eq!(hits[0].rows[1][3], "250,00");
+    assert_eq!(hits[0].rows[2][4], "900,00");
+}
+
+#[test]
+fn drawn_vertical_rules_cut_the_columns_exactly() {
+    // The DEBIT header sits far left of its right-aligned values, so the
+    // label/data-derived cut would drag the DEBIT/CREDIT boundary left of the
+    // debit value and file it as a credit. The drawn rules must win.
+    let lines = vec![
+        line(
+            700.0,
+            &[
+                ("DATE", 60.0, 30.0),
+                ("VALEUR", 110.0, 30.0),
+                ("DESCRIPTION", 170.0, 60.0),
+                ("DEBIT", 250.0, 30.0),
+                ("CREDIT", 480.0, 30.0),
+            ],
+        ),
+        line(
+            685.0,
+            &[
+                ("02.01", 60.0, 30.0),
+                ("03.01", 110.0, 30.0),
+                ("CARD PAYMENT", 170.0, 70.0),
+                ("12,00", 430.0, 25.0),
+            ],
+        ),
+        line(
+            673.0,
+            &[
+                ("04.01", 60.0, 30.0),
+                ("05.01", 110.0, 30.0),
+                ("REFUND", 170.0, 45.0),
+                ("20,00", 490.0, 25.0),
+            ],
+        ),
+    ];
+    let rules = [
+        (100.0, 665.0, 706.0),
+        (155.0, 665.0, 706.0),
+        (240.0, 665.0, 706.0),
+        (460.0, 665.0, 706.0),
+    ];
+    let hits = apply_ledger_model_with_rules(&lines, Vec::new(), &rules);
+    assert_eq!(hits.len(), 1);
+    let t = &hits[0];
+    assert_eq!(t.rows[1][3], "12,00", "the debit value must land under DEBIT");
+    assert!(t.rows[1][4].is_empty());
+    assert_eq!(t.rows[2][4], "20,00", "the credit value must land under CREDIT");
+    assert!(t.rows[2][3].is_empty());
+}
+
+#[test]
+fn opening_balance_above_the_header_becomes_the_first_row() {
+    let lines = vec![
+        line(
+            730.0,
+            &[("ACCOUNT NAME", 60.0, 70.0), ("RIB : 0000 0000 0000", 400.0, 90.0)],
+        ),
+        line(
+            700.0,
+            &[("OPENING BALANCE", 170.0, 92.0), ("500,00", 410.0, 44.0)],
+        ),
+        line(
+            688.0,
+            &[
+                ("DATE", 60.0, 32.0),
+                ("VALEUR", 110.0, 40.0),
+                ("DESCRIPTION", 170.0, 70.0),
+                ("DEBIT", 340.0, 34.0),
+                ("CREDIT", 410.0, 38.0),
+            ],
+        ),
+        line(
+            673.0,
+            &[
+                ("02.01", 60.0, 30.0),
+                ("03.01", 110.0, 30.0),
+                ("PAYMENT", 170.0, 55.0),
+                ("12,00", 330.0, 40.0),
+            ],
+        ),
+        line(
+            661.0,
+            &[
+                ("04.01", 60.0, 30.0),
+                ("05.01", 110.0, 30.0),
+                ("PAYMENT", 170.0, 55.0),
+                ("20,00", 330.0, 40.0),
+            ],
+        ),
+    ];
+    let t = &apply_ledger_model(&lines, Vec::new())[0];
+    assert_eq!(t.start, 1, "the table begins at the opening balance line");
+    assert_eq!(t.rows[1][2], "OPENING BALANCE");
+    assert_eq!(t.rows[1][4], "500,00");
+    assert_eq!(t.rows[0][0], "DATE");
+}
+
+#[test]
+fn account_band_lines_stay_outside_the_ledger_table() {
+    // Two account-info lines (the level-1 band) sit above the opening balance
+    // and must not be absorbed as ledger rows.
+    let lines = vec![
+        line(
+            742.0,
+            &[("ACCOUNT NAME", 60.0, 70.0), ("RIB : 0000 0000 0000", 400.0, 90.0)],
+        ),
+        line(
+            730.0,
+            &[("HOLDER NAME", 60.0, 66.0), ("COMPTE EN EUROS", 420.0, 92.0)],
+        ),
+        line(
+            700.0,
+            &[("OPENING BALANCE", 170.0, 92.0), ("500,00", 410.0, 44.0)],
+        ),
+        line(
+            688.0,
+            &[
+                ("DATE", 60.0, 32.0),
+                ("VALEUR", 110.0, 40.0),
+                ("DESCRIPTION", 170.0, 70.0),
+                ("DEBIT", 340.0, 34.0),
+                ("CREDIT", 410.0, 38.0),
+            ],
+        ),
+        line(
+            673.0,
+            &[
+                ("02.01", 60.0, 30.0),
+                ("03.01", 110.0, 30.0),
+                ("PAYMENT", 170.0, 55.0),
+                ("12,00", 330.0, 40.0),
+            ],
+        ),
+        line(
+            661.0,
+            &[
+                ("04.01", 60.0, 30.0),
+                ("05.01", 110.0, 30.0),
+                ("PAYMENT", 170.0, 55.0),
+                ("20,00", 330.0, 40.0),
+            ],
+        ),
+    ];
+    let t = &apply_ledger_model(&lines, Vec::new())[0];
+    assert_eq!(t.start, 2, "only the opening balance joins the table");
+    assert!(
+        t.rows.iter().all(|r| !r.iter().any(|c| c.contains("ACCOUNT NAME") || c.contains("HOLDER NAME"))),
+        "the account band must not become ledger rows: {:?}",
+        t.rows
+    );
+}
+
+#[test]
+fn right_aligned_balance_label_stays_in_the_description_column() {
+    let mut lines = header_lines();
+    lines.push(line(
+        685.0,
+        &[
+            ("02.01", 60.0, 30.0),
+            ("03.01", 110.0, 30.0),
+            ("PAYMENT", 170.0, 50.0),
+            ("12,00", 330.0, 40.0),
+        ],
+    ));
+    lines.push(line(
+        670.0,
+        &[
+            ("02.01", 60.0, 30.0),
+            ("03.01", 110.0, 30.0),
+            ("PAYMENT", 170.0, 50.0),
+            ("20,00", 330.0, 40.0),
+        ],
+    ));
+    lines.push(line(
+        658.0,
+        &[("CLOSING BALANCE", 250.0, 100.0), ("900,00", 410.0, 46.0)],
+    ));
+    let t = &apply_ledger_model(&lines, Vec::new())[0];
+    let last = t.rows.last().unwrap();
+    assert_eq!(last[2], "CLOSING BALANCE", "a right-aligned label keeps its column");
+    assert_eq!(last[4], "900,00");
+    assert!(last[3].is_empty());
+}
+
+#[test]
+fn a_ruled_non_ledger_table_is_left_untouched() {
+    // A description/qty/amount grid is not a ledger; a hit the generic pass
+    // already found must pass straight through.
+    let lines = vec![
+        line(
+            700.0,
+            &[
+                ("DESCRIPTION", 60.0, 80.0),
+                ("QTY", 220.0, 26.0),
+                ("AMOUNT", 420.0, 60.0),
+            ],
+        ),
+        line(
+            685.0,
+            &[("Widget", 60.0, 40.0), ("2", 220.0, 8.0), ("10,00", 420.0, 30.0)],
+        ),
+    ];
+    let existing = TableHit {
+        start: 0,
+        end: 1,
+        rows: vec![
+            vec!["DESCRIPTION".into(), "QTY".into(), "AMOUNT".into()],
+            vec!["Widget".into(), "2".into(), "10,00".into()],
+        ],
+        bbox: BoundingBox::new(60.0, 680.0, 480.0, 700.0),
+    };
+    let rules = [(200.0, 680.0, 700.0)];
+    let out = apply_ledger_model_with_rules(&lines, vec![existing.clone()], &rules);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].rows, existing.rows);
+}

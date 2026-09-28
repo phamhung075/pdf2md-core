@@ -218,7 +218,9 @@ use super::regression_tests_common2::*;
         );
     }
 
-    /// A repeated column header inside table rows must survive.
+    /// A column header repeated at the top of the next page's table is the same
+    /// table continuing: the header survives once and every page's data rows
+    /// follow it, in page order.
     #[test]
     fn synthetic_repeated_montant_header_survives() {
         let pages: Vec<String> = (1..=3)
@@ -235,7 +237,16 @@ use super::regression_tests_common2::*;
             })
             .collect();
         let md = convert_synth(&pages);
-        assert_eq!(count_occurrences(&md, "Montant"), 3, "repeated header lost:\n{md}");
+        assert_eq!(count_occurrences(&md, "Montant"), 1, "repeated header kept:\n{md}");
+        assert_eq!(
+            count_occurrences(&md, "| --- | --- |"),
+            1,
+            "cross-page table not merged:\n{md}"
+        );
+        let a1 = md.find("poste-1A").expect("page 1 row");
+        let a2 = md.find("poste-2A").expect("page 2 row");
+        let a3 = md.find("poste-3A").expect("page 3 row");
+        assert!(a1 < a2 && a2 < a3, "rows out of page order:\n{md}");
     }
 
     /// Distinct postal codes must never be folded into one furniture key.

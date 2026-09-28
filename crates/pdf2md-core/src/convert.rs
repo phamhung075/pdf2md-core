@@ -270,6 +270,11 @@ pub fn convert_pdf_bytes_to_markdown(
     // Document-level furniture pass: running headers/footers, page counters and
     // repeated multi-line letterhead blocks are removed before reflow.
     apply_furniture(options, &mut page_md, &mut block_items);
+    // A table that ends a page and the same-header table that starts the next
+    // are one logical table; rejoin them into a single Markdown table before
+    // reflow. Per-page blocks keep their own page assignment — only the emitted
+    // document text is rejoined. See `xpage`.
+    crate::xpage::merge_continuation_tables(&mut page_md);
     for (p, chunk) in page_md {
         // Paragraph reflow: join the walker's one-line-per-PDF-line output
         // back into paragraphs. Run per page, after the line-based furniture

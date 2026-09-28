@@ -19,6 +19,7 @@ mod urls;
 use urls::*;
 mod page_select;
 use page_select::*;
+mod xpage;
 mod glyph_counts;
 mod convert_annotations;
 mod convert_media;

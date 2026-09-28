@@ -154,13 +154,15 @@ struct GlyphBudget {
     exhausted: bool,
 }
 
-/// One content-stream walk's output: positioned spans, underline rules, and the
-/// character counts of vertical runs by reading direction (upward / downward).
-/// The direction counts are what let the page-level caller detect a dominantly
-/// vertical page and rotate it upright.
+/// One content-stream walk's output: positioned spans, the thin horizontal
+/// underline rules, the thin vertical column rules, and the character counts of
+/// vertical runs by reading direction (upward / downward). The direction counts
+/// are what let the page-level caller detect a dominantly vertical page and
+/// rotate it upright.
 struct GlyphWalk {
     spans: Vec<Span>,
     underline_segs: Vec<(f64, f64, f64)>,
+    vertical_segs: Vec<(f64, f64, f64)>,
     vertical_up_chars: usize,
     vertical_down_chars: usize,
 }

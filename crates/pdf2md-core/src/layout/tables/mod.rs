@@ -7,13 +7,17 @@
 pub mod bordered;
 pub mod borderless;
 pub mod consolidation;
+pub mod key_value;
 pub mod ledger;
+pub mod ledger_columns;
+pub mod ledger_rows;
 pub mod rulers;
 pub mod validation;
 
 pub use bordered::{extract_bordered_tables, extract_tables, recover_borderless_tables, recover_tables_with_grid};
 pub use borderless::extract_borderless_tables;
-pub use ledger::apply_ledger_model;
+pub use key_value::append_key_value_boxes;
+pub use ledger::{apply_ledger_model, apply_ledger_model_with_rules};
 pub use rulers::{find_gap_tables, find_tables, scan_aligned_grids, table_rulers, RowInfo, TableHit, WordTok};
 
 use crate::layout::glyph_stream::Span;

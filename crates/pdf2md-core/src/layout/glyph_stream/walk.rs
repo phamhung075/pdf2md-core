@@ -122,8 +122,11 @@ pub(super) fn walk_glyphs(
     // a thin horizontal stroke (or an equally thin filled rectangle) painted
     // just below a run's baseline. We collect those candidate "underline
     // segments" (device y, x0, x1) while walking the content stream, then match
-    // them to spans after the visual lines are built.
+    // them to spans after the visual lines are built. The same walk collects the
+    // thin vertical rectangles a statement uses as its column rules, as
+    // (device x, y0, y1), for the ledger's exact column cuts.
     let mut underline_segs: Vec<(f64, f64, f64)> = Vec::new();
+    let mut vertical_segs: Vec<(f64, f64, f64)> = Vec::new();
     let mut path_pts: Vec<(f64, f64)> = Vec::new();
     let mut path_start: Option<(f64, f64)> = None;
 
@@ -354,6 +357,10 @@ pub(super) fn walk_glyphs(
                         // A thin filled rectangle beneath text is an underline
                         // rule; record its bottom edge (device y is smaller).
                         underline_segs.push((y0.min(y1), x0.min(x1), x0.max(x1)));
+                    } else if (x1 - x0).abs() < 2.0 && (y1 - y0).abs() >= 1.5 {
+                        // The same rectangle turned 90° is a column rule;
+                        // record its centre x and vertical extent.
+                        vertical_segs.push((0.5 * (x0 + x1), y0.min(y1), y0.max(y1)));
                     }
                 }
             }
@@ -445,6 +452,7 @@ pub(super) fn walk_glyphs(
                     None => spans.extend(sub.spans),
                 }
                 underline_segs.extend(sub.underline_segs);
+                vertical_segs.extend(sub.vertical_segs);
                 vertical_up_chars += sub.vertical_up_chars;
                 vertical_down_chars += sub.vertical_down_chars;
             }
@@ -455,6 +463,7 @@ pub(super) fn walk_glyphs(
     GlyphWalk {
         spans,
         underline_segs,
+        vertical_segs,
         vertical_up_chars,
         vertical_down_chars,
     }
