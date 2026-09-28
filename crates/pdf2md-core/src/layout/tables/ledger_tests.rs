@@ -167,6 +167,52 @@ fn page_furniture_left_of_the_ledger_ends_the_table() {
 }
 
 #[test]
+fn a_far_below_footer_is_not_a_ledger_row() {
+    // The footer sits at the ledger's own left edge (~40 line pitches below the
+    // last operation), so only the vertical-gap cut can keep it out.
+    let mut lines = header_lines();
+    lines.push(line(
+        685.0,
+        &[
+            ("02.01", 60.0, 30.0),
+            ("03.01", 110.0, 30.0),
+            ("FIRST OPERATION", 170.0, 90.0),
+            ("10,00", 330.0, 40.0),
+        ],
+    ));
+    lines.push(line(
+        673.0,
+        &[
+            ("03.01", 60.0, 30.0),
+            ("04.01", 110.0, 30.0),
+            ("SECOND OPERATION", 170.0, 100.0),
+            ("20,00", 330.0, 40.0),
+        ],
+    ));
+    lines.push(line(
+        661.0,
+        &[
+            ("04.01", 60.0, 30.0),
+            ("05.01", 110.0, 30.0),
+            ("THIRD OPERATION", 170.0, 95.0),
+            ("30,00", 330.0, 40.0),
+        ],
+    ));
+    lines.push(line(205.0, &[("Printed footer", 60.0, 80.0)]));
+
+    let t = &apply_ledger_model(&lines, Vec::new())[0];
+    assert_eq!(t.rows.len(), 4, "header plus the three operations only");
+    assert_eq!(t.end, 3, "the footer index must be after the hit's end");
+    assert!(
+        t.rows
+            .iter()
+            .all(|r| !r.iter().any(|c| c.contains("Printed footer"))),
+        "the footer must not be a ledger row: {:?}",
+        t.rows
+    );
+}
+
+#[test]
 fn a_plain_invoice_grid_is_not_a_ledger() {
     // description | qty | unit price | amount: no date/value column.
     let lines = vec![

@@ -37,6 +37,14 @@ const LEDGER_LEFT_TOL_PT: f64 = 2.5;
 /// A vertical gap larger than this multiple of the ledger's line pitch starts a
 /// new row, separating a section label from the entry above it.
 const ROW_GAP_PITCH_MULT: f64 = 1.7;
+/// A vertical gap larger than this multiple of the ledger's line pitch ends the
+/// ledger. A page footer far below the last entry can start at the ledger's own
+/// left edge, so the left-edge and page-counter guards do not catch it. The
+/// value sits well above [`ROW_GAP_PITCH_MULT`] — which only opens a new row at
+/// an in-ledger section break — so a real ledger is never cut; the pitch is
+/// taken from the prefix before the widest gap, so the footer's own outlier gap
+/// does not inflate it.
+const MAX_ROW_GAP_PITCH_MULT: f64 = 4.0;
 
 /// Which family a header label belongs to. Determines how a row's words are
 /// assigned and which lines begin a new row.
@@ -323,6 +331,33 @@ fn build_ledger(
         return None;
     }
 
+    let mut ys: Vec<f64> = data.iter().map(|(_, y, _)| *y).collect();
+    // A footer far below the last operation shares the ledger's left edge and
+    // slips past the guards above. It contributes the single widest gap, so the
+    // typical in-ledger pitch is the median (`line_pitch`) of the prefix before
+    // that gap: on a two-line page the median of all gaps would otherwise be the
+    // outlier itself and defeat the cut. Data is then cut at the first gap wider
+    // than MAX_ROW_GAP_PITCH_MULT pitches before any row is built (the hit's
+    // `end` and bbox shrink with it).
+    let mut widest = 0usize;
+    let mut widest_gap = f64::NEG_INFINITY;
+    for (i, w) in ys.windows(2).enumerate() {
+        let gap = w[0] - w[1];
+        if gap > widest_gap {
+            widest_gap = gap;
+            widest = i;
+        }
+    }
+    let max_gap = line_pitch(&ys[..=widest]) * MAX_ROW_GAP_PITCH_MULT;
+    let cut = data.windows(2).position(|w| w[0].1 - w[1].1 > max_gap);
+    if let Some(k) = cut {
+        data.truncate(k + 1);
+        ys.truncate(k + 1);
+    }
+    if data.len() < 2 {
+        return None;
+    }
+
     let word_rows: Vec<Vec<WordTok>> = data.iter().map(|(_, _, w)| w.clone()).collect();
     let size = lines[hstart..=hend]
         .iter()
@@ -330,7 +365,6 @@ fn build_ledger(
         .map(|s| s.size)
         .fold(0.0, f64::max);
     let mut boundaries = refine_boundaries(header, &word_rows, size);
-    let ys: Vec<f64> = data.iter().map(|(_, y, _)| *y).collect();
     let threshold = line_pitch(&ys) * ROW_GAP_PITCH_MULT;
     // A drawn rule is exact, so adopt the rule x's when they resolve to one
     // separator per internal column boundary.
