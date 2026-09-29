@@ -217,6 +217,38 @@ const BOUNDED_MARKDOWN_CEILING: usize = 1 << 20;
         }
     }
 
+    /// The exact `<!-- pdf2w:page n="N" -->` marker and the heuristic
+    /// `## Page N` heading are two spellings of the same page label. With the
+    /// marker opted in the heading must be suppressed, so a renderer that
+    /// surfaces the marker does not show the page number twice; with the flag
+    /// off the `## Page N` heading heuristic is unchanged.
+    #[test]
+    fn page_markers_replace_the_heuristic_page_heading() {
+        let bytes = unequal_page_marker_pdf();
+
+        let on = convert_with_markers(&bytes, true);
+        assert!(
+            on.contains("<!-- pdf2w:page n=\"1\" -->"),
+            "page_markers=true must keep the exact marker:\n{on}"
+        );
+        assert!(
+            !on.contains("## Page "),
+            "page_markers=true must not also emit the heuristic heading:\n{on}"
+        );
+
+        let off = convert_with_markers(&bytes, false);
+        assert!(
+            !off.contains("pdf2w:page"),
+            "page_markers=false must emit no marker:\n{off}"
+        );
+        for page in 1..=3 {
+            assert!(
+                off.contains(&format!("## Page {page}")),
+                "page_markers=false must keep the `## Page {page}` heading:\n{off}"
+            );
+        }
+    }
+
     /// Regression: every page starts with the identical running header, exactly
     /// the cross-page shape the furniture passes collapse. A marker inserted
     /// *before* those passes (inside the per-page build loop) would sit ahead of

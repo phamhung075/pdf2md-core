@@ -197,7 +197,13 @@ pub fn convert_pdf_bytes_to_markdown(
         let heading_like = marker_hint.unwrap_or_else(|| {
             crate::text_extract::first_line_looks_like_heading(&text)
         });
-        if options.detect_headings && heading_like {
+        // The `## Page N` heading is a heuristic, human-readable page title.
+        // When the caller opted into the exact `<!-- pdf2w:page n="N" -->`
+        // marker, that marker is the page label, so emitting both would show
+        // the page number twice wherever the marker is rendered (e.g. as a
+        // visible page label). Suppress the heading only in that case; with
+        // `page_markers` off the heuristic is byte-identical to before.
+        if options.detect_headings && heading_like && !options.page_markers {
             chunk.push_str(&format!("\n## Page {}\n\n", page_num));
         }
 
