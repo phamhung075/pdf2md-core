@@ -247,10 +247,17 @@
 
     // -- join_paragraph_text / de-hyphenation -----------------------------
 
+    /// Exercise the join with the evidence the two lines themselves provide
+    /// (the wrap prefix / tail are therefore excluded, as on a real page).
+    fn join_next(text: &mut String, next: &str) {
+        let evidence = JoinEvidence::from_text([text.as_str(), next]);
+        join_paragraph_text(text, next, &evidence);
+    }
+
     #[test]
     fn hyphenated_line_wrap_joins_without_space_or_hyphen() {
         let mut text = "This is infor-".to_string();
-        join_paragraph_text(&mut text, "mation you need.");
+        join_next(&mut text, "mation you need.");
         assert_eq!(text, "This is information you need.");
     }
 
@@ -260,21 +267,21 @@
         // before it is a space, not a letter — must join with a space and
         // keep the dash.
         let mut text = "A notable fact -".to_string();
-        join_paragraph_text(&mut text, "worth remembering.");
+        join_next(&mut text, "worth remembering.");
         assert_eq!(text, "A notable fact - worth remembering.");
     }
 
     #[test]
     fn ordinary_lines_join_with_a_single_space() {
         let mut text = "First part".to_string();
-        join_paragraph_text(&mut text, "second part.");
+        join_next(&mut text, "second part.");
         assert_eq!(text, "First part second part.");
     }
 
     #[test]
     fn trailing_whitespace_before_hyphen_is_ignored() {
         let mut text = "infor-  ".to_string(); // trailing spaces after the hyphen
-        join_paragraph_text(&mut text, "mation");
+        join_next(&mut text, "mation");
         assert_eq!(text, "information");
     }
 
@@ -282,16 +289,33 @@
     fn real_compound_hyphen_is_kept_on_merge() {
         // A clitic tail (inversion) is not a line-wrap fragment.
         let mut text = "Comment va-".to_string();
-        join_paragraph_text(&mut text, "t-il ?");
+        join_next(&mut text, "t-il ?");
         assert_eq!(text, "Comment va-t-il ?");
         // A hyphenated compound whose second element is a whole word.
         let mut text = "un non-".to_string();
-        join_paragraph_text(&mut text, "professionnel ici");
+        join_next(&mut text, "professionnel ici");
         assert_eq!(text, "un non-professionnel ici");
         // A capitalised continuation is never a line-wrap fragment either.
         let mut text = "la ville de".to_string();
-        join_paragraph_text(&mut text, "Paris");
+        join_next(&mut text, "Paris");
         assert_eq!(text, "la ville de Paris");
+    }
+
+    #[test]
+    fn uppercase_tail_keeps_its_hyphen_on_merge() {
+        // The geometry merge joins the two lines, but a capitalised tail is a
+        // proper-noun compound: the hyphen survives.
+        let mut text = "Jean-".to_string();
+        join_next(&mut text, "Pierre arrive");
+        assert_eq!(text, "Jean-Pierre arrive");
+    }
+
+    #[test]
+    fn hyphen_after_a_digit_is_never_dropped() {
+        let mut text = "total 12-".to_string();
+        join_next(&mut text, "3 pieces");
+        assert_eq!(text, "total 12- 3 pieces");
+        assert!(!text.contains("123"));
     }
 
     // -- page_two_columns_rows: column membership of unpaired lines -----------

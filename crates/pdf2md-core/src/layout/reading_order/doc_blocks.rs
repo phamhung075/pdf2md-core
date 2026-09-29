@@ -118,11 +118,18 @@ pub fn build_doc_blocks(lines: &[Vec<Span>], page_height: f64, page_width: Optio
 ///
 /// De-hyphenation: when the earlier line's text ends in a hyphen preceded by
 /// a letter (a line-wrap break, not a bullet/dash/range), the hyphen is
-/// dropped and the next line's text is joined directly with no space;
+/// dropped and the next line's text is joined directly with no space — but
+/// only when the page's own attestation says the pieces are fragments rather
+/// than a compound (the same evidence rule as the Markdown reflow, so the two
+/// channels cannot disagree);
 /// otherwise a single space joins them.
 pub(super) fn merge_paragraph_lines(blocks: Vec<DocBlock>) -> Vec<DocBlock> {
     const LEFT_EDGE_TOL: f64 = 3.0;
     const MAX_PITCH_RATIO: f64 = 1.8;
+
+    // Attestation across the page's blocks: the structured channel must make
+    // the same de-hyphenation decision as the Markdown reflow.
+    let evidence = JoinEvidence::from_text(blocks.iter().map(|b| b.text.as_str()));
 
     /// A paragraph being accumulated: `block` grows in place (text joined,
     /// bbox unioned) as more lines merge into it.
@@ -168,7 +175,7 @@ pub(super) fn merge_paragraph_lines(blocks: Vec<DocBlock>) -> Vec<DocBlock> {
             let edge_ok =
                 overlap_ok && (p.line_count == 1 || (b.x0 - p.body_x0).abs() <= LEFT_EDGE_TOL);
             if pitch_ok && edge_ok {
-                join_paragraph_text(&mut p.block.text, &b.text);
+                join_paragraph_text(&mut p.block.text, &b.text, &evidence);
                 p.block.x0 = p.block.x0.min(b.x0);
                 p.block.y0 = p.block.y0.min(b.y0);
                 p.block.x1 = p.block.x1.max(b.x1);
@@ -208,15 +215,17 @@ pub(super) fn merge_paragraph_lines(blocks: Vec<DocBlock>) -> Vec<DocBlock> {
 /// genuine line-wrap break (a hyphen preceded by a letter, followed by a
 /// lowercase *fragment* — not a French clitic / compound tail, e.g.
 /// "infor-" + "mation" -> "information"), otherwise joins with a plain space.
-pub(super) fn join_paragraph_text(text: &mut String, next: &str) {
+/// `evidence` is the page's attestation, so a compound whose halves both read
+/// as real words keeps its hyphen exactly as in the Markdown reflow.
+pub(super) fn join_paragraph_text(text: &mut String, next: &str, evidence: &JoinEvidence) {
     let trimmed_len = text.trim_end().len();
     text.truncate(trimmed_len);
     match classify_hyphen_join(text, next) {
-        HyphenJoin::Dehyphenate => {
+        HyphenJoin::Dehyphenate if is_unattested_fragment(text, next, evidence) => {
             text.pop(); // drop the trailing '-'
             text.push_str(next.trim_start());
         }
-        HyphenJoin::KeepHyphen => {
+        HyphenJoin::Dehyphenate | HyphenJoin::KeepHyphen => {
             text.push_str(next.trim_start());
         }
         HyphenJoin::None => {

@@ -24,15 +24,24 @@
 //!   `, ; . )`, or after a trailing comma); the first *visible* character is
 //!   tested, so a line opening with `**`/`<u>` is classified by its text, and
 //!   two lines wrapped in the same emphasis merge into one run;
-//! * a trailing line-break hyphen is removed only before a lowercase *fragment*
-//!   (not a French clitic / compound tail) **and** when the joined word occurs
-//!   elsewhere in the document as a standalone word, so `infor-` + `mation`
-//!   collapses only when `information` is attested, while `peut-être`,
-//!   `c'est-à-dire` and `non-professionnel` always survive;
+//! * a trailing line-break hyphen is removed before a lowercase *fragment*
+//!   (not a French clitic / compound tail) when either the joined word occurs
+//!   elsewhere in the document as a standalone word (`infor-` + `mation`
+//!   collapses when `information` is attested) **or** the chunk's own evidence
+//!   says the two pieces are fragments rather than a compound (no half is an
+//!   attested content word, the hyphenated form is not written mid-line, the
+//!   prefix is not a productive compound prefix, and the wrap is not inside a
+//!   multi-part hyphenated token). `peut-être`, `c'est-à-dire`,
+//!   `non-professionnel`, `sous-total`, `ci-dessus` and `porte-monnaie` always
+//!   survive;
 //! * a space is kept before `, ; . )` only when the source already carries the
 //!   whitespace after it, so two numbers are never fused across a join.
 
-use std::collections::HashSet;
+mod hyphen;
+
+pub(crate) use hyphen::{
+    classify_hyphen_join, dehyphenated_word, is_unattested_fragment, JoinEvidence, HyphenJoin,
+};
 
 /// Line prefixes that always mark a structural (non-paragraph) line.
 const STRUCTURAL_STARTS: &[&str] = &["#", "- ", "* ", "> ", "<", "![", "|", "*["];
@@ -42,35 +51,6 @@ const STRUCTURAL_STARTS: &[&str] = &["#", "- ", "* ", "> ", "<", "![", "|", "*["
 /// consecutive wrapped lines into a single run of the *same* emphasis
 /// (`**a**` + `**b**` -> `**a b**`, not `**a** **b**`).
 const WHOLE_LINE_WRAPPERS: &[(&str, &str)] = &[("**", "**"), ("<u>", "</u>"), ("*", "*")];
-
-/// Second elements of French hyphenated compounds / inversion clitics. A
-/// trailing `-` before one of these is a *real* hyphen, not a line-wrap break.
-const COMPOUND_TAILS: &[&str] = &[
-    // inversion / elision clitics
-    "ce", "il", "elle", "on", "je", "tu", "nous", "vous", "ils", "elles", "t", "en", "y", "ci",
-    "là", "même", "moi", "toi", "soi", "lui", "leur",
-    // common compounds whose second element is a full word
-    "etre", "être", "dire", "professionnel", "professionnelle", "professionnels", "professionnelles",
-    "tout", "tous", "toute", "toutes", "rien", "jamais", "mieux", "moins", "plus", "même",
-];
-
-/// How a line break that lands on a trailing hyphen should be joined.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum HyphenJoin {
-    /// A line-wrap break: drop the hyphen and concatenate (`infor-` + `mation`).
-    Dehyphenate,
-    /// A real compound hyphen: keep it and concatenate (`peut-` + `être`).
-    KeepHyphen,
-    /// Not a hyphen break: join with a normal space.
-    None,
-}
-
-/// Whether `word` is a French clitic / compound tail that must keep a preceding
-/// hyphen when two lines are joined.
-pub(crate) fn is_compound_tail(word: &str) -> bool {
-    let w = word.to_lowercase();
-    COMPOUND_TAILS.contains(&w.as_str())
-}
 
 /// True when the whitespace-stripped line opens a structural Markdown element.
 fn is_structural_start(t: &str) -> bool {
@@ -211,37 +191,6 @@ fn whole_line_wrapper(s: &str) -> Option<(&'static str, &'static str)> {
     None
 }
 
-/// First run of alphabetic characters in `s`, or `""` when it does not start
-/// with a letter.
-fn first_word(s: &str) -> &str {
-    let t = s.trim_start();
-    let end = t.find(|c: char| !c.is_alphabetic()).unwrap_or(t.len());
-    &t[..end]
-}
-
-/// Classify a join that lands on a trailing hyphen.
-pub(crate) fn classify_hyphen_join(prev: &str, next: &str) -> HyphenJoin {
-    let p = prev.trim_end();
-    let mut rev = p.chars().rev();
-    if rev.next() != Some('-') {
-        return HyphenJoin::None;
-    }
-    match rev.next() {
-        Some(c) if c.is_alphabetic() => {}
-        _ => return HyphenJoin::None,
-    }
-    let w = first_word(next);
-    let first = match w.chars().next() {
-        Some(c) => c,
-        None => return HyphenJoin::None,
-    };
-    if first.is_lowercase() && !is_compound_tail(w) {
-        HyphenJoin::Dehyphenate
-    } else {
-        HyphenJoin::KeepHyphen
-    }
-}
-
 /// Drop the space before an opening `, ; . )` only when the source already has
 /// whitespace after that punctuation. This keeps `par jour` + `, avant` as
 /// `par jour, avant` while refusing to fuse `12` + `.50` into `12.50`.
@@ -255,38 +204,6 @@ fn punct_join_safe(ns: &str) -> bool {
     }
 }
 
-/// Every maximal run of alphabetic characters in `lines`, lowercased. A
-/// line-end hyphen may only be dropped when the de-hyphenated word actually
-/// occurs elsewhere in the document as a standalone word, so the reflow needs
-/// the document's own vocabulary.
-fn document_vocabulary(lines: &[&str]) -> HashSet<String> {
-    let mut set = HashSet::new();
-    for line in lines {
-        for word in line.split(|c: char| !c.is_alphabetic()) {
-            if !word.is_empty() {
-                set.insert(word.to_lowercase());
-            }
-        }
-    }
-    set
-}
-
-/// The word formed by undoing a line-end hyphen: the alphabetic run ending at
-/// the hyphen in `prev`, concatenated with the first word of `next`, lowercased.
-fn dehyphenated_word(prev: &str, next: &str) -> String {
-    let p = prev.trim_end();
-    let p = p.strip_suffix('-').unwrap_or(p);
-    let mut frag: Vec<char> = p
-        .chars()
-        .rev()
-        .take_while(|c| c.is_alphabetic())
-        .collect();
-    frag.reverse();
-    let mut word: String = frag.into_iter().collect();
-    word.push_str(&first_word(next).to_lowercase());
-    word.to_lowercase()
-}
-
 /// Reflow `input`: join wrapped body lines into paragraphs.
 ///
 /// Pure and allocation-bounded: the output is at most the input plus one space
@@ -294,9 +211,10 @@ fn dehyphenated_word(prev: &str, next: &str) -> String {
 pub fn reflow_markdown(input: &str) -> String {
     let lines: Vec<&str> = input.split('\n').collect();
 
-    // Document vocabulary: a line-end hyphen is only removed when the joined
-    // word appears elsewhere in the document as a standalone word.
-    let vocab = document_vocabulary(&lines);
+    // Chunk attestation: a line-end hyphen is dropped when the joined word
+    // appears elsewhere as a standalone word, or when the pieces are attested
+    // as fragments rather than a compound (see `is_unattested_fragment`).
+    let evidence = JoinEvidence::from_text(lines.iter().copied());
 
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut pending: Option<String> = None;
@@ -411,14 +329,15 @@ pub fn reflow_markdown(input: &str) -> String {
                 }
                 None => match classify_hyphen_join(buf, ln) {
                     HyphenJoin::Dehyphenate
-                        if vocab.contains(&dehyphenated_word(buf, ln)) =>
+                        if evidence.attests(&dehyphenated_word(buf, ln))
+                            || is_unattested_fragment(buf, ln, &evidence) =>
                     {
                         let n = buf.trim_end().len();
                         buf.truncate(n - 1); // '-' is one byte
                         buf.push_str(ns);
                     }
-                    // A real compound / clitic, or a fragment whose joined word
-                    // never appears standalone in this document: keep the hyphen.
+                    // A real compound / clitic, or a wrap whose pieces are not
+                    // evidenced as fragments: keep the hyphen.
                     HyphenJoin::Dehyphenate | HyphenJoin::KeepHyphen => {
                         let n = buf.trim_end().len();
                         buf.truncate(n);

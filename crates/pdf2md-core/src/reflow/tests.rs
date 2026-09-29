@@ -19,11 +19,15 @@
 //!   terminator and the later one continues it (starts lowercase or with
 //!   `, ; . )`); a line that ends a sentence is always a paragraph boundary,
 //!   however long it is;
-//! * a trailing line-break hyphen is removed only before a lowercase *fragment*
-//!   (not a French clitic / compound tail) **and** when the joined word occurs
-//!   elsewhere in the document as a standalone word, so `infor-` + `mation`
-//!   collapses only when `information` is attested, while `peut-être`,
-//!   `c'est-à-dire` and `non-professionnel` always survive;
+//! * a trailing line-break hyphen is removed before a lowercase *fragment*
+//!   (not a French clitic / compound tail) when the joined word occurs
+//!   elsewhere as a standalone word **or** the chunk's own evidence says the
+//!   pieces are fragments rather than a compound (no half is an attested
+//!   content word, the hyphenated form is not written mid-line, the prefix is
+//!   not a productive compound prefix, and the wrap is not inside a multi-part
+//!   hyphenated token), so `incre-`+`mentally` collapses while `peut-être`,
+//!   `c'est-à-dire`, `non-professionnel`, `sous-total`, `ci-dessus` and
+//!   `porte-monnaie` always survive;
 //! * a space is kept before `, ; . )` only when the source already carries the
 //!   whitespace after it, so two numbers are never fused across a join.
 
@@ -111,14 +115,83 @@
     }
 
     #[test]
-    fn dehyphenates_a_lowercase_fragment_only_with_self_vocabulary() {
+    fn dehyphenates_a_lowercase_fragment_when_the_joined_word_is_attested() {
         // `information` occurs standalone earlier in the document: the wrapped
         // fragment is a line break, so the hyphen is dropped.
         let out = join("information complete\n\nThis is infor-\nmation you need");
         assert_eq!(out, "information complete\n\nThis is information you need");
-        // No standalone `information` anywhere: keep the hyphen.
-        let out = join("Ceci est infor-\nmation utile");
-        assert_eq!(out, "Ceci est infor-mation utile");
+    }
+
+    #[test]
+    fn dehyphenates_an_unattested_fragment_whose_pieces_are_not_words() {
+        // No standalone `incrementally` / `opportunity` / `gesture` anywhere,
+        // and neither half of the wrap is a standalone word: the pieces are
+        // fragments, so the hyphen is dropped without needing attestation.
+        assert_eq!(
+            join("Ceci est incre-\nmentally utile"),
+            "Ceci est incrementally utile"
+        );
+        assert_eq!(join("an oppor-\ntunity knocks"), "an opportunity knocks");
+        assert_eq!(join("a ges-\nture of goodwill"), "a gesture of goodwill");
+    }
+
+    #[test]
+    fn dehyphenates_a_join_whose_only_attested_half_is_a_function_word() {
+        // `in` is a real word in the first line, but a 2-letter function word
+        // is not evidence of a compound: `crementally` is not a word anywhere,
+        // so the wrap is a fragment.
+        let out = join("Put it in there\n\nThey grow in-\ncrementally");
+        assert_eq!(out, "Put it in there\n\nThey grow incrementally");
+    }
+
+    #[test]
+    fn keeps_the_hyphen_when_a_content_word_half_is_attested() {
+        // `mentally` is a real content word elsewhere in the document: the
+        // conservative side of the rule keeps the hyphen rather than risk
+        // fusing a compound like `pocket-sprung` (`pocket` repeats).
+        let out = join("The report is mentally noted\n\nWe work incre-\nmentally");
+        assert_eq!(
+            out,
+            "The report is mentally noted\n\nWe work incre-mentally"
+        );
+    }
+
+    #[test]
+    fn keeps_a_compound_when_both_halves_are_real_words() {
+        // `porte` and `monnaie` both occur standalone elsewhere: a genuine
+        // compound, never fused.
+        let out = join("Une porte et une monnaie\n\nLe porte-\nmonnaie est ici");
+        assert_eq!(
+            out,
+            "Une porte et une monnaie\n\nLe porte-monnaie est ici"
+        );
+    }
+
+    #[test]
+    fn keeps_the_hyphen_when_the_hyphenated_compound_is_attested_mid_line() {
+        // The author writes `xyz-section` hyphenated mid-line, so the wrap is a
+        // compound even though the joined word never occurs.
+        let out = join("See our xyz-section here\n\nOur xyz-\nsection is fine");
+        assert_eq!(
+            out,
+            "See our xyz-section here\n\nOur xyz-section is fine"
+        );
+    }
+
+    #[test]
+    fn keeps_a_productive_compound_prefix() {
+        // `sous-` / `non-` are derivational prefixes, not line-wrap breaks,
+        // even when the joined word is unattested and the tail is a real word.
+        assert_eq!(join("Le sous-\ntotal est affiche"), "Le sous-total est affiche");
+        assert_eq!(join("un non-\ntruc bizarre"), "un non-truc bizarre");
+    }
+
+    #[test]
+    fn keeps_a_multi_part_hyphenated_compound() {
+        // The wrap sits inside a token that already carries a hyphen, so the
+        // hyphen must survive.
+        assert_eq!(join("un arc-en-\nciel bleu"), "un arc-en-ciel bleu");
+        assert_eq!(join("C'est-à-\ndire vrai"), "C'est-à-dire vrai");
     }
 
     #[test]
@@ -127,6 +200,28 @@
         assert_eq!(join("C'est peut-\nêtre vrai"), "C'est peut-être vrai");
         // A real compound tail keeps its hyphen.
         assert_eq!(join("un non-\nprofessionnel ici"), "un non-professionnel ici");
+    }
+
+    #[test]
+    fn keeps_the_hyphen_before_an_uppercase_tail() {
+        // A capitalised continuation never joins the paragraph and never fuses
+        // the two proper-noun parts.
+        // A capitalised fragment before the hyphen is a likely name: keep it.
+        assert_eq!(join("Dai-\nhung est ici"), "Dai-hung est ici");
+        let out = join("Jean-\nPierre arrive");
+        assert_eq!(out, "Jean-\nPierre arrive");
+        assert!(!out.contains("JeanPierre"));
+    }
+
+    #[test]
+    fn never_dehyphenates_a_hyphen_after_a_digit() {
+        // `12-` + `3` is a range / identifier, never a wrapped word: no join and
+        // no fusion of the digit streams.
+        let out = join("total 12-\n3 pieces");
+        assert_eq!(out, "total 12-\n3 pieces");
+        assert!(!out.contains("123"));
+        // Even when the next line joins, the hyphen is kept.
+        assert_eq!(join("Le code 12-\nabc"), "Le code 12- abc");
     }
 
     #[test]

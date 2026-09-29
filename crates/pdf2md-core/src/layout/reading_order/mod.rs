@@ -35,7 +35,7 @@ pub use doc_blocks::*;
 
 use serde::{Deserialize, Serialize};
 use crate::layout::glyph_stream::Span;
-use crate::reflow::{classify_hyphen_join, HyphenJoin};
+use crate::reflow::{classify_hyphen_join, is_unattested_fragment, JoinEvidence, HyphenJoin};
 
 /// Fraction of an em by which the next run must start past the previous run's
 /// natural end (its `word_advance`, `Tc`/`Tw` included) to count as a word
