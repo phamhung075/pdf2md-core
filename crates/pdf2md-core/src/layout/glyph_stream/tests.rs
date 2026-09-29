@@ -414,7 +414,7 @@ use super::tests_common::*;
         let mut path = vec![(100.0, 200.0), (300.0, 200.0), (300.0, 201.0)];
         let mut segs: Vec<(f64, f64, f64)> = Vec::new();
         let mut vsegs: Vec<(f64, f64, f64)> = Vec::new();
-        flush_path_segs(&mut path, Some((100.0, 200.0)), &mut segs, &mut vsegs, false);
+        flush_path_segs(&mut path, Some((100.0, 200.0)), &mut segs, &mut vsegs, &mut Vec::new(), false);
         assert_eq!(segs, vec![(200.0, 100.0, 300.0)], "only the horizontal rule survives");
         assert!(vsegs.is_empty(), "no vertical rule in a horizontal path");
     }
@@ -425,7 +425,7 @@ use super::tests_common::*;
         let mut path = vec![(191.0, 173.0), (191.0, 626.0)];
         let mut hsegs: Vec<(f64, f64, f64)> = Vec::new();
         let mut vsegs: Vec<(f64, f64, f64)> = Vec::new();
-        flush_path_segs(&mut path, Some((191.0, 173.0)), &mut hsegs, &mut vsegs, false);
+        flush_path_segs(&mut path, Some((191.0, 173.0)), &mut hsegs, &mut vsegs, &mut Vec::new(), false);
         assert!(hsegs.is_empty(), "a vertical stroke is not an underline");
         assert_eq!(vsegs, vec![(191.0, 173.0, 626.0)]);
     }
@@ -436,7 +436,8 @@ use super::tests_common::*;
         // and bottom edges must NOT become "underline" rules, or the top edge
         // underlines the text line just above the box (the FR ACRE slide's URL
         // box underlined " au plus tard dans les 45 jours suiv"). It must not
-        // yield column rules either.
+        // yield thin column rules either: a lone box has too few edges and too
+        // short a span to seed a frame, so it is only recorded as a drawn cell.
         let mut path = vec![
             (198.1, 257.5),
             (260.4, 257.5),
@@ -445,9 +446,15 @@ use super::tests_common::*;
         ];
         let mut segs: Vec<(f64, f64, f64)> = Vec::new();
         let mut vsegs: Vec<(f64, f64, f64)> = Vec::new();
-        flush_path_segs(&mut path, Some((198.1, 257.5)), &mut segs, &mut vsegs, true);
+        let mut cells: Vec<(f64, f64, f64, f64)> = Vec::new();
+        flush_path_segs(&mut path, Some((198.1, 257.5)), &mut segs, &mut vsegs, &mut cells, true);
         assert!(segs.is_empty(), "a box border must not yield underline rules, got {segs:?}");
         assert!(vsegs.is_empty(), "a box border must not yield column rules, got {vsegs:?}");
+        assert_eq!(
+            cells.len(),
+            1,
+            "the box is a drawn cell rectangle, not a column rule: {cells:?}"
+        );
     }
 
     #[test]

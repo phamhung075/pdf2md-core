@@ -163,6 +163,9 @@ struct GlyphWalk {
     spans: Vec<Span>,
     underline_segs: Vec<(f64, f64, f64)>,
     vertical_segs: Vec<(f64, f64, f64)>,
+    /// Drawn axis-aligned cell rectangles `(x0, y0, x1, y1)`, the raw material
+    /// for a grid whose columns are stated per cell rather than by long rules.
+    cell_rects: Vec<(f64, f64, f64, f64)>,
     vertical_up_chars: usize,
     vertical_down_chars: usize,
 }

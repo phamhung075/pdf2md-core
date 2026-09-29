@@ -125,10 +125,61 @@ pub(super) fn record_vert_seg(out: &mut Vec<(f64, f64, f64)>, p: (f64, f64), q: 
 
 /// Minimum length of a vertical stroke for it to count as a column rule rather
 /// than a glyph-size tick or a table cell's short border segment.
-const MIN_VERT_RULE_PT: f64 = 4.0;
+pub(super) const MIN_VERT_RULE_PT: f64 = 4.0;
 /// Maximum width of a path for it to be a vertical (not horizontal, not box)
 /// rule: the same < 2pt thinness the filled-rectangle branch applies.
 const MAX_RULE_THICKNESS_PT: f64 = 2.0;
+
+/// Axis-aligned bounds of a drawn cell rectangle `(x0, y0, x1, y1)`.
+pub(super) type CellRect = (f64, f64, f64, f64);
+
+/// Is the closed path an axis-aligned rectangle? A rectangle's vertices all sit
+/// on the bounding box; a glyph outline (the other closed path shape on a page)
+/// has curve/edge points strictly inside it, so it is rejected. `path` and
+/// `start` are the same ring `flush_path_segs` walks.
+fn axis_aligned_rect(
+    path: &[(f64, f64)],
+    start: Option<(f64, f64)>,
+) -> Option<(f64, f64, f64, f64)> {
+    // A rectangle has four corners plus, when the path is explicitly closed,
+    // one repeated vertex. More than five points means it is not a plain box.
+    let extra = usize::from(start.is_some());
+    let n = path.len();
+    if n < 4 || n > 5 + extra {
+        return None;
+    }
+    let mut xmin = f64::INFINITY;
+    let mut xmax = f64::NEG_INFINITY;
+    let mut ymin = f64::INFINITY;
+    let mut ymax = f64::NEG_INFINITY;
+    let mut all = |x: f64, y: f64| {
+        xmin = xmin.min(x);
+        xmax = xmax.max(x);
+        ymin = ymin.min(y);
+        ymax = ymax.max(y);
+    };
+    for &(x, y) in path {
+        all(x, y);
+    }
+    if let Some((x, y)) = start {
+        all(x, y);
+    }
+    let eps = 0.5;
+    let on_corner = |x: f64, y: f64| {
+        let x_edge = (x - xmin).abs() <= eps || (x - xmax).abs() <= eps;
+        let y_edge = (y - ymin).abs() <= eps || (y - ymax).abs() <= eps;
+        x_edge && y_edge
+    };
+    if !path.iter().all(|&(x, y)| on_corner(x, y)) {
+        return None;
+    }
+    if let Some((x, y)) = start {
+        if !on_corner(x, y) {
+            return None;
+        }
+    }
+    Some((xmin, ymin, xmax, ymax))
+}
 
 /// Flush the current path as consecutive line segments, keeping only thin
 /// horizontal rules (`hout`, `(y, x0, x1)`) and thin tall vertical rules
@@ -145,12 +196,18 @@ const MAX_RULE_THICKNESS_PT: f64 = 2.0;
 /// < 2pt threshold the thin-filled-`re` branch already applies.
 ///
 /// A column rule is the same shape turned 90°: a single `m`/`l` stroke of
-/// negligible x-extent. A box border (large extent in both axes) is neither.
+/// negligible x-extent. A box border (large extent in both axes) is neither —
+/// but its *edges* are recorded, separately, in `cells`: a producer that draws
+/// every table cell as its own bordered rectangle (rather than a long column
+/// rule) still states its columns through those stacked edges. `cells` is a
+/// distinct channel so a lone hyperlink box's two short edges never enter the
+/// ledger's column rules.
 pub(super) fn flush_path_segs(
     path: &mut Vec<(f64, f64)>,
     start: Option<(f64, f64)>,
     hout: &mut Vec<(f64, f64, f64)>,
     vout: &mut Vec<(f64, f64, f64)>,
+    cells: &mut Vec<CellRect>,
     close: bool,
 ) {
     let mut ymin = f64::INFINITY;
@@ -193,6 +250,14 @@ pub(super) fn flush_path_segs(
                     record_vert_seg(vout, last, s);
                 }
             }
+        }
+    }
+    // A closed, non-thin axis-aligned rectangle is a drawn cell. Its two
+    // vertical edges are candidate column boundaries, kept in the separate
+    // `cells` channel so the ledger's thin-rule input is untouched.
+    if close && (xmax - xmin) >= MAX_RULE_THICKNESS_PT && (ymax - ymin) >= MIN_VERT_RULE_PT {
+        if let Some(rect) = axis_aligned_rect(path, start) {
+            cells.push(rect);
         }
     }
     path.clear();

@@ -127,6 +127,8 @@ pub(super) fn walk_glyphs(
     // (device x, y0, y1), for the ledger's exact column cuts.
     let mut underline_segs: Vec<(f64, f64, f64)> = Vec::new();
     let mut vertical_segs: Vec<(f64, f64, f64)> = Vec::new();
+    // Drawn cell rectangles (a grid whose every cell is its own bordered box).
+    let mut cell_rects: Vec<(f64, f64, f64, f64)> = Vec::new();
     let mut path_pts: Vec<(f64, f64)> = Vec::new();
     let mut path_start: Option<(f64, f64)> = None;
 
@@ -303,7 +305,7 @@ pub(super) fn walk_glyphs(
             }
             // --- Underline-candidate path tracking (thin horizontal rules) ---
             "m" => {
-                flush_path_segs(&mut path_pts, path_start, &mut underline_segs, &mut vertical_segs, false);
+                flush_path_segs(&mut path_pts, path_start, &mut underline_segs, &mut vertical_segs, &mut cell_rects, false);
                 if let (Some(x), Some(y)) =
                     (op.operands.first().and_then(num), op.operands.get(1).and_then(num))
                 {
@@ -339,7 +341,7 @@ pub(super) fn walk_glyphs(
                 }
             }
             "re" => {
-                flush_path_segs(&mut path_pts, path_start, &mut underline_segs, &mut vertical_segs, false);
+                flush_path_segs(&mut path_pts, path_start, &mut underline_segs, &mut vertical_segs, &mut cell_rects, false);
                 if let (Some(x), Some(y), Some(w), Some(h)) = (
                     op.operands.first().and_then(num),
                     op.operands.get(1).and_then(num),
@@ -366,10 +368,10 @@ pub(super) fn walk_glyphs(
                 }
             }
             "S" | "s" | "B" | "B*" | "b" | "b*" => {
-                flush_path_segs(&mut path_pts, path_start, &mut underline_segs, &mut vertical_segs, true);
+                flush_path_segs(&mut path_pts, path_start, &mut underline_segs, &mut vertical_segs, &mut cell_rects, true);
             }
             "f" | "F" | "f*" => {
-                flush_path_segs(&mut path_pts, path_start, &mut underline_segs, &mut vertical_segs, true);
+                flush_path_segs(&mut path_pts, path_start, &mut underline_segs, &mut vertical_segs, &mut cell_rects, true);
             }
             "n" => path_pts.clear(),
             // Form XObject text. Fonts come from the form's own resource chain
@@ -454,6 +456,7 @@ pub(super) fn walk_glyphs(
                 }
                 underline_segs.extend(sub.underline_segs);
                 vertical_segs.extend(sub.vertical_segs);
+                cell_rects.extend(sub.cell_rects);
                 vertical_up_chars += sub.vertical_up_chars;
                 vertical_down_chars += sub.vertical_down_chars;
             }
@@ -465,6 +468,7 @@ pub(super) fn walk_glyphs(
         spans,
         underline_segs,
         vertical_segs,
+        cell_rects,
         vertical_up_chars,
         vertical_down_chars,
     }

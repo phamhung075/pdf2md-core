@@ -98,6 +98,34 @@ fn band_has_content(lines: &[Vec<Span>], x0: f64, x1: f64, lo: f64, hi: f64) -> 
     })
 }
 
+/// Collinear rules grouped by x: a producer may draw one column separator in
+/// several segments (a full-width section row interrupts it). The group keeps
+/// every segment so the frame detector can measure the column's *total*
+/// coverage of a band rather than one contiguous run.
+struct XGroup {
+    x: f64,
+    segs: Vec<(f64, f64)>,
+}
+
+/// Group `merged` (already x-sorted) into collinear x-groups.
+fn group_by_x(merged: &[(f64, f64, f64)]) -> Vec<XGroup> {
+    let mut out: Vec<XGroup> = Vec::new();
+    for &(x, y0, y1) in merged {
+        match out
+            .iter_mut()
+            .find(|g| (g.x - x).abs() <= RULE_X_MERGE_TOL_PT)
+        {
+            Some(g) => g.segs.push((y0, y1)),
+            None => out.push(XGroup {
+                x,
+                segs: vec![(y0, y1)],
+            }),
+        }
+    }
+    out.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
 /// Derive every candidate frame on the page from the drawn vertical rules.
 pub(super) fn find_frames(lines: &[Vec<Span>], rules: &[(f64, f64, f64)]) -> Vec<Frame> {
     let merged = merge_verticals(rules);
@@ -111,6 +139,7 @@ pub(super) fn find_frames(lines: &[Vec<Span>], rules: &[(f64, f64, f64)]) -> Vec
                 .collect::<Vec<_>>()
         )
     });
+    let groups = group_by_x(&merged);
     let mut candidates: Vec<Frame> = Vec::new();
 
     for &(_, sy0, sy1) in &merged {
@@ -119,19 +148,40 @@ pub(super) fn find_frames(lines: &[Vec<Span>], rules: &[(f64, f64, f64)]) -> Vec
         if height < MIN_FRAME_HEIGHT_PT {
             continue;
         }
-        // A candidate column rule must span most of this seed's band and must
-        // not run far past it (a page border does).
+        // A candidate column can have its rule drawn in segments broken by a
+        // full-width row (a section title). Its *total* overlap with the seed
+        // band — not one contiguous run — decides membership, so a column that
+        // is empty in some rows still counts. The overshoot test uses only the
+        // segments that overlap this band, so a stacked table's other section
+        // does not annex it.
         let mut members: Vec<(f64, f64, f64)> = Vec::new();
-        for &r in &merged {
-            let overlap = (r.2.min(shi) - r.1.max(slo)).max(0.0);
+        for g in &groups {
+            let overlap: f64 = g
+                .segs
+                .iter()
+                .map(|&(a, b)| (b.min(shi) - a.max(slo)).max(0.0))
+                .sum();
             if overlap / height < MIN_RULE_BAND_COVERAGE {
                 continue;
             }
-            let overshoot = (slo - r.1).max(0.0) + (r.2 - shi).max(0.0);
+            let clip = g
+                .segs
+                .iter()
+                .filter(|&&(a, b)| b > slo && a < shi)
+                .fold(None, |acc: Option<(f64, f64)>, &(a, b)| {
+                    Some(match acc {
+                        Some((lo, hi)) => (lo.min(a), hi.max(b)),
+                        None => (a, b),
+                    })
+                });
+            let Some((glo, ghi)) = clip else {
+                continue;
+            };
+            let overshoot = (slo - glo).max(0.0) + (ghi - shi).max(0.0);
             if overshoot / height > MAX_OUTER_OVERSHOOT_FRAC {
                 continue;
             }
-            members.push(r);
+            members.push((g.x, glo, ghi));
         }
         if members.len() < MIN_FRAME_RULES {
             continue;
@@ -231,9 +281,14 @@ pub(super) fn find_frames(lines: &[Vec<Span>], rules: &[(f64, f64, f64)]) -> Vec
             continue;
         }
         let overlaps = chosen.iter().any(|f| {
+            // Only frames sharing horizontal space are the same region: two
+            // side-by-side frames (left table, right table) have overlapping
+            // bands but disjoint x-ranges and must both survive.
+            let x_overlap = f.boundaries[0] <= c.boundaries[c.ncols()]
+                && c.boundaries[0] <= f.boundaries[f.ncols()];
             let lo = f.lo.max(c.lo);
             let hi = f.hi.min(c.hi);
-            hi - lo > 0.5 * (f.hi - f.lo).min(c.hi - c.lo)
+            x_overlap && hi - lo > 0.5 * (f.hi - f.lo).min(c.hi - c.lo)
         });
         if overlaps {
             continue;

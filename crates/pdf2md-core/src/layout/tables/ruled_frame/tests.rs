@@ -1,4 +1,5 @@
     use super::*;
+    use crate::models::BoundingBox;
 
     fn sp_at(text: &str, x: f64, y: f64, advance: f64) -> Span {
         Span {
@@ -69,7 +70,7 @@
                 sp_at("4", 92.0, 50.0, 6.0),
             ],
         ];
-        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 3, 12.0, 110.0, 70.0, 50.0)], &frame_rules());
+        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 3, 12.0, 110.0, 70.0, 50.0)], &frame_rules(), &[]);
         assert_eq!(hits.len(), 1);
         let rows = table_of(&hits[0]);
         assert_eq!(rows[0], vec!["H1", "H2", "H3"]);
@@ -95,7 +96,7 @@
             vec![sp_at("note", 135.0, 45.0, 20.0)],
             vec![sp_at("b", 12.0, 20.0, 6.0), sp_at("3", 52.0, 20.0, 6.0), sp_at("4", 92.0, 20.0, 6.0)],
         ];
-        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 3, 3, 12.0, 110.0, 70.0, 20.0)], &frame_rules());
+        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 3, 3, 12.0, 110.0, 70.0, 20.0)], &frame_rules(), &[]);
         assert_eq!(hits.len(), 1, "the frame must survive the gap");
         let rows = table_of(&hits[0]);
         assert_eq!(rows.len(), 3, "rows after the gap were dropped: {rows:?}");
@@ -111,7 +112,7 @@
             vec![sp_at("x", 12.0, 70.0, 6.0), sp_at("1", 52.0, 70.0, 6.0), sp_at("2", 92.0, 70.0, 6.0)],
             vec![sp_at("y", 12.0, 50.0, 6.0), sp_at("3", 52.0, 50.0, 6.0), sp_at("4", 92.0, 50.0, 6.0)],
         ];
-        let hits = apply_ruled_frame_model(&lines, vec![seed(2, 3, 3, 12.0, 130.0, 70.0, 50.0)], &frame_rules());
+        let hits = apply_ruled_frame_model(&lines, vec![seed(2, 3, 3, 12.0, 130.0, 70.0, 50.0)], &frame_rules(), &[]);
         assert_eq!(hits.len(), 1);
         let rows = table_of(&hits[0]);
         assert_eq!(rows.len(), 3, "wrapped header must be one row: {rows:?}");
@@ -134,7 +135,7 @@
                 sp_at("333", 92.0, 70.0, 18.0),
             ],
         ];
-        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 1, 3, 12.0, 110.0, 70.0, 70.0)], &frame_rules());
+        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 1, 3, 12.0, 110.0, 70.0, 70.0)], &frame_rules(), &[]);
         assert_eq!(hits.len(), 1);
         let rows = table_of(&hits[0]);
         assert_eq!(rows[1], vec!["111", "222", "333"]);
@@ -151,7 +152,7 @@
             vec![sp_at("a", 12.0, 70.0, 6.0), sp_at("1", 52.0, 70.0, 6.0), sp_at("2", 92.0, 70.0, 6.0)],
             vec![sp_at("b", 12.0, 50.0, 6.0), sp_at("3", 52.0, 50.0, 6.0), sp_at("4", 92.0, 50.0, 6.0)],
         ];
-        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 3, 12.0, 110.0, 70.0, 50.0)], &rules);
+        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 3, 12.0, 110.0, 70.0, 50.0)], &rules, &[]);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].bbox.x1, 130.0, "page border adopted as the frame edge");
     }
@@ -169,7 +170,7 @@
             vec![sp_at("a", 2.0, 70.0, 6.0), sp_at("1", 52.0, 70.0, 6.0), sp_at("2", 92.0, 70.0, 6.0)],
             vec![sp_at("b", 2.0, 50.0, 6.0), sp_at("3", 52.0, 50.0, 6.0), sp_at("4", 92.0, 50.0, 6.0)],
         ];
-        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 4, 2.0, 110.0, 70.0, 50.0)], &rules);
+        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 4, 2.0, 110.0, 70.0, 50.0)], &rules, &[]);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].bbox.x0, 0.0, "page-border left edge not adopted");
         // The adopted edge adds the x=0..10 column, which holds "H1".
@@ -189,7 +190,7 @@
             vec![sp_at("a", 12.0, 70.0, 6.0), sp_at("1", 52.0, 70.0, 6.0), sp_at("2", 92.0, 70.0, 6.0)],
             vec![sp_at("b", 12.0, 50.0, 6.0), sp_at("3", 52.0, 50.0, 6.0), sp_at("4", 92.0, 50.0, 6.0)],
         ];
-        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 3, 12.0, 110.0, 70.0, 50.0)], &rules);
+        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 3, 12.0, 110.0, 70.0, 50.0)], &rules, &[]);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].bbox.x0, 10.0, "empty page-border column was adopted");
     }
@@ -202,7 +203,7 @@
             vec![sp_at("H1", 12.0, 90.0, 6.0), sp_at("H2", 72.0, 90.0, 6.0)],
             vec![sp_at("a", 12.0, 70.0, 6.0), sp_at("1", 72.0, 70.0, 6.0)],
         ];
-        let hits = apply_ruled_frame_model(&lines, Vec::new(), &rules);
+        let hits = apply_ruled_frame_model(&lines, Vec::new(), &rules, &[]);
         assert!(hits.is_empty(), "a two-column rule pair is not a frame");
     }
 
@@ -222,7 +223,7 @@
             ],
             bbox: BoundingBox::new(12.0, 70.0, 130.0, 50.0),
         };
-        let hits = apply_ruled_frame_model(&lines, vec![stale], &frame_rules());
+        let hits = apply_ruled_frame_model(&lines, vec![stale], &frame_rules(), &[]);
         assert_eq!(hits.len(), 1);
         assert!(hits[0].rows.iter().all(|r| !r.iter().any(|c| c.contains("stale"))));
     }
@@ -248,7 +249,7 @@
                 sp_at("4", 92.0, 50.0, 6.0),
             ],
         ];
-        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 3, 2.0, 110.0, 70.0, 50.0)], &frame_rules());
+        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 3, 2.0, 110.0, 70.0, 50.0)], &frame_rules(), &[]);
         assert_eq!(hits.len(), 1, "the prose-strip frame was refused");
         assert_eq!(hits[0].bbox.x0, 10.0, "frame left rule must bound the table");
         let rows = table_of(&hits[0]);
@@ -278,7 +279,7 @@
                 sp_at("4", 92.0, 50.0, 6.0),
             ],
         ];
-        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 3, 2.0, 110.0, 70.0, 50.0)], &frame_rules());
+        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 3, 2.0, 110.0, 70.0, 50.0)], &frame_rules(), &[]);
         assert_eq!(hits[0].bbox.x0, 2.0, "a numeric strip must not be cut away");
     }
 
@@ -309,6 +310,7 @@
                 seed(3, 3, 3, 12.0, 110.0, 10.0, 10.0),
             ],
             &rules,
+            &[],
         );
         assert_eq!(hits.len(), 2, "both stacked sections must be re-cut: {hits:?}");
     }
@@ -332,7 +334,7 @@
                 sp_at("4", 92.0, 50.0, 6.0),
             ],
         ];
-        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 3, 2.0, 110.0, 70.0, 50.0)], &frame_rules());
+        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 3, 2.0, 110.0, 70.0, 50.0)], &frame_rules(), &[]);
         assert_eq!(hits[0].bbox.x0, 2.0, "a numbered-label strip must not be cut away");
     }
 
@@ -356,12 +358,148 @@
             ],
         ];
         // Hit shows 4 columns; the frame offers 3 and covers the hit.
-        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 4, 10.0, 130.0, 70.0, 50.0)], &frame_rules());
+        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 4, 10.0, 130.0, 70.0, 50.0)], &frame_rules(), &[]);
         assert_eq!(hits.len(), 1);
         assert!(
             hits[0].rows.iter().all(|r| r.len() == 4),
             "a covered hit must not be re-cut to fewer columns: {:?}",
             hits[0].rows
+        );
+    }
+
+    /// Rules at every `x` in `xs` spanning `y0..y1`.
+    fn rules_at(xs: &[f64], y0: f64, y1: f64) -> Vec<(f64, f64, f64)> {
+        xs.iter().map(|&x| (x, y0, y1)).collect()
+    }
+
+    /// A grid column that is empty in every row must still be a column: the
+    /// drawn rules define the count, so no two real cells may fuse around it.
+    #[test]
+    fn sparse_grid_keeps_the_drawn_column_count() {
+        let rules = rules_at(&[0.0, 40.0, 80.0, 120.0, 160.0], 0.0, 100.0);
+        let lines = vec![
+            vec![
+                sp_at("H1", 5.0, 90.0, 6.0),
+                sp_at("H2", 45.0, 90.0, 6.0),
+                sp_at("H4", 125.0, 90.0, 6.0),
+            ],
+            vec![
+                sp_at("a", 5.0, 70.0, 6.0),
+                sp_at("1", 45.0, 70.0, 6.0),
+                sp_at("2", 125.0, 70.0, 6.0),
+            ],
+            vec![
+                sp_at("b", 5.0, 50.0, 6.0),
+                sp_at("3", 45.0, 50.0, 6.0),
+                sp_at("4", 125.0, 50.0, 6.0),
+            ],
+        ];
+        // The generic pass saw two columns; the drawn cell grid states four.
+        let rects: Vec<(f64, f64, f64, f64)> = (0..4)
+            .map(|c| (40.0 * c as f64, 0.0, 40.0 * c as f64 + 40.0, 100.0))
+            .collect();
+        let hits = apply_ruled_frame_model(
+            &lines,
+            vec![seed(1, 2, 2, 0.0, 160.0, 70.0, 50.0)],
+            &rules,
+            &rects,
+        );
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].rows.iter().all(|r| r.len() == 4),
+            "the empty drawn column collapsed: {:?}",
+            hits[0].rows
+        );
+        assert_eq!(hits[0].rows[0], vec!["H1", "H2", "", "H4"]);
+    }
+
+    /// A full-width section title line is one row of the ruled table, not a
+    /// reason to reject the frame; the sparse data rows below stay rows.
+    #[test]
+    fn section_title_rows_between_data_rows_survive() {
+        let rules = rules_at(&[0.0, 40.0, 80.0, 120.0], 0.0, 100.0);
+        let lines = vec![
+            vec![
+                sp_at("H1", 5.0, 90.0, 6.0),
+                sp_at("H2", 45.0, 90.0, 6.0),
+                sp_at("H3", 85.0, 90.0, 6.0),
+            ],
+            vec![sp_at("SECTION", 5.0, 75.0, 6.0)],
+            vec![
+                sp_at("a", 5.0, 60.0, 6.0),
+                sp_at("1", 45.0, 60.0, 6.0),
+                sp_at("2", 85.0, 60.0, 6.0),
+            ],
+            vec![
+                sp_at("b", 5.0, 40.0, 6.0),
+                sp_at("3", 45.0, 40.0, 6.0),
+                sp_at("4", 85.0, 40.0, 6.0),
+            ],
+        ];
+        let hits =
+            apply_ruled_frame_model(&lines, vec![seed(1, 3, 3, 0.0, 120.0, 75.0, 40.0)], &rules, &[]);
+        assert_eq!(hits.len(), 1, "the frame was rejected around a section row");
+        let rows = table_of(&hits[0]);
+        assert!(
+            rows.iter().any(|r| r.iter().any(|c| c.contains("SECTION"))),
+            "the section row was dropped: {rows:?}"
+        );
+        assert_eq!(hits[0].rows[0], vec!["H1", "H2", "H3"]);
+    }
+
+    /// A grid stated only by drawn cell rectangles (no long column rules) is
+    /// found from those stacked edges.
+    #[test]
+    fn cell_rectangles_supply_the_grid_rules() {
+        // Seven columns x four rows of adjoining cells.
+        let mut rects: Vec<(f64, f64, f64, f64)> = Vec::new();
+        for row in 0..4 {
+            let y0 = 25.0 * row as f64;
+            for col in 0..7 {
+                let x0 = 30.0 * col as f64;
+                rects.push((x0, y0, x0 + 30.0, y0 + 25.0));
+            }
+        }
+        let header: Vec<Span> = (0..7)
+            .map(|c| sp_at(&format!("H{c}"), 5.0 + 30.0 * c as f64, 90.0, 6.0))
+            .collect();
+        let data_row = |y: f64, base: usize| -> Vec<Span> {
+            (0..7)
+                .map(|c| sp_at(&format!("{}", base + c), 5.0 + 30.0 * c as f64, y, 6.0))
+                .collect()
+        };
+        let lines = vec![
+            header,
+            data_row(65.0, 10),
+            data_row(40.0, 20),
+            data_row(15.0, 30),
+        ];
+        let hits = apply_ruled_frame_model(&lines, Vec::new(), &[], &rects);
+        assert_eq!(hits.len(), 1, "the drawn cell rectangles did not form a frame");
+        assert!(hits[0].rows.iter().all(|r| r.len() == 7), "{:?}", hits[0].rows);
+    }
+
+    /// A box drawn around prose is not a table: a lone box has two vertical
+    /// edges and a three-column box is below the creation floor.
+    #[test]
+    fn a_box_around_prose_is_not_turned_into_a_table() {
+        let prose = vec![
+            vec![sp_at("one two three four", 5.0, 80.0, 60.0)],
+            vec![sp_at("five six seven eight", 5.0, 60.0, 60.0)],
+            vec![sp_at("nine ten eleven twelve", 5.0, 40.0, 60.0)],
+            vec![sp_at("thirteen fourteen fifteen", 5.0, 20.0, 60.0)],
+        ];
+        // A box: only its two edges.
+        let box_rules = rules_at(&[10.0, 130.0], 0.0, 100.0);
+        assert!(
+            apply_ruled_frame_model(&prose, Vec::new(), &box_rules, &[]).is_empty(),
+            "a lone box became a table"
+        );
+        // A three-column box is still below the creation floor (seven columns).
+        let three = rules_at(&[10.0, 50.0, 90.0, 130.0], 0.0, 100.0);
+        assert!(
+            apply_ruled_frame_model(&prose, Vec::new(), &three, &[]).is_empty(),
+            "a three-column prose box became a table"
         );
     }
 

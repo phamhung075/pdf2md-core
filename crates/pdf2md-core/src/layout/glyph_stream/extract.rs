@@ -13,6 +13,8 @@ struct GlyphPrefix {
     spans: Vec<Span>,
     underline_segs: Vec<(f64, f64, f64)>,
     vertical_segs: Vec<(f64, f64, f64)>,
+    /// Drawn axis-aligned cell rectangles (see [`GlyphWalk`]).
+    cell_rects: Vec<(f64, f64, f64, f64)>,
     vertical_up_chars: usize,
     vertical_down_chars: usize,
     page_height: f64,
@@ -61,6 +63,7 @@ fn extract_glyph_prefix(doc: &Document, page_id: ObjectId) -> Result<GlyphPrefix
         spans,
         underline_segs,
         vertical_segs,
+        cell_rects,
         vertical_up_chars,
         vertical_down_chars,
     } = walk;
@@ -68,6 +71,7 @@ fn extract_glyph_prefix(doc: &Document, page_id: ObjectId) -> Result<GlyphPrefix
         spans,
         underline_segs,
         vertical_segs,
+        cell_rects,
         vertical_up_chars,
         vertical_down_chars,
         page_height,
@@ -127,6 +131,7 @@ pub fn extract_page_glyphs(
         mut spans,
         underline_segs,
         vertical_segs,
+        cell_rects,
         vertical_up_chars,
         vertical_down_chars,
         mut page_height,
@@ -303,7 +308,7 @@ pub fn extract_page_glyphs(
     // the grid, carries rows across an empty ruled gap to the frame bottom, and
     // joins a multi-line header cell instead of emitting it as headings.
     let hits = if detect_tables {
-        crate::layout::tables::apply_ruled_frame_model(&lines, hits, &vertical_segs)
+        crate::layout::tables::apply_ruled_frame_model(&lines, hits, &vertical_segs, &cell_rects)
     } else {
         hits
     };

@@ -22,6 +22,11 @@ pub use ledger::{apply_ledger_model, apply_ledger_model_with_rules};
 pub use ruled_frame::apply_ruled_frame_model;
 pub use rulers::{find_gap_tables, find_tables, scan_aligned_grids, table_rulers, RowInfo, TableHit, WordTok};
 
+mod groups;
+use groups::{group_tables, spans_outside_active};
+#[cfg(test)]
+use groups::de_overlap_tables;
+
 use crate::layout::glyph_stream::Span;
 use crate::layout::reading_order::{
     body_size_for, detect_column_bands, is_bare_page_number_line, push_band_lines, ListRunState,
@@ -39,48 +44,6 @@ const SIDE_CONTINUATION_PITCH_MULT: f64 = 3.0;
 /// beside individual rows keeps the original order.
 const MIN_SIDEBAR_LINES: usize = 5;
 
-/// Collapse duplicate / overlapping table candidates for a page into a
-/// non-overlapping, line-disjoint list sorted by `start`.
-///
-/// `find_tables` ∪ `find_gap_tables` are produced independently and are only
-/// sorted by `start`; nothing de-overlaps them. Nested, partially-overlapping,
-/// or same-start hits therefore stall the render loop (it advances `i` past the
-/// first table's `end` but never advances `t`), silently dropping **every**
-/// remaining table on that page as plain text. Keep a hit only when its `start`
-/// is at or beyond the first line not already claimed by a kept table, so each
-/// underlying region is emitted (as a GFM table) at most once.
-fn de_overlap_tables(tables: &[TableHit]) -> Vec<TableHit> {
-    let mut sorted: Vec<TableHit> = tables.to_vec();
-    sorted.sort_by(|a, b| a.start.cmp(&b.start).then(a.end.cmp(&b.end)));
-    let mut out: Vec<TableHit> = Vec::new();
-    let mut covered = 0usize;
-    for h in sorted {
-        if h.start >= covered {
-            let end = h.end;
-            out.push(h);
-            covered = end + 1;
-        }
-    }
-    out
-}
-
-/// Spans of `line` that lie outside the horizontal band `[x0, x1]` a table
-/// occupies. Used to recover a neighboring column's content when it shares
-/// visual lines with a side table (a narrow parameter/score table in the page
-/// margin beside the main text column): the table's lines are skipped when it
-/// is spliced, so everything outside its own x-band must still be rendered.
-fn spans_outside(line: &[Span], x0: f64, x1: f64) -> Vec<Span> {
-    line.iter()
-        .filter(|s| {
-            let end = s.x + s.advance;
-            // A span overlapping the table's x-band is table content; a span
-            // ending before x0 or starting after x1 belongs to the neighbor.
-            !(s.x < x1 - 0.5 && end > x0 + 0.5)
-        })
-        .cloned()
-        .collect()
-}
-
 /// Render a page's visual lines to text, replacing detected table blocks with
 /// GFM pipe tables. Non-table lines use the exact same rules as `render_cluster`.
 ///
@@ -95,7 +58,7 @@ pub fn render_with_tables(
 ) -> String {
     let mut out = String::new();
     let mut prev_line_y: Option<f64> = None;
-    let tables = de_overlap_tables(tables);
+    let groups = group_tables(tables);
     let mut t = 0usize;
     let body_size = body_size_for(lines);
     let is_footer = |l: &Vec<Span>| is_bare_page_number_line(l, page_height, body_size);
@@ -103,21 +66,29 @@ pub fn render_with_tables(
 
     let mut i = 0usize;
     while i < lines.len() {
-        // Advance past any table whose region has already been consumed (e.g. a
-        // nested/overlapping candidate de-overlapped above, or a table that a
+        // Advance past any group whose region has already been consumed (e.g. a
+        // nested/overlapping candidate de-overlapped above, or a group that a
         // previous atomic emission jumped beyond).
-        while t < tables.len() && tables[t].start < i && tables[t].end < i {
+        while t < groups.len() && groups[t].start < i && groups[t].end < i {
             t += 1;
         }
         // A table block starting exactly at this line: emit GFM instead of
         // the plain rows.
-        if t < tables.len() && tables[t].start == i {
-            let hit = &tables[t];
-            if hit.end >= lines.len() {
+        if t < groups.len() && groups[t].start == i {
+            let group = &groups[t];
+            if group.end >= lines.len() {
                 // Defensive: never index past the last line.
                 t += 1;
                 continue;
             }
+            // Emit left to right. A side-by-side pair shares visual lines; the
+            // group is emitted at the leftmost member's start.
+            let mut active: Vec<&TableHit> = group.hits.iter().collect();
+            active.sort_by(|a, b| {
+                a.bbox.x0
+                    .partial_cmp(&b.bbox.x0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             // A side table shares its visual lines with a neighboring column's
             // prose. When that neighbor runs beside the table's own first line
             // (a genuine side-by-side layout) it continues the prose above the
@@ -125,9 +96,8 @@ pub fn render_with_tables(
             // *below* the table's top — a sidebar to the right whose first box
             // starts a few rows down — the table must be emitted first, at its
             // frame's position, or it is pushed below the sidebar.
-            let side_content: Vec<Vec<Span>> = lines[i..=hit.end]
-                .iter()
-                .map(|l| spans_outside(l, hit.bbox.x0, hit.bbox.x1))
+            let side_content: Vec<Vec<Span>> = (i..=group.end)
+                .map(|li| spans_outside_active(&lines[li], li, &active))
                 .map(|l| if is_footer(&l) { Vec::new() } else { l })
                 .collect();
             // Neighboring content that begins on or just below the table's first
@@ -168,7 +138,7 @@ pub fn render_with_tables(
                     push_band_lines(out, &bands, prev_line_y, list_state, body_size, page_width);
                 }
             };
-            let emit_table = |out: &mut String| {
+            let emit_table = |out: &mut String, hit: &TableHit| {
                 // Blank line before the table (markdown block separation).
                 if !out.is_empty() && !out.ends_with("\n\n") {
                     out.push('\n');
@@ -182,18 +152,22 @@ pub fn render_with_tables(
             };
             if side_first {
                 emit_side(&mut out, &mut prev_line_y, &mut list_state);
-                emit_table(&mut out);
-                prev_line_y = Some(lines[hit.end][0].y);
+                for hit in &active {
+                    emit_table(&mut out, hit);
+                }
+                prev_line_y = Some(lines[group.end][0].y);
             } else {
-                emit_table(&mut out);
+                for hit in &active {
+                    emit_table(&mut out, hit);
+                }
                 emit_side(&mut out, &mut prev_line_y, &mut list_state);
                 // A sidebar emitted after the table is a separate block: the
                 // prose that follows must not join onto its last line.
-                prev_line_y = if had_side { None } else { Some(lines[hit.end][0].y) };
+                prev_line_y = if had_side { None } else { Some(lines[group.end][0].y) };
             }
             list_state = ListRunState::default(); // a table interrupts any list run
             t += 1;
-            i = hit.end + 1; // skip the table's own lines
+            i = group.end + 1; // skip the table's own lines
             continue;
         }
         // Recover column reading order for the contiguous run of non-table
@@ -202,8 +176,8 @@ pub fn render_with_tables(
         // small table (e.g. a 2-cell reference block) while its surrounding
         // header/footer still uses a two-column seller/buyer style layout
         // that a naive top-to-bottom walk would weave together.
-        let seg_end = if t < tables.len() {
-            tables[t].start.min(lines.len())
+        let seg_end = if t < groups.len() {
+            groups[t].start.min(lines.len())
         } else {
             lines.len()
         };
@@ -423,5 +397,35 @@ mod tests {
         let prose = md.find("left line 0").expect("side prose lost");
         let table = md.find("| c0").expect("table lost");
         assert!(prose < table, "side prose must be emitted before the table:\n{md}");
+    }
+
+    /// Two side-by-side frames share visual lines but occupy disjoint x-ranges:
+    /// both must be emitted, left one first, instead of one collapsing the
+    /// other by line overlap.
+    #[test]
+    fn render_with_tables_emits_side_by_side_frames_left_first() {
+        let lines = vec![
+            line("r0", 800.0),
+            line("r1", 780.0),
+            line("r2", 760.0),
+            line("r3", 740.0),
+        ];
+        let left = TableHit {
+            start: 0,
+            end: 2,
+            rows: vec![vec!["LEFT".to_string()]],
+            bbox: BoundingBox::new(10.0, 700.0, 200.0, 810.0),
+        };
+        let right = TableHit {
+            start: 1,
+            end: 3,
+            rows: vec![vec!["RIGHT".to_string()]],
+            bbox: BoundingBox::new(300.0, 700.0, 500.0, 810.0),
+        };
+        let md = render_with_tables(&lines, &[left, right], 792.0, None);
+        assert_eq!(table_blocks(&md), 2, "a side-by-side pair must emit both tables:\n{md}");
+        let l = md.find("LEFT").expect("left table lost");
+        let r = md.find("RIGHT").expect("right table lost");
+        assert!(l < r, "the left frame must be emitted first:\n{md}");
     }
 }

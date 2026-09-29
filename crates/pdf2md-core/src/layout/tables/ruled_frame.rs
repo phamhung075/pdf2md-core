@@ -26,18 +26,20 @@
 //! full-page extent cannot annex rows below the table.
 
 mod detect;
+mod model;
 mod rows;
 mod strip;
+use model::{build_frame_table, frame_is_cell_grid, hit_folds_values_only, is_grid_frame};
 use detect::find_frames;
-use rows::{build_row, is_header_like, populated};
+use rows::build_row;
 use strip::{classify_excluded_strip, StripKind};
 
 use super::rulers::{line_words, TableHit};
 use crate::layout::glyph_stream::Span;
-use crate::models::{BoundingBox, CELL_LINE_BREAK, CELL_LINE_BREAK_PENDING};
+use crate::models::{CELL_LINE_BREAK, CELL_LINE_BREAK_PENDING};
 
 /// Maximum leading lines joined into the header band.
-const MAX_HEADER_LINES: usize = 2;
+const MAX_HEADER_LINES: usize = 3;
 /// A leading line must sit within this many text sizes of the line below it to
 /// belong to the same header band (the same 2.2×size pitch the ruler scanner
 /// uses for an adjacent row).
@@ -69,6 +71,17 @@ const FRAME_MIN_WIDTH_FRAC_PROSE: f64 = 0.6;
 /// A frame wider than this many columns is a dense layout grid, not the
 /// header-bounded table this model targets.
 const MAX_FRAME_COLS: usize = 12;
+/// A frame that no generic hit covers may still build its own table, but only
+/// when it is a substantial grid: at least this many columns. Narrow frames are
+/// deliberately excluded — a producer drawing a box around a few columns of
+/// prose would otherwise be turned into a table, and every ordinary table is
+/// already found by the generic passes, so creation is needed only for the wide
+/// drawn grids (section tables, multi-column forms).
+const MIN_GRID_COLS: usize = 7;
+/// ... at least this many in-band lines ...
+const MIN_GRID_ROWS: usize = 4;
+/// ... and at least this many body rows that populate two columns.
+const MIN_GRID_TABULAR_ROWS: usize = 3;
 
 /// Diagnostic tracer: prints when TABLE_TRACE env is set (same switch as the
 /// ruler scanner's trace). The message is built lazily so an untraced run pays
@@ -93,146 +106,10 @@ impl Frame {
     }
 }
 
-/// Build one table from a frame, or `None` when the frame carries no table.
-///
-/// The frame's own band and outer rules bound the table: every line inside the
-/// band contributes only the words between the outer rules, so a prose column
-/// or a sidebar outside them is not table content and is recovered by the
-/// renderer's `spans_outside`. A line above the hit's own start is included when
-/// it carries in-frame words, which is how a header row that the generic pass
-/// left out is annexed as the header rather than emitted as loose headings.
-fn build_frame_table(lines: &[Vec<Span>], frame: &Frame, _hit: &TableHit) -> Option<TableHit> {
-    let ncols = frame.ncols();
-    let boundaries = &frame.boundaries;
-
-    // Every in-band line carrying an in-frame word.
-    let mut data: Vec<(usize, Vec<String>)> = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        if line.is_empty() {
-            continue;
-        }
-        let y = line[0].y;
-        if !(frame.lo..=frame.hi).contains(&y) {
-            continue;
-        }
-        let row = build_row(&line_words(line), boundaries);
-        if row.iter().all(|c| c.trim().is_empty()) {
-            continue;
-        }
-        data.push((i, row));
-    }
-    if data.is_empty() {
-        t(|| "reject: no data rows".to_string());
-        return None;
-    }
-
-    // The header band is the leading run of label-like lines. It may sit inside
-    // the band (a header row below the top rule) or, when the top rule runs
-    // under the header, immediately above it; join either into one row so a
-    // multi-line header cell is not emitted as headings or as data.
-    let mut header: Vec<(usize, Vec<String>)> = Vec::new();
-    let mut body_start = 0;
-    while body_start < data.len() && header.len() < MAX_HEADER_LINES {
-        if !is_header_like(&data[body_start].1) {
-            break;
-        }
-        header.push(data[body_start].clone());
-        body_start += 1;
-    }
-    if header.is_empty() {
-        if let Some(&(first, _)) = data.first() {
-            let mut prev_y = lines[first][0].y;
-            let mut j = first;
-            while header.len() < MAX_HEADER_LINES && j > 0 {
-                j -= 1;
-                let line = &lines[j];
-                if line.is_empty() {
-                    break;
-                }
-                let y = line[0].y;
-                let size = line.iter().map(|s| s.size).fold(0.0, f64::max).max(1.0);
-                let gap = y - prev_y;
-                if !(gap > 0.0 && gap <= HEADER_GAP_SIZE_MULT * size) {
-                    break;
-                }
-                let row = build_row(&line_words(line), boundaries);
-                if !is_header_like(&row) {
-                    break;
-                }
-                header.push((j, row));
-                prev_y = y;
-            }
-            header.reverse();
-        }
-    }
-
-    let body: &[(usize, Vec<String>)] = &data[body_start..];
-    if body.len() < MIN_BODY_ROWS {
-        t(|| "reject: header consumed every row".to_string());
-        return None;
-    }
-    // A real table is at least a header plus a body, or two data rows.
-    if header.len() + body.len() < MIN_FRAME_ROWS {
-        t(|| "reject: single-row table".to_string());
-        return None;
-    }
-    let tabular = body.iter().filter(|(_, r)| populated(r) >= 2).count();
-    if tabular < MIN_TABULAR_ROWS {
-        t(|| format!("reject: tabular={tabular}"));
-        return None;
-    }
-
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    if header.is_empty() {
-        rows.extend(body.iter().map(|(_, r)| r.clone()));
-    } else {
-        let mut joined = vec![String::new(); ncols];
-        for (_, row) in &header {
-            for (c, cell) in row.iter().enumerate() {
-                if cell.trim().is_empty() {
-                    continue;
-                }
-                if !joined[c].is_empty() {
-                    joined[c].push(CELL_LINE_BREAK_PENDING);
-                }
-                joined[c].push_str(cell);
-            }
-        }
-        rows.push(joined);
-        rows.extend(body.iter().map(|(_, r)| r.clone()));
-    }
-
-    let start = header
-        .iter()
-        .map(|(i, _)| *i)
-        .min()
-        .unwrap_or_else(|| body[0].0);
-    let end = body.last()?.0;
-
-    // bbox spans the frame's own x-range and the included lines' y-range.
-    let (mut y0, mut y1) = (f64::INFINITY, f64::NEG_INFINITY);
-    for line in &lines[start..=end] {
-        for sp in line {
-            y0 = y0.min(sp.y);
-            y1 = y1.max(sp.y);
-        }
-    }
-    if !y0.is_finite() {
-        return None;
-    }
-    t(|| {
-        format!(
-            "frame start={start} end={end} rows={} body_start={body_start} hdr={}",
-            rows.len(),
-            header.len()
-        )
-    });
-    Some(TableHit {
-        start,
-        end,
-        rows,
-        bbox: BoundingBox::new(boundaries[0], y0, boundaries[ncols], y1),
-    })
+/// Largest font size on a visual line (>= 1.0), used to judge whether two
+/// words are separated by a word space or by a column gutter.
+fn line_size(line: &[Span]) -> f64 {
+    line.iter().map(|s| s.size).fold(0.0, f64::max).max(1.0)
 }
 
 /// The y-band covered by a hit's own lines.
@@ -339,7 +216,7 @@ fn hit_folds_lines(lines: &[Vec<Span>], frame: &Frame, hit: &TableHit) -> bool {
         if line.is_empty() {
             continue;
         }
-        let row = build_row(&line_words(line), &frame.boundaries);
+        let row = build_row(&line_words(line), line_size(line), &frame.boundaries);
         if row.iter().any(|c| !c.trim().is_empty()) {
             visual_lines += 1;
         }
@@ -347,87 +224,160 @@ fn hit_folds_lines(lines: &[Vec<Span>], frame: &Frame, hit: &TableHit) -> bool {
     hit.rows.len() < visual_lines
 }
 
+/// Is each frame one of a side-by-side pair (overlapping band, disjoint x)?
+/// A sibling is what lets a wide generic fragment "cover" a half-grid: the two
+/// drawn grids each rebuild one half. A lone long-rule frame that merely spans
+/// stacked statement fragments has no sibling and must not re-columnize them.
+fn side_by_side_flags(frames: &[Frame]) -> Vec<bool> {
+    frames
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            frames.iter().enumerate().any(|(j, g)| {
+                if i == j {
+                    return false;
+                }
+                let band_overlap = f.lo <= g.hi && g.lo <= f.hi;
+                let x_disjoint = f.boundaries[0] >= g.boundaries[g.ncols()] - EDGE_EPS_PT
+                    || g.boundaries[0] >= f.boundaries[f.ncols()] - EDGE_EPS_PT;
+                band_overlap && x_disjoint
+            })
+        })
+        .collect()
+}
+
 /// Rebuild each drawn-rule frame that genuinely encloses an existing generic
 /// hit, replacing that hit with the rule-column table. A frame that covers no
-/// hit is left alone: this pass refines a table the geometry already found, it
-/// never turns prose into a table.
+/// hit is left alone unless it is a substantial grid (see `is_grid_frame`).
 ///
-/// The frame is only *re-cut* (same column count as the hit): the drawn rules
-/// then fix the boundaries, exclude a sidebar past the right rule, extend the
-/// rows across an empty ruled gap, and join a header the text-ruler pass left
-/// above the grid. A frame with more columns than the hit would be a
-/// re-columnization of the whole page region, which on multi-column statements
-/// annexes a neighbouring box and drops real rows; that broader re-columnization
-/// is deliberately out of scope here.
+/// The drawn rules fix the boundaries, exclude a sidebar past the right rule,
+/// extend the rows across an empty ruled gap, and join a header the text-ruler
+/// pass left above the grid. A frame with more columns than the hit is a
+/// re-columnization: it is allowed for a dense cell grid and for one half of a
+/// side-by-side pair, but refused for a lone long-rule frame over stacked
+/// statement fragments (which would annex neighbouring boxes and rows).
 pub fn apply_ruled_frame_model(
     lines: &[Vec<Span>],
     hits: Vec<TableHit>,
     vertical_rules: &[(f64, f64, f64)],
+    cell_rects: &[(f64, f64, f64, f64)],
 ) -> Vec<TableHit> {
-    let frames = find_frames(lines, vertical_rules);
+    // A grid whose producer draws every cell as its own bordered rectangle
+    // states its columns through those stacked edges. They are folded into the
+    // rule set here; a lone box contributes two short edges that cannot seed or
+    // join a frame (see `find_frames`'s length/coverage gates).
+    let mut rules: Vec<(f64, f64, f64)> = vertical_rules.to_vec();
+    for &(x0, y0, x1, y1) in cell_rects {
+        rules.push((x0, y0, y1));
+        rules.push((x1, y0, y1));
+    }
+    let frames = find_frames(lines, &rules);
     if frames.is_empty() {
         return hits;
     }
+    let side_by_side = side_by_side_flags(&frames);
+    t(|| {
+        format!(
+            "hits_in={:?}",
+            hits.iter()
+                .map(|h| (
+                    h.start,
+                    h.end,
+                    hit_ncols(h),
+                    h.bbox.x0.round(),
+                    h.bbox.x1.round(),
+                    h.bbox.y0.round(),
+                    h.bbox.y1.round()
+                ))
+                .collect::<Vec<_>>()
+        )
+    });
     let mut out: Vec<TableHit> = hits.clone();
     let mut added: Vec<TableHit> = Vec::new();
-    for frame in &frames {
+    for (fi, frame) in frames.iter().enumerate() {
         if frame.ncols() > MAX_FRAME_COLS {
             continue;
         }
         let covered: Vec<&TableHit> = hits.iter().filter(|h| frame_covers_hit(lines, frame, h)).collect();
-        // Exactly one existing table must be enclosed. A frame that would span
-        // or merge several separate grids (a multi-column statement page, a
-        // dense layout) is a false positive: re-columnizing it annexes
-        // neighbouring boxes and drops real rows.
-        //
-        // The frame's own rules fix the column count. A frame with *more*
-        // columns than the hit would re-columnize the region and is refused. A
-        // frame with *fewer* is allowed only when the excluded strip is a
-        // genuine prose column (which is not part of the table); an empty strip
-        // means the frame covers the hit, so dropping a column would merge real
-        // cells — the previous (generic) table is kept instead.
-        let same_cols = covered.len() == 1 && hit_ncols(covered[0]) == frame.ncols();
-        let prose_shrink = covered.len() == 1
-            && frame.ncols() < hit_ncols(covered[0])
-            && classify_excluded_strip(lines, frame) == StripKind::Prose;
-        if !same_cols && !prose_shrink {
-            t(|| format!(
-                "skip: frame {}cols covered={} hit_ncols={:?}",
-                frame.ncols(),
-                covered.len(),
-                covered.first().map(|h| hit_ncols(h))
-            ));
-            continue;
+        // The drawn rules are the authority on columns.
+        //  * Exactly one covered hit: re-cut that region. More columns than the
+        //    generic word-gap clustering found is the whole point; the same count
+        //    is a straight re-cut. Fewer columns is allowed only when the
+        //    excluded strip is a genuine prose column — an excluded value/label
+        //    strip would merge real cells, so the generic table is kept.
+        //  * Several covered hits: the generic pass split one drawn grid along
+        //    word gaps, so each frame rebuilds its own half (side by side).
+        //  * None: only a substantial grid builds a table on its own, never a
+        //    box or a prose strip.
+        let (fx0, fx1) = (frame.boundaries[0], frame.boundaries[frame.ncols()]);
+        if covered.is_empty() {
+            if !is_grid_frame(lines, frame) {
+                t(|| format!("skip: frame {}cols covered=0", frame.ncols()));
+                continue;
+            }
+        } else {
+            // A frame with fewer columns than the widest hit it covers may only
+            // shrink when the excluded strip is a genuine prose column; an
+            // excluded value/label strip would merge real cells.
+            let widest = covered.iter().map(|h| hit_ncols(h)).max().unwrap_or(0);
+            if frame.ncols() < widest && classify_excluded_strip(lines, frame) != StripKind::Prose {
+                t(|| format!("skip: frame {}cols fewer than hit {widest}", frame.ncols()));
+                continue;
+            }
+            // A frame with *more* columns than every hit it covers re-states the
+            // columns of the whole region. That is the intended fix only for a
+            // grid whose producer boxes each cell (a dense cell grid, where the
+            // generic pass folded values of different drawn columns together);
+            // a long-rule frame that merely crosses several stacked statement
+            // fragments must keep the generic/ledger row structure, or every
+            // continuation line becomes its own row (F0402) and repeated headers
+            // are annexed into the body (F0058).
+            if frame.ncols() > widest
+                && !frame_is_cell_grid(frame, cell_rects)
+                && !side_by_side[fi]
+            {
+                t(|| format!("skip: frame {}cols wider than hit {widest} (not a cell grid)", frame.ncols()));
+                continue;
+            }
+            // A table the generic pass already folded (wrapped description
+            // cells) keeps its row structure; the line-per-row re-cut would
+            // split every continuation into its own row. The one exception is a
+            // dense drawn cell grid whose columns are *more numerous* than a
+            // hit's and whose fold joins bare values: there the generic pass
+            // folded values of different drawn columns into one cell, and the
+            // drawn rules must override it. A prose fold always keeps the guard.
+            let folds = covered.iter().any(|h| {
+                let value_override = frame_is_cell_grid(frame, cell_rects)
+                    && frame.ncols() > hit_ncols(h)
+                    && hit_folds_values_only(h);
+                !value_override && hit_folds_lines(lines, frame, h)
+            });
+            if folds {
+                t(|| "skip: hit folds lines".to_string());
+                continue;
+            }
         }
-        // A table the generic pass already folded (wrapped description cells)
-        // keeps its row structure; the line-per-row re-cut would split every
-        // continuation into its own row.
-        if hit_folds_lines(lines, frame, covered[0]) {
-            t(|| "skip: hit folds lines".to_string());
-            continue;
-        }
-        let Some(hit) = build_frame_table(lines, frame, covered[0]) else {
+        let Some(hit) = build_frame_table(lines, frame) else {
             t(|| "skip: build_frame_table returned None".to_string());
             continue;
         };
-        // A re-cut must not start below the hit it replaces: the hit's leading
-        // lines (its header row) would then fall outside the new table's line
-        // range and be emitted as loose headings. Its trailing rows must stay
-        // inside too. Otherwise the previous table is kept.
-        if hit.start > covered[0].start || hit.end < covered[0].end {
-            t(|| "skip: re-cut would drop the hit's leading/trailing rows".to_string());
-            continue;
+        // A single re-cut must not start below the hit it replaces (its header
+        // would fall outside the new range) or end above it.
+        if covered.len() == 1 {
+            let h = covered[0];
+            if hit.start > h.start || hit.end < h.end {
+                t(|| "skip: re-cut would drop the hit's leading/trailing rows".to_string());
+                continue;
+            }
         }
-        // The rebuilt region must not overlap any other hit: replacing it would
-        // delete that neighbour's table boundary without folding its rows in.
-        let touching = hits
-            .iter()
-            .filter(|h| h.start <= hit.end && h.end >= hit.start)
-            .count();
-        if touching != 1 {
-            continue;
-        }
-        out.retain(|h| h.end < hit.start || h.start > hit.end);
+        // The frame supersedes every generic fragment whose lines and x-band it
+        // overlaps: keeping one would double a region the drawn rules already
+        // rebuilt (and `group_tables` would then drop one arbitrarily).
+        out.retain(|h| {
+            let x_overlap = h.bbox.x0 < fx1 - EDGE_EPS_PT && h.bbox.x1 > fx0 + EDGE_EPS_PT;
+            let line_overlap = h.start <= hit.end && h.end >= hit.start;
+            !(x_overlap && line_overlap)
+        });
         added.push(hit);
     }
     out.extend(added);
