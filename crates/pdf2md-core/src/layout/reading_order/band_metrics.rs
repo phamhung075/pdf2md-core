@@ -6,6 +6,11 @@
 
 use super::*;
 
+/// Whether a span carries no visible ink (empty or whitespace-only).
+pub(super) fn is_blank_span(s: &Span) -> bool {
+    s.text.chars().all(|c| c == ' ')
+}
+
 /// Median gutter x (midpoint between left/right content) of the `Split`
 /// rows accumulated so far in an in-progress column run, or `None` before
 /// the run has any confirmed split.

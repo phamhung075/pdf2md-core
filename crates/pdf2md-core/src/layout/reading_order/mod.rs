@@ -16,6 +16,8 @@ mod band_metrics;
 use band_metrics::*;
 mod bands;
 pub use bands::*;
+mod band_repair;
+use band_repair::*;
 mod staggered;
 use staggered::*;
 mod zones;
@@ -192,3 +194,6 @@ mod structural_tests_part2;
 
 #[cfg(test)]
 mod zone_tests;
+
+#[cfg(test)]
+mod band_repair_tests;

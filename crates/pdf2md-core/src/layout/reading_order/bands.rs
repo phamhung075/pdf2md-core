@@ -264,6 +264,13 @@ pub(super) fn detect_column_bands_opts(lines: &[Vec<Span>], allow_stacks: bool) 
             ColumnBand::Full(rows) => project_full_band(rows, allow_stacks, &mut out, 0),
         }
     }
+    if allow_stacks {
+        // The row-local running-gutter pass can confirm a column run but not
+        // stitch it to the next one; `repair_column_bands` re-joins the pieces
+        // it left woven. The table scanner (`allow_stacks == false`) bands the
+        // page's own geometry and must not have its rows resequenced here.
+        out = repair_column_bands(out);
+    }
     out
 }
 
