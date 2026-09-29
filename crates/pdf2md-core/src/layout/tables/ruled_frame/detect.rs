@@ -13,6 +13,12 @@ use crate::layout::tables::rulers::line_words;
 /// Two collinear vertical rules closer than this are one separator drawn in
 /// pieces.
 const RULE_X_MERGE_TOL_PT: f64 = 2.0;
+/// Two collinear rules separated by a vertical gap larger than this are *not*
+/// one separator: they belong to two stacked tables that share the same column
+/// x-positions (two sections of the same statement). The union would otherwise
+/// form one tall frame spanning the prose between them. A rule drawn in pieces
+/// keeps sub-point gaps at the row joins, far below this floor.
+const RULE_Y_MERGE_MAX_GAP_PT: f64 = 3.0;
 /// A frame's column rule must overlap at least this fraction of the band to
 /// count as one of its separators.
 const MIN_RULE_BAND_COVERAGE: f64 = 0.6;
@@ -25,9 +31,15 @@ const MIN_FRAME_HEIGHT_PT: f64 = 24.0;
 /// it is page furniture (the page border) rather than the frame edge.
 const MAX_OUTER_OVERSHOOT_FRAC: f64 = 0.35;
 
-/// Merge collinear vertical rules (same x within [`RULE_X_MERGE_TOL_PT`]) into
-/// one separator whose y-extent is their union. Returns `(x, ylo, yhi)` sorted
-/// by x.
+/// White gap between two collinear rules' y-extents (0 when they touch or
+/// overlap).
+fn vertical_gap(a0: f64, a1: f64, b0: f64, b1: f64) -> f64 {
+    (b0 - a1).max(a0 - b1).max(0.0)
+}
+
+/// Merge collinear vertical rules (same x within [`RULE_X_MERGE_TOL_PT`], y
+/// extents no more than [`RULE_Y_MERGE_MAX_GAP_PT`] apart) into one separator
+/// whose y-extent is their union. Returns `(x, ylo, yhi)` sorted by x.
 fn merge_verticals(rules: &[(f64, f64, f64)]) -> Vec<(f64, f64, f64)> {
     let mut sorted: Vec<(f64, f64, f64)> = rules
         .iter()
@@ -38,17 +50,35 @@ fn merge_verticals(rules: &[(f64, f64, f64)]) -> Vec<(f64, f64, f64)> {
 
     let mut out: Vec<(f64, f64, f64)> = Vec::new();
     for (x, y0, y1) in sorted {
-        match out.last_mut() {
-            Some(last) if (x - last.0).abs() <= RULE_X_MERGE_TOL_PT => {
+        // Merge into the nearest existing separator that is collinear in x and
+        // overlaps or nearly touches in y. Picking the *nearest* x (not just the
+        // last one) keeps two stacked tables' same-x rules separate while still
+        // fusing the two sides of a double-stroked rule.
+        let mut best: Option<usize> = None;
+        let mut best_dx = f64::INFINITY;
+        for (i, &(gx, g0, g1)) in out.iter().enumerate() {
+            let dx = (x - gx).abs();
+            if dx <= RULE_X_MERGE_TOL_PT
+                && vertical_gap(g0, g1, y0, y1) <= RULE_Y_MERGE_MAX_GAP_PT
+                && dx < best_dx
+            {
+                best_dx = dx;
+                best = Some(i);
+            }
+        }
+        match best {
+            Some(i) => {
+                let g = &mut out[i];
                 // Keep a running mean x so a chain of near-collinear pieces
                 // does not drift onto the next separator.
-                last.0 = 0.5 * (last.0 + x);
-                last.1 = last.1.min(y0);
-                last.2 = last.2.max(y1);
+                g.0 = 0.5 * (g.0 + x);
+                g.1 = g.1.min(y0);
+                g.2 = g.2.max(y1);
             }
-            _ => out.push((x, y0, y1)),
+            None => out.push((x, y0, y1)),
         }
     }
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     out
 }
 
@@ -184,12 +214,18 @@ pub(super) fn find_frames(lines: &[Vec<Span>], rules: &[(f64, f64, f64)]) -> Vec
     });
     let mut chosen: Vec<Frame> = Vec::new();
     for c in candidates {
+        // Same rules and an overlapping band is the same frame seen from another
+        // seed. Same rules with *disjoint* bands are two stacked tables that
+        // share their column x-positions (two statement sections): both are
+        // real and must be kept, or one section's table is never re-cut.
         let dup = chosen.iter().any(|f| {
             f.boundaries.len() == c.boundaries.len()
                 && f.boundaries
                     .iter()
                     .zip(&c.boundaries)
                     .all(|(a, b)| (a - b).abs() <= RULE_X_MERGE_TOL_PT)
+                && c.lo <= f.hi
+                && c.hi >= f.lo
         });
         if dup {
             continue;

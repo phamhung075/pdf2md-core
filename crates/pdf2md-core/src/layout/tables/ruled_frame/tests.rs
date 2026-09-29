@@ -226,3 +226,142 @@
         assert_eq!(hits.len(), 1);
         assert!(hits[0].rows.iter().all(|r| !r.iter().any(|c| c.contains("stale"))));
     }
+
+    /// A prose column left of the frame shares the frame's rows. The generic hit
+    /// spans prose + frame, but the frame must still re-cut: the prose falls
+    /// outside the rebuilt hit's x-range (where the renderer recovers it) and
+    /// must not become a table column.
+    #[test]
+    fn prose_strip_left_of_a_frame_is_cut_away() {
+        let lines = vec![
+            vec![sp_at("H1", 12.0, 90.0, 6.0), sp_at("H2", 52.0, 90.0, 6.0), sp_at("H3", 92.0, 90.0, 6.0)],
+            vec![
+                sp_at("three prose words here", 2.0, 70.0, 4.0),
+                sp_at("a", 12.0, 70.0, 6.0),
+                sp_at("1", 52.0, 70.0, 6.0),
+                sp_at("2", 92.0, 70.0, 6.0),
+            ],
+            vec![
+                sp_at("four more prose words now", 2.0, 50.0, 4.0),
+                sp_at("b", 12.0, 50.0, 6.0),
+                sp_at("3", 52.0, 50.0, 6.0),
+                sp_at("4", 92.0, 50.0, 6.0),
+            ],
+        ];
+        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 3, 2.0, 110.0, 70.0, 50.0)], &frame_rules());
+        assert_eq!(hits.len(), 1, "the prose-strip frame was refused");
+        assert_eq!(hits[0].bbox.x0, 10.0, "frame left rule must bound the table");
+        let rows = table_of(&hits[0]);
+        assert!(
+            rows.iter().all(|r| !r.iter().any(|c| c.contains("prose") || c.contains("here"))),
+            "prose joined the table: {rows:?}"
+        );
+        assert_eq!(rows[0], vec!["H1", "H2", "H3"]);
+    }
+
+    /// The mirror case: when the excluded strip is itself a column of values,
+    /// the frame does not enclose the whole table and the re-cut is refused.
+    #[test]
+    fn numeric_strip_left_of_a_frame_is_not_cut_away() {
+        let lines = vec![
+            vec![sp_at("H1", 12.0, 90.0, 6.0), sp_at("H2", 52.0, 90.0, 6.0), sp_at("H3", 92.0, 90.0, 6.0)],
+            vec![
+                sp_at("111,11", 2.0, 70.0, 6.0),
+                sp_at("a", 12.0, 70.0, 6.0),
+                sp_at("1", 52.0, 70.0, 6.0),
+                sp_at("2", 92.0, 70.0, 6.0),
+            ],
+            vec![
+                sp_at("222,22", 2.0, 50.0, 6.0),
+                sp_at("b", 12.0, 50.0, 6.0),
+                sp_at("3", 52.0, 50.0, 6.0),
+                sp_at("4", 92.0, 50.0, 6.0),
+            ],
+        ];
+        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 3, 2.0, 110.0, 70.0, 50.0)], &frame_rules());
+        assert_eq!(hits[0].bbox.x0, 2.0, "a numeric strip must not be cut away");
+    }
+
+    /// Two tables stacked with identical column rules must each be re-cut: the
+    /// rules are one visual frame per section, not one tall frame over both.
+    #[test]
+    fn stacked_frames_sharing_columns_are_both_recut() {
+        let rules = vec![
+            (10.0, 60.0, 100.0),
+            (50.0, 60.0, 100.0),
+            (90.0, 60.0, 100.0),
+            (130.0, 60.0, 100.0),
+            (10.0, 0.0, 40.0),
+            (50.0, 0.0, 40.0),
+            (90.0, 0.0, 40.0),
+            (130.0, 0.0, 40.0),
+        ];
+        let lines = vec![
+            vec![sp_at("H1", 12.0, 90.0, 6.0), sp_at("H2", 52.0, 90.0, 6.0), sp_at("H3", 92.0, 90.0, 6.0)],
+            vec![sp_at("a", 12.0, 70.0, 6.0), sp_at("1", 52.0, 70.0, 6.0), sp_at("2", 92.0, 70.0, 6.0)],
+            vec![sp_at("J1", 12.0, 30.0, 6.0), sp_at("J2", 52.0, 30.0, 6.0), sp_at("J3", 92.0, 30.0, 6.0)],
+            vec![sp_at("b", 12.0, 10.0, 6.0), sp_at("3", 52.0, 10.0, 6.0), sp_at("4", 92.0, 10.0, 6.0)],
+        ];
+        let hits = apply_ruled_frame_model(
+            &lines,
+            vec![
+                seed(1, 1, 3, 12.0, 110.0, 70.0, 70.0),
+                seed(3, 3, 3, 12.0, 110.0, 10.0, 10.0),
+            ],
+            &rules,
+        );
+        assert_eq!(hits.len(), 2, "both stacked sections must be re-cut: {hits:?}");
+    }
+
+    /// The excluded strip is a table's numbered label column ("13-Bases"): it
+    /// must stay inside the table, so the frame re-cut is refused.
+    #[test]
+    fn numbered_label_strip_left_of_a_frame_is_not_cut_away() {
+        let lines = vec![
+            vec![sp_at("H1", 12.0, 90.0, 6.0), sp_at("H2", 52.0, 90.0, 6.0), sp_at("H3", 92.0, 90.0, 6.0)],
+            vec![
+                sp_at("13-Bases", 2.0, 70.0, 6.0),
+                sp_at("a", 12.0, 70.0, 6.0),
+                sp_at("1", 52.0, 70.0, 6.0),
+                sp_at("2", 92.0, 70.0, 6.0),
+            ],
+            vec![
+                sp_at("14-dont", 2.0, 50.0, 6.0),
+                sp_at("b", 12.0, 50.0, 6.0),
+                sp_at("3", 52.0, 50.0, 6.0),
+                sp_at("4", 92.0, 50.0, 6.0),
+            ],
+        ];
+        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 3, 2.0, 110.0, 70.0, 50.0)], &frame_rules());
+        assert_eq!(hits[0].bbox.x0, 2.0, "a numbered-label strip must not be cut away");
+    }
+
+    /// A frame that covers the hit (excludes nothing) but offers fewer columns
+    /// must not re-cut it: a lower column count would merge real cells.
+    #[test]
+    fn frame_covering_the_hit_with_fewer_columns_is_refused() {
+        let lines = vec![
+            vec![sp_at("H1", 12.0, 90.0, 6.0), sp_at("H2", 52.0, 90.0, 6.0), sp_at("H3", 92.0, 90.0, 6.0)],
+            vec![
+                sp_at("a", 12.0, 70.0, 6.0),
+                sp_at("x", 40.0, 70.0, 6.0),
+                sp_at("1", 52.0, 70.0, 6.0),
+                sp_at("2", 92.0, 70.0, 6.0),
+            ],
+            vec![
+                sp_at("b", 12.0, 50.0, 6.0),
+                sp_at("y", 40.0, 50.0, 6.0),
+                sp_at("3", 52.0, 50.0, 6.0),
+                sp_at("4", 92.0, 50.0, 6.0),
+            ],
+        ];
+        // Hit shows 4 columns; the frame offers 3 and covers the hit.
+        let hits = apply_ruled_frame_model(&lines, vec![seed(1, 2, 4, 10.0, 130.0, 70.0, 50.0)], &frame_rules());
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].rows.iter().all(|r| r.len() == 4),
+            "a covered hit must not be re-cut to fewer columns: {:?}",
+            hits[0].rows
+        );
+    }
+

@@ -15,7 +15,7 @@ use super::*;
 /// 27.5 pt between the facing columns — 3.35 em, comfortably above this floor,
 /// which sits above the word-space/justification band so ordinary word gaps
 /// never seed a corridor.
-const ZONE_MIN_CORRIDOR_EM: f64 = 1.5;
+pub(super) const ZONE_MIN_CORRIDOR_EM: f64 = 1.5;
 
 /// Minimum number of consecutive rows a corridor must cross to be a zone pair.
 ///
@@ -23,7 +23,7 @@ const ZONE_MIN_CORRIDOR_EM: f64 = 1.5;
 /// projection needs six clear rows, so a two- or three-row block beside another
 /// falls through both and is woven row by row. Two rows is the smallest block
 /// whose reading order can differ from the linear one, so it is the floor here.
-const ZONE_MIN_ROWS: usize = 2;
+pub(super) const ZONE_MIN_ROWS: usize = 2;
 
 /// Maximum raggedness of each side's left edge, in em of body size.
 ///
@@ -33,11 +33,11 @@ const ZONE_MIN_ROWS: usize = 2;
 /// rejected. The measured false positives (a utility-bill line whose recurring
 /// gap moves with the sentence) spread 100-360 pt against 0 pt for the
 /// bilingual footer.
-const ZONE_MAX_EDGE_SPREAD_EM: f64 = 1.0;
+pub(super) const ZONE_MAX_EDGE_SPREAD_EM: f64 = 1.0;
 
 /// Minimum average whitespace-separated words per row on each side. Below this
 /// a side is a column of short cells (a value column, a table half), not text.
-const ZONE_MIN_WORDS_PER_ROW: f64 = 2.5;
+pub(super) const ZONE_MIN_WORDS_PER_ROW: f64 = 2.5;
 
 /// Maximum baseline gap between two consecutive rows of one zone run, in em of
 /// the lower row's size. A genuine block's rows keep a paragraph-like line
@@ -45,16 +45,16 @@ const ZONE_MIN_WORDS_PER_ROW: f64 = 2.5;
 /// apart (measured: a 5.4 em gap between two label/value fields on a
 /// certificate, against ~0.9 em line pitch inside the bilingual footer). This
 /// mirrors `detect_column_bands`'s existing `2.5 * size` adjacency rule.
-const ZONE_MAX_ROW_GAP_EM: f64 = 2.5;
+pub(super) const ZONE_MAX_ROW_GAP_EM: f64 = 2.5;
 
 /// Fraction of a side's tokens that may be digit-only before it reads as a
 /// value column rather than prose. A left label beside a right amount is the
 /// classic false positive; the amounts alone exceed a third of the right side.
-const ZONE_MAX_NUMERIC_FRACTION: f64 = 0.34;
+pub(super) const ZONE_MAX_NUMERIC_FRACTION: f64 = 0.34;
 
 /// Candidate gutter midpoints closer than this fraction of body size are the
 /// same corridor: 3 pt at a typical 8-10 pt body is ~0.35 em.
-const ZONE_GUTTER_DEDUP_EM: f64 = 0.35;
+pub(super) const ZONE_GUTTER_DEDUP_EM: f64 = 0.35;
 
 /// Whether `row` leaves one white corridor that covers `gx`, returning its
 /// `(left_end, right_start)` bounds.
@@ -88,7 +88,7 @@ fn corridor_at(row: &[Span], gx: f64) -> Option<(f64, f64)> {
 /// Partition one crossing row into its left and right sides at `gx`. The
 /// corridor was proved ink-free, so every non-space span falls wholly on one
 /// side; whitespace follows its centre.
-fn partition_at(row: &[Span], gx: f64) -> (Vec<Span>, Vec<Span>) {
+pub(super) fn partition_at(row: &[Span], gx: f64) -> (Vec<Span>, Vec<Span>) {
     row.iter().cloned().partition(|s| {
         if s.text.chars().all(|c| c == ' ') {
             s.x + 0.5 * s.advance < gx
@@ -124,7 +124,7 @@ fn numeric_token_fraction(rows: &[Vec<Span>]) -> f64 {
 /// Whether a side `rows` reads as table cells rather than one text column:
 /// an internal wide gap inside a row, an aligned internal gutter, or a
 /// numeric-dominated vocabulary.
-fn side_looks_like_cells(rows: &[Vec<Span>]) -> bool {
+pub(super) fn side_looks_like_cells(rows: &[Vec<Span>]) -> bool {
     !rows_are_clean(rows)
         || has_aligned_internal_gutter(rows)
         || numeric_token_fraction(rows) > ZONE_MAX_NUMERIC_FRACTION
@@ -262,5 +262,8 @@ pub(super) fn side_by_side_zones(
             }
         }
     }
-    best
+    // The strict pass needs every row of the run to face the corridor. A pair
+    // whose columns keep separate baselines (a staggered address / addressee)
+    // never produces such a run; recover it with the one-sided fallback.
+    best.or_else(|| super::zones_extend::extended_side_by_side_zones(rows))
 }

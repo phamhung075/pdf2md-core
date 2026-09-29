@@ -140,7 +140,12 @@ pub fn render_with_tables(
             let first_side = side_content.iter().position(|l| !l.is_empty());
             let side_lines = side_content.iter().filter(|l| !l.is_empty()).count();
             let side_below = match first_side {
-                Some(off) if i > 0 => {
+                // Content that begins on the table's own first line is a
+                // side-by-side column, not a sidebar below it: the large gap
+                // above the table must not be read as "starts several rows
+                // down" (the line before a ruled table is often a heading or a
+                // separate block far above).
+                Some(off) if i > 0 && off > 0 => {
                     let prev_y = lines[i - 1].first().map(|s| s.y);
                     let side_y = lines[i + off].first().map(|s| s.y).or(prev_y);
                     match (prev_y, side_y) {
@@ -391,5 +396,32 @@ mod tests {
             !md.lines().any(|l| l.trim() == "2"),
             "bare page number leaked into output:\n{md}"
         );
+    }
+
+    /// A side column that begins on the table's own first line is a side-by-side
+    /// column, not a sidebar below it: a heading far above the table must not
+    /// push its prose after the table (the frame re-cut's left strip).
+    #[test]
+    fn side_prose_at_the_table_top_is_emitted_before_it() {
+        let mut lines = vec![line("heading high above", 780.0)];
+        for i in 0..6 {
+            let y = 700.0 - i as f64 * 12.0;
+            lines.push(vec![
+                span(&format!("left line {i}"), 40.0, y, 10.0, 60.0),
+                span(&format!("c{i}"), 300.0, y, 10.0, 15.0),
+                span(&format!("{i}"), 360.0, y, 10.0, 8.0),
+            ]);
+        }
+        let rows: Vec<Vec<String>> = (0..6).map(|i| vec![format!("c{i}"), format!("{i}")]).collect();
+        let hit = TableHit {
+            start: 1,
+            end: 6,
+            rows,
+            bbox: BoundingBox::new(300.0, 630.0, 380.0, 710.0),
+        };
+        let md = render_with_tables(&lines, &[hit], 792.0, None);
+        let prose = md.find("left line 0").expect("side prose lost");
+        let table = md.find("| c0").expect("table lost");
+        assert!(prose < table, "side prose must be emitted before the table:\n{md}");
     }
 }

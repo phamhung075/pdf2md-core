@@ -26,10 +26,13 @@
 //! full-page extent cannot annex rows below the table.
 
 mod detect;
+mod rows;
+mod strip;
 use detect::find_frames;
+use rows::{build_row, is_header_like, populated};
+use strip::{classify_excluded_strip, StripKind};
 
-use super::ledger::column_of;
-use super::rulers::{line_words, TableHit, WordTok};
+use super::rulers::{line_words, TableHit};
 use crate::layout::glyph_stream::Span;
 use crate::models::{BoundingBox, CELL_LINE_BREAK, CELL_LINE_BREAK_PENDING};
 
@@ -59,6 +62,10 @@ const FRAME_HIT_COVERAGE: f64 = 0.5;
 /// exclusion); a frame covering much less than the hit would cut off a real
 /// content column and push it out to prose.
 const FRAME_MIN_WIDTH_FRAC: f64 = 0.85;
+/// A frame that re-cuts away an excluded *prose* strip may be narrower, but it
+/// must still enclose most of the table: a frame covering less than this would
+/// push whole table rows (labels and values) out as loose prose.
+const FRAME_MIN_WIDTH_FRAC_PROSE: f64 = 0.6;
 /// A frame wider than this many columns is a dense layout grid, not the
 /// header-bounded table this model targets.
 const MAX_FRAME_COLS: usize = 12;
@@ -86,134 +93,22 @@ impl Frame {
     }
 }
 
-/// Is `cell` a bare value (number / amount / percent) rather than a label?
-fn cell_is_value(cell: &str) -> bool {
-    let t = cell
-        .trim()
-        .trim_matches(|c: char| matches!(c, '€' | '$' | '£' | '\u{00a0}'));
-    if t.is_empty() {
-        return false;
-    }
-    let mut has_digit = false;
-    for ch in t.chars() {
-        if ch.is_ascii_digit() {
-            has_digit = true;
-        } else if !matches!(
-            ch,
-            '.' | ',' | '-' | '+' | '%' | '/' | '\'' | ' ' | '\u{2028}'
-        ) {
-            return false;
-        }
-    }
-    has_digit
-}
-
-/// Assign a line's words to the frame's columns. A word that lies *entirely*
-/// outside the frame's outer rules belongs to the surrounding flow (a sidebar,
-/// the page margin) and is dropped; a word that straddles an outer rule is kept
-/// in the nearest column, because `render_with_tables` treats any span
-/// overlapping the table's bbox as table content — dropping it here would
-/// silently delete it from both the table and the recovered side flow.
-fn build_row(words: &[WordTok], boundaries: &[f64]) -> Vec<String> {
-    let ncols = boundaries.len() - 1;
-    let left = boundaries[0];
-    let right = boundaries[boundaries.len() - 1];
-    // `column_of` takes the *interior* boundaries only; the outer rules are
-    // explicit edges.
-    let interior = &boundaries[1..boundaries.len() - 1];
-    let mut cells = vec![String::new(); ncols];
-    for w in words {
-        if w.x1 <= left + EDGE_EPS_PT || w.x0 >= right - EDGE_EPS_PT {
-            continue;
-        }
-        // A producer frequently draws two right-aligned numbers in adjacent
-        // spans whose advances abut, so `line_words` folds them into one token
-        // ("##.#### ####.##"). The drawn rule between them is the authority: a
-        // token crossing an interior rule is split at its whitespace and each
-        // part bucketed by its own interpolated centre.
-        if interior
-            .iter()
-            .any(|&b| b > w.x0 + EDGE_EPS_PT && b < w.x1 - EDGE_EPS_PT)
-            && w.text.contains(' ')
-        {
-            for (col, part) in split_crossing_token(w, interior) {
-                push_cell(&mut cells, col, &part);
-            }
-            continue;
-        }
-        let center = 0.5 * (w.x0 + w.x1);
-        let c = column_of(center.clamp(left, right), interior).min(ncols - 1);
-        push_cell(&mut cells, c, w.text.as_str());
-    }
-    cells
-}
-
-/// Split a word token that crosses an interior rule at its whitespace, assigning
-/// each whitespace-separated part a column from its x-position interpolated
-/// linearly across the token (digit runs are near-uniform width, so the split
-/// lands on the rule). A part past the frame's right rule is dropped.
-fn split_crossing_token(w: &WordTok, interior: &[f64]) -> Vec<(usize, String)> {
-    let text = w.text.as_str();
-    let char_count = text.chars().count().max(1) as f64;
-    let total = (w.x1 - w.x0).max(0.1);
-    let mut out = Vec::new();
-    let mut search_from = 0usize;
-    for part in text.split_whitespace() {
-        let Some(idx) = text[search_from..].find(part).map(|i| i + search_from) else {
-            search_from += part.len();
-            continue;
-        };
-        let c0 = text[..idx].chars().count() as f64;
-        let c1 = c0 + part.chars().count() as f64;
-        let x0 = w.x0 + total * (c0 / char_count);
-        let x1 = w.x0 + total * (c1 / char_count);
-        search_from = idx + part.len();
-        let col = column_of(0.5 * (x0 + x1), interior);
-        out.push((col, part.to_string()));
-    }
-    out
-}
-
-/// Append `text` to `cells[col]`, space-separating multiple words in one cell.
-fn push_cell(cells: &mut [String], col: usize, text: &str) {
-    if col >= cells.len() || text.trim().is_empty() {
-        return;
-    }
-    if !cells[col].is_empty() {
-        cells[col].push(' ');
-    }
-    cells[col].push_str(text.trim());
-}
-
-/// Number of non-empty cells.
-fn populated(cells: &[String]) -> usize {
-    cells.iter().filter(|c| !c.trim().is_empty()).count()
-}
-
-/// Is `row` the shape of a header band line: a short label in several columns
-/// and no bare value cell?
-fn is_header_like(row: &[String]) -> bool {
-    populated(row) >= MIN_HEADER_COLS
-        && !row.iter().any(|c| cell_is_value(c))
-        && row
-            .iter()
-            .all(|c| c.is_empty() || c.split_whitespace().count() <= HEADER_MAX_CELL_WORDS)
-}
-
 /// Build one table from a frame, or `None` when the frame carries no table.
 ///
-/// `hit` is the existing table the frame re-cuts. Rows above the hit's own
-/// start are not absorbed (an address block sitting in the frame's upper band
-/// is not table content); only a short label-like header immediately above the
-/// hit is annexed.
-fn build_frame_table(lines: &[Vec<Span>], frame: &Frame, hit: &TableHit) -> Option<TableHit> {
+/// The frame's own band and outer rules bound the table: every line inside the
+/// band contributes only the words between the outer rules, so a prose column
+/// or a sidebar outside them is not table content and is recovered by the
+/// renderer's `spans_outside`. A line above the hit's own start is included when
+/// it carries in-frame words, which is how a header row that the generic pass
+/// left out is annexed as the header rather than emitted as loose headings.
+fn build_frame_table(lines: &[Vec<Span>], frame: &Frame, _hit: &TableHit) -> Option<TableHit> {
     let ncols = frame.ncols();
     let boundaries = &frame.boundaries;
 
-    // Every in-band line at or below the hit's start carrying an in-frame word.
+    // Every in-band line carrying an in-frame word.
     let mut data: Vec<(usize, Vec<String>)> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        if i < hit.start || line.is_empty() {
+        if line.is_empty() {
             continue;
         }
         let y = line[0].y;
@@ -364,18 +259,51 @@ fn frame_covers_hit(lines: &[Vec<Span>], frame: &Frame, hit: &TableHit) -> bool 
     }
     let overlap = frame.hi.min(hhi) - frame.lo.max(hlo);
     if overlap < FRAME_HIT_COVERAGE * (hhi - hlo) {
+        t(|| format!("cover reject: overlap {overlap:.1} vs {}", FRAME_HIT_COVERAGE * (hhi - hlo)));
         return false;
     }
     let left = frame.boundaries[0];
     let right = frame.boundaries[frame.ncols()];
-    // The frame must not chop off the hit's left content ...
-    if left > hit.bbox.x0 + EDGE_EPS_PT {
-        return false;
-    }
-    // ... and must account for most of its width (the rest may be a sidebar
-    // outside the right rule, which the frame deliberately excludes).
     let hit_width = (hit.bbox.x1 - hit.bbox.x0).max(0.0);
-    (right - left) >= FRAME_MIN_WIDTH_FRAC * hit_width
+    // The frame must cover most of the hit and not chop off its left content.
+    // When either holds less, the strip the frame excludes is only allowed to
+    // become prose if it actually reads as a text column; otherwise the frame
+    // would cut a real column out of the table. An excluded *prose* strip is
+    // recovered by the renderer (`spans_outside`), so no word is dropped.
+    let left_ok = left <= hit.bbox.x0 + EDGE_EPS_PT;
+    let width_ok = (right - left) >= FRAME_MIN_WIDTH_FRAC * hit_width;
+    if left_ok && width_ok {
+        return true;
+    }
+    match classify_excluded_strip(lines, frame) {
+        // A prose strip may be excluded, but the frame must still enclose most
+        // of the table; a much narrower frame would push whole rows out as
+        // loose prose. An empty strip loses nothing regardless of width.
+        StripKind::Prose if (right - left) >= FRAME_MIN_WIDTH_FRAC_PROSE * hit_width => {
+            t(|| {
+                format!(
+                    "cover: prose strip allows left_ok={left_ok} width_ok={width_ok} ({:.1} vs {:.1})",
+                    right - left,
+                    hit_width
+                )
+            });
+            true
+        }
+        StripKind::Empty => {
+            t(|| {
+                format!(
+                    "cover: empty strip allows left_ok={left_ok} width_ok={width_ok} ({:.1} vs {:.1})",
+                    right - left,
+                    hit_width
+                )
+            });
+            true
+        }
+        StripKind::Prose | StripKind::Other => {
+            t(|| format!("cover reject: left_ok={left_ok} width_ok={width_ok} and strip not usable"));
+            false
+        }
+    }
 }
 
 /// The column count a generic hit already shows.
@@ -447,22 +375,49 @@ pub fn apply_ruled_frame_model(
             continue;
         }
         let covered: Vec<&TableHit> = hits.iter().filter(|h| frame_covers_hit(lines, frame, h)).collect();
-        // Exactly one existing table must be enclosed, with the frame's own
-        // column count. A frame that would span or merge several separate grids
-        // (a multi-column statement page, a dense layout) is a false positive:
-        // re-columnizing it annexes neighbouring boxes and drops real rows.
-        if covered.len() != 1 || hit_ncols(covered[0]) != frame.ncols() {
+        // Exactly one existing table must be enclosed. A frame that would span
+        // or merge several separate grids (a multi-column statement page, a
+        // dense layout) is a false positive: re-columnizing it annexes
+        // neighbouring boxes and drops real rows.
+        //
+        // The frame's own rules fix the column count. A frame with *more*
+        // columns than the hit would re-columnize the region and is refused. A
+        // frame with *fewer* is allowed only when the excluded strip is a
+        // genuine prose column (which is not part of the table); an empty strip
+        // means the frame covers the hit, so dropping a column would merge real
+        // cells — the previous (generic) table is kept instead.
+        let same_cols = covered.len() == 1 && hit_ncols(covered[0]) == frame.ncols();
+        let prose_shrink = covered.len() == 1
+            && frame.ncols() < hit_ncols(covered[0])
+            && classify_excluded_strip(lines, frame) == StripKind::Prose;
+        if !same_cols && !prose_shrink {
+            t(|| format!(
+                "skip: frame {}cols covered={} hit_ncols={:?}",
+                frame.ncols(),
+                covered.len(),
+                covered.first().map(|h| hit_ncols(h))
+            ));
             continue;
         }
         // A table the generic pass already folded (wrapped description cells)
         // keeps its row structure; the line-per-row re-cut would split every
         // continuation into its own row.
         if hit_folds_lines(lines, frame, covered[0]) {
+            t(|| "skip: hit folds lines".to_string());
             continue;
         }
         let Some(hit) = build_frame_table(lines, frame, covered[0]) else {
+            t(|| "skip: build_frame_table returned None".to_string());
             continue;
         };
+        // A re-cut must not start below the hit it replaces: the hit's leading
+        // lines (its header row) would then fall outside the new table's line
+        // range and be emitted as loose headings. Its trailing rows must stay
+        // inside too. Otherwise the previous table is kept.
+        if hit.start > covered[0].start || hit.end < covered[0].end {
+            t(|| "skip: re-cut would drop the hit's leading/trailing rows".to_string());
+            continue;
+        }
         // The rebuilt region must not overlap any other hit: replacing it would
         // delete that neighbour's table boundary without folding its rows in.
         let touching = hits

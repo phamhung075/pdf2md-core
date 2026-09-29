@@ -22,6 +22,7 @@ mod staggered;
 use staggered::*;
 mod zones;
 use zones::*;
+mod zones_extend;
 mod lines;
 pub use lines::*;
 mod page_numbers;

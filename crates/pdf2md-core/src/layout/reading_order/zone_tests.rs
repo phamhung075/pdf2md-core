@@ -231,3 +231,61 @@ fn far_apart_fields_sharing_a_corridor_are_not_a_zone() {
         bands.len()
     );
 }
+
+/// Two independent blocks whose columns do not share baselines (a staggered
+/// address / box pair) must still read left block then right block. Neither
+/// side wraps, so only the unequal line counts keep it out of the label/value
+/// guard.
+#[test]
+fn staggered_two_blocks_are_read_sequentially() {
+    let lines = vec![
+        vec![sp("Alpha beta gamma delta", 30.0, 300.0)],
+        vec![
+            sp("Epsilon zeta eta theta", 30.0, 288.0),
+            sp("One two three four", 305.0, 290.0),
+        ],
+        vec![
+            sp("Iota kappa lambda mu", 30.0, 276.0),
+            sp("Five six seven eight", 305.0, 278.0),
+        ],
+        vec![sp("Nu xi omicron pi", 30.0, 264.0)],
+        vec![sp("Nine ten eleven twelve", 305.0, 252.0)],
+    ];
+    let bands = detect_column_bands(&lines);
+    let col = bands.iter().find_map(|b| match b {
+        ColumnBand::Columns { left, right } => Some((left, right)),
+        _ => None,
+    });
+    let (left, right) = col.expect("staggered blocks must become a Columns band");
+    assert_eq!(left.len(), 4, "left block must keep all its lines: {left:?}");
+    assert_eq!(right.len(), 3, "right block must keep all its lines: {right:?}");
+    let texts: Vec<String> = left
+        .iter()
+        .chain(right.iter())
+        .map(|l| render_line_text(l, None))
+        .collect();
+    assert!(texts[0].contains("Alpha beta"), "{texts:?}");
+    assert!(texts[3].contains("Nu xi"), "{texts:?}");
+    assert!(texts[4].contains("One two"), "{texts:?}");
+    assert!(texts[6].contains("Nine ten"), "{texts:?}");
+    assert!(
+        texts.iter().all(|t| !(t.contains("Alpha") && t.contains("One two"))),
+        "blocks must not be woven: {texts:?}"
+    );
+}
+
+/// A row-aligned pair with equal line counts and no wrapping is a label/value
+/// box, not two blocks: the stagger/unequal-count escape must not split it.
+#[test]
+fn row_aligned_equal_pair_stays_rowwise() {
+    let lines = vec![
+        vec![sp("Alpha beta gamma", 30.0, 300.0), sp("GARE CENTRALE NORD", 305.0, 300.0)],
+        vec![sp("Delta epsilon zeta", 30.0, 290.0), sp("PORT DE PLAISANCE", 305.0, 290.0)],
+    ];
+    let bands = detect_column_bands(&lines);
+    assert!(
+        bands.iter().all(|b| !matches!(b, ColumnBand::Columns { .. })),
+        "an equal label/value pair must not be transposed: {} bands",
+        bands.len()
+    );
+}
