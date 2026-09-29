@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Dai Hung PHAM. All rights reserved.
 // SPDX-License-Identifier: BSL-1.1
 // Licensed under the Business Source License 1.1 (BSL-1.1).
+
 //! Band repair: absorbs one-sided rows into a column band and merges column bands that share one gutter.
-//! Reading order recovery, multi-column stream separation, and structured DocBlock generation.
 
 use super::*;
 
