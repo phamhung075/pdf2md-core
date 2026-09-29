@@ -355,7 +355,7 @@ const WRAP_EDGE_EM: f64 = 1.5;
 /// column-0-only line is a new record, not a continuation. A line whose text
 /// runs out in a dot leader (`...` / `…`) only *looks* like it reaches the edge;
 /// it is a table-of-contents/notice leader, never a wrapped sentence.
-fn col0_reached_the_edge(info: &[RowInfo], ri: usize, rulers: &[f64]) -> bool {
+fn col0_reached_the_edge(info: &[RowInfo], ri: usize, rulers: &[f64], spine: bool) -> bool {
     if rulers.len() < 2 {
         return false;
     }
@@ -373,7 +373,15 @@ fn col0_reached_the_edge(info: &[RowInfo], ri: usize, rulers: &[f64]) -> bool {
     if !end.is_finite() || ends_in_dot_leader(&text) {
         return false;
     }
-    end >= rulers[1] - WRAP_EDGE_EM * info[ri].size.max(0.1)
+    // A header-spine window's rulers are its columns' *centres*, so the first
+    // column's edge is the midpoint of the first two centres; every other grid
+    // passes column *starts*, where the next start *is* the edge.
+    let edge = if spine {
+        0.5 * (rulers[0] + rulers[1])
+    } else {
+        rulers[1]
+    };
+    end >= edge - WRAP_EDGE_EM * info[ri].size.max(0.1)
 }
 
 /// Whether `text` ends in a dot leader: an ellipsis character, or three or more
@@ -585,7 +593,7 @@ pub fn consolidate_table_rows(
                         && is_text_column_cell(&row_cells[0])
                         && !starts_with_footnote_marker(&row_cells[0])
                         && (curr[0].contains(CELL_LINE_BREAK)
-                            || col0_reached_the_edge(info, win_rows[r_idx - 1], rulers))
+                            || col0_reached_the_edge(info, win_rows[r_idx - 1], rulers, spine))
                     {
                         // A column-0-only line continues the open row's first
                         // cell only when that cell is *wrapping*: either the

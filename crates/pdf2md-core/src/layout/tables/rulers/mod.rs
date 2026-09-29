@@ -16,6 +16,9 @@ mod grid_scan;
 use grid_scan::*;
 mod header_spine;
 use header_spine::*;
+mod header_spine_legacy;
+#[cfg(test)]
+mod header_spine_tests;
 mod window_rules;
 use window_rules::*;
 mod scan;

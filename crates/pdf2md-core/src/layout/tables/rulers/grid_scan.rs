@@ -305,8 +305,16 @@ pub(super) fn scan_aligned_grids_opts(
             // tall first-column cell keeps wrapped continuation lines inside
             // the row instead of letting them seed phantom rulers (and lets a
             // header column whose label starts on only one line survive).
-            let spine_rulers =
-                header_spine_refine(&info, lines, &band, win_lo, &mut hi, tol, min_gutter);
+            let spine_rulers = header_spine_refine(
+                &info,
+                lines,
+                &band,
+                &mut win_lo,
+                &mut hi,
+                tol,
+                min_gutter,
+                &rulers,
+            );
             let spine_active = spine_rulers.is_some();
             let rulers = spine_rulers.unwrap_or(rulers);
             let win_rows: Vec<usize> = band[win_lo..=hi].to_vec();

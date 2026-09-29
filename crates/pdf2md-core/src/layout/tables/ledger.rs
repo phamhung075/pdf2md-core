@@ -179,6 +179,13 @@ fn group_cells(words: &[WordTok], min_gutter: f64) -> Vec<(f64, f64, String)> {
     out
 }
 
+/// Whether these header words read as an operations-ledger header: a date or
+/// value column plus an amount column. The grid spine pass uses this to leave a
+/// statement header to this ledger model rather than re-columning it.
+pub(crate) fn header_reads_as_ledger(words: &[WordTok], size: f64) -> bool {
+    header_from_words(words, size).is_some()
+}
+
 /// Build ledger columns from a header band's words, or `None` when the words do
 /// not read as a ledger header.
 fn header_from_words(words: &[WordTok], size: f64) -> Option<Vec<HeaderColumn>> {
