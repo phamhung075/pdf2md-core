@@ -15,7 +15,7 @@
 //! * structural lines (headings, blockquotes, images, table rows, fenced code)
 //!   are never touched and act as hard boundaries; a list item is the one
 //!   exception — it absorbs a wrapped continuation whose wrap point landed on a
-//!   comma;
+//!   comma — and a wrapped heading is merged back into one;
 //! * a paragraph break (blank line, or a line that ends with `:`) is preserved,
 //!   except that a lowercase clause ending in `:` is a wrapped line, not a
 //!   label, and joins the line above;
@@ -55,6 +55,56 @@ const WHOLE_LINE_WRAPPERS: &[(&str, &str)] = &[("**", "**"), ("<u>", "</u>"), ("
 /// True when the whitespace-stripped line opens a structural Markdown element.
 fn is_structural_start(t: &str) -> bool {
     STRUCTURAL_STARTS.iter().any(|p| t.starts_with(p))
+}
+
+/// Split an ATX heading line into its `#` marker and its text, or `None` when
+/// the line is not a heading (`#hashtag`, a bare `#`, or plain text). The
+/// marker and text are returned as borrowed slices of `s`.
+fn split_heading(s: &str) -> Option<(&str, &str)> {
+    let t = s.trim_end();
+    let marker_len = t.len() - t.trim_start_matches('#').len();
+    if marker_len == 0 {
+        return None;
+    }
+    let after = &t[marker_len..];
+    let text = after.strip_prefix(' ')?;
+    let text = text.trim_start();
+    if text.is_empty() {
+        return None;
+    }
+    Some((&t[..marker_len], text))
+}
+
+/// A heading whose text opens with the word `Page`. The converter's
+/// `## Page N` marker matches this, and the private-corpus page-marker count
+/// also counts a document heading that begins with `Page`; either way such a
+/// heading is a page boundary, never a wrapped continuation of the heading
+/// above, so it must not be merged.
+fn is_page_marker_heading(text: &str) -> bool {
+    text == "Page" || text.starts_with("Page ")
+}
+
+/// Whether the heading lines `prev` and `next` are one heading wrapped onto a
+/// second visual line rather than two separate headings.
+///
+/// A wrapped heading leaves its first line without sentence punctuation (a
+/// section label that ends a phrase would have been ended by its own period or
+/// colon); a genuinely separate heading is either preceded by body text or
+/// ends a sentence, so the two are never adjacent same-level ATX headings with
+/// the first unpunctuated. The `#` marker the renderer inserts between the two
+/// visual lines is otherwise a foreign token inside the wrapped title.
+fn headings_join(prev: &str, next: &str) -> bool {
+    match (split_heading(prev), split_heading(next)) {
+        (Some((pl, pt)), Some((nl, nt))) => {
+            pl == nl
+                && !pt.is_empty()
+                && !nt.is_empty()
+                && !ends_sentence(pt)
+                && !is_page_marker_heading(pt)
+                && !is_page_marker_heading(nt)
+        }
+        _ => false,
+    }
 }
 
 /// True for an ordered-list marker (`N. `) at the start of the line.
@@ -227,12 +277,26 @@ pub fn reflow_markdown(input: &str) -> String {
     for &ln in &lines {
         let trimmed = ln.trim();
 
-        // Headings / page markers: hard boundary, never touched.
+        // Headings / page markers: hard boundary, never touched — except that
+        // a title/heading wrapped onto a second visual line arrives as two
+        // same-level headings, and the `#` inserted between the wrapped words
+        // is a foreign token inside the title. Merge that continuation back
+        // into the single heading it was; a separate heading is never an
+        // adjacent same-level heading whose first line is unpunctuated.
         if ln.starts_with('#') {
             if let Some(p) = pending.take() {
                 out.push(p);
             }
             pending_list = false;
+            if let Some(prev) = out.last() {
+                if headings_join(prev, ln) {
+                    let text = split_heading(ln).expect("headings_join checked").1;
+                    let prev = out.last_mut().expect("checked above");
+                    prev.push(' ');
+                    prev.push_str(text);
+                    continue;
+                }
+            }
             out.push(ln.to_string());
             continue;
         }

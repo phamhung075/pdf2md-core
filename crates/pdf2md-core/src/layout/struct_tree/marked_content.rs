@@ -79,6 +79,7 @@ pub(super) fn emit_show(
     tm: &Mtx,
     ctm: &Mtx,
     tfs: f64,
+    hz: f64,
     tc: f64,
     tw: f64,
     emit: &mut dyn FnMut(&Span),
@@ -89,7 +90,7 @@ pub(super) fn emit_show(
         match operand {
             Object::String(bytes, _) => {
                 let mut spans = Vec::new();
-                push_span(codec, width, bytes, 0.0, tm, ctm, tfs, tc, tw, *style, &mut spans);
+                push_span(codec, width, bytes, 0.0, tm, ctm, tfs, hz, tc, tw, *style, &mut spans);
                 for s in spans {
                     emit(&s);
                 }
@@ -100,7 +101,7 @@ pub(super) fn emit_show(
                     match item {
                         Object::String(bytes, _) => {
                             let mut spans = Vec::new();
-                            push_span(codec, width, bytes, offset, tm, ctm, tfs, tc, tw, *style, &mut spans);
+                            push_span(codec, width, bytes, offset, tm, ctm, tfs, hz, tc, tw, *style, &mut spans);
                             for s in spans {
                                 emit(&s);
                             }
@@ -167,6 +168,7 @@ pub(super) fn extract_marked_content(doc: &Document, page_id: ObjectId) -> HashM
     let mut leading = 0.0f64;
     let mut tc = 0.0f64;
     let mut tw = 0.0f64;
+    let mut hz = 1.0f64;
     let mut cur_font: Option<usize> = None;
 
     let target = |stack: &[i64]| -> Option<usize> {
@@ -226,7 +228,7 @@ pub(super) fn extract_marked_content(doc: &Document, page_id: ObjectId) -> HashM
             }
             "Tz" => {
                 if let Some(v) = op.operands.first().and_then(num) {
-                    let _ = v;
+                    hz = v / 100.0;
                 }
             }
             "Tf" => {
@@ -258,7 +260,7 @@ pub(super) fn extract_marked_content(doc: &Document, page_id: ObjectId) -> HashM
                     }
                 }
                 let eff = own_mcid.map(|m| m as usize).or_else(|| target(&mcid_stack));
-                emit_show(&fonts_info, cur_font, &op.operands, &tm, &ctm, tfs, tc, tw, &mut |s: &Span| {
+                emit_show(&fonts_info, cur_font, &op.operands, &tm, &ctm, tfs, hz, tc, tw, &mut |s: &Span| {
                     if let Some(m) = eff {
                         map.entry(m).or_default().add_span(s);
                     }
@@ -272,7 +274,7 @@ pub(super) fn extract_marked_content(doc: &Document, page_id: ObjectId) -> HashM
                     }
                 }
                 let eff = own_mcid.map(|m| m as usize).or_else(|| target(&mcid_stack));
-                emit_show(&fonts_info, cur_font, &op.operands, &tm, &ctm, tfs, tc, tw, &mut |s: &Span| {
+                emit_show(&fonts_info, cur_font, &op.operands, &tm, &ctm, tfs, hz, tc, tw, &mut |s: &Span| {
                     if let Some(m) = eff {
                         map.entry(m).or_default().add_span(s);
                     }

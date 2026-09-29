@@ -4,6 +4,10 @@
 
 //! Table validation heuristics: TOC dot leader rejection, bullet markers, stopword flow, and data tokens.
 
+mod prose_sweep;
+
+pub(crate) use prose_sweep::is_prose_sweep;
+
 /// A cell or token that marks a table's data even though it carries no digit:
 /// a voting tick, a round marker, or a short status word. Checklist / voting
 /// matrices (`x` cells) and survey grids (`oui`/`non`) have no numbers at all,
@@ -309,6 +313,14 @@ pub fn is_tabular_rows(rows: &[Vec<String>]) -> bool {
         if density < 0.35 {
             return false;
         }
+    }
+
+    // Prose swept into a grid is rejected by the prose-sweep guard (see
+    // `prose_sweep.rs`): a page's flowing text columns split at both their
+    // left and right text edges leave sentence-length columns beside sparse
+    // filler columns, a shape a genuine table does not have.
+    if is_prose_sweep(&data, &non_empty) {
+        return false;
     }
 
     // Prose stopword detector: flowing sentences contain a high percentage of

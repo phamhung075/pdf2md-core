@@ -156,3 +156,64 @@
             "a running bibliography was accepted as a table: {rows:?}"
         );
     }
+
+    /// Two running-prose text columns cut at both text edges leave a sparse
+    /// gutter column between them. The prose is synthetic Indonesian-style text
+    /// carrying none of the English/French stopwords, so the stopword veto does
+    /// not fire; the prose-sweep guard must reject the grid on structure alone.
+    #[test]
+    fn two_prose_columns_beside_a_filler_column_are_rejected() {
+        let rows: Vec<Vec<String>> = vec![
+            vec![
+                "mengalami percepatan bone loss dan studi".into(),
+                "yang".into(),
+                "yang kurang pada kelompok kasus dan".into(),
+            ],
+            vec![
+                "dilakukan pada 200.000 wanita berusia".into(),
+                "".into(),
+                "Kebiasaan olahraga yang kurang dapat".into(),
+            ],
+            vec![
+                "dengan mengukur nilai BMD dan dibandingkan".into(),
+                "".into(),
+                "meningkatkan risiko osteoporosis pada".into(),
+            ],
+            vec![
+                "dengan standar WHO menunjukkan bahwa sebagian".into(),
+                "7% menderita".into(),
+                "penelitian pada wanita lansia di Bogor".into(),
+            ],
+            vec![
+                "menderita osteopenia di bawah nilai normal".into(),
+                "".into(),
+                "menunjukkan subjek jarang berolahraga".into(),
+            ],
+            vec![
+                "dan osteoporosis pada usia lanjut sekali".into(),
+                "".into(),
+                "sehingga aktivitas fisiknya tergolong ringan".into(),
+            ],
+        ];
+        assert!(!is_tabular_rows(&rows), "swept prose grid accepted: {rows:?}");
+    }
+
+    /// A genuine table with ONE long description column, short value columns
+    /// and an optional notes column filled in only some rows keeps its sparse
+    /// column without tripping the sweep guard: a single prose column is not
+    /// the two-column cut the guard targets.
+    #[test]
+    fn real_table_with_one_prose_column_and_optional_column_is_kept() {
+        let rows: Vec<Vec<String>> = vec![
+            vec!["Remplacement du filtre a air habitacle".into(), "1".into(), "35.00 €".into(), "".into()],
+            vec!["Vidange moteur et remplacement du filtre".into(), "1".into(), "89.00 €".into(), "urgent".into()],
+            vec!["Controle du systeme de freinage complet".into(), "2".into(), "120.00 €".into(), "".into()],
+            vec!["Remplacement des plaquettes avant".into(), "1".into(), "75.00 €".into(), "".into()],
+            vec!["Diagnostic electronique et effacement".into(), "1".into(), "49.00 €".into(), "".into()],
+            vec!["Forfait main d oeuvre atelier".into(), "3".into(), "180.00 €".into(), "".into()],
+        ];
+        assert!(
+            is_tabular_rows(&rows),
+            "a real table with one prose column was rejected: {rows:?}"
+        );
+    }

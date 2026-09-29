@@ -399,3 +399,43 @@
             result.markdown
         );
     }
+    #[test]
+    fn a_wrapped_heading_merges_into_one() {
+        // The renderer emits one heading per visual line; the inserted `#`
+        // between the two lines is a foreign token inside the wrapped title.
+        let out = join("# Impact of Hypertension in Mysore\n# Population of South India");
+        assert_eq!(
+            out,
+            "# Impact of Hypertension in Mysore Population of South India"
+        );
+        // A three-line wrapped title collapses to one heading too.
+        let out = join("# A very long report title\n# that wraps onto\n# three lines");
+        assert_eq!(out, "# A very long report title that wraps onto three lines");
+    }
+
+    #[test]
+    fn a_heading_that_ends_a_sentence_is_not_absorbed() {
+        // A heading whose text ends with sentence punctuation is a complete
+        // label, not a wrapped first line: the next heading stays separate.
+        let out = join("# Introduction.\n# Method");
+        assert_eq!(out, "# Introduction.\n# Method");
+        let out = join("## Where are we?\n## Next steps");
+        assert_eq!(out, "## Where are we?\n## Next steps");
+    }
+
+    #[test]
+    fn different_heading_levels_are_never_merged() {
+        let out = join("# Chapter\n## Section\n### Subsection");
+        assert_eq!(out, "# Chapter\n## Section\n### Subsection");
+    }
+
+    #[test]
+    fn page_markers_are_never_merged() {
+        // Consecutive pages with no body between them leave adjacent `## Page`
+        // markers; they are separate markers, not one wrapped heading.
+        let out = join("## Page 1\n## Page 2\n\nbody");
+        assert_eq!(out, "## Page 1\n## Page 2\n\nbody");
+        // A page marker is not absorbed into a real heading either.
+        let out = join("## Page 3\n## Section");
+        assert_eq!(out, "## Page 3\n## Section");
+    }

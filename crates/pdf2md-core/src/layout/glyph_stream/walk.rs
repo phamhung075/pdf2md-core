@@ -218,7 +218,8 @@ pub(super) fn walk_glyphs(
                     } else {
                         let before = spans.len();
                         if let Some(dir) = push_span(
-                            codec, width, bytes, 0.0, &tm, &ctm, tfs, tc, tw, style, &mut spans,
+                            codec, width, bytes, 0.0, &tm, &ctm, tfs, tz / 100.0, tc, tw, style,
+                            &mut spans,
                         ) {
                             let n = spans.last().map(|s| s.text.chars().count()).unwrap_or(0);
                             if dir > 0 {
@@ -263,8 +264,8 @@ pub(super) fn walk_glyphs(
                             } else {
                                 let before = spans.len();
                                 if let Some(dir) = push_span(
-                                    codec, width, bytes, offset, &tm, &ctm, tfs, tc, tw, style,
-                                    &mut spans,
+                                    codec, width, bytes, offset, &tm, &ctm, tfs, tz / 100.0, tc,
+                                    tw, style, &mut spans,
                                 ) {
                                     let n =
                                         spans.last().map(|s| s.text.chars().count()).unwrap_or(0);

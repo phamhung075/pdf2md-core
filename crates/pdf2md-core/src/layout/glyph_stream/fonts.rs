@@ -236,6 +236,10 @@ pub(super) fn fold_ligatures(s: &mut String) {
 
 /// Decode one string operand into a positioned span (or nothing if it decodes
 /// to no text). `em_offset` is a preceding TJ-array number in 1/1000 em units.
+/// `hz` is the text state's horizontal scaling (`Tz / 100`): it scales every
+/// horizontal displacement (glyph width, `Tc`/`Tw`, `TJ` kerns) but not the
+/// glyph height, so it must reach the run's right edge as well as the text
+/// matrix the shell walker advances.
 ///
 /// Returns the reading direction of a *vertical* span: `Some(1)` when the glyph
 /// advance runs upward (bottom-to-top), `Some(-1)` when it runs downward, and
@@ -251,6 +255,7 @@ pub(crate) fn push_span(
     tm: &Mtx,
     ctm: &Mtx,
     tfs: f64,
+    hz: f64,
     tc: f64,
     tw: f64,
     style: (bool, bool),
@@ -266,19 +271,25 @@ pub(crate) fn push_span(
         return None;
     }
     let hscale = tm.h_scale() * ctm.h_scale();
+    // `Tz` scales the horizontal glyph displacement (PDF 32000-1 §9.3.3); the
+    // shell walker already folds it into the text matrix it advances, so without
+    // it here `span.advance` overshoots the run's rendered right edge by
+    // `1 / hz`. On the Courier/Franklin forms that set `Tz` ~50 these runs then
+    // swallowed the following word space and the column gutter whole.
+    let hx = hscale * hz;
     // A Type3 font's `Tf` operand is a size in the font's own glyph space, not
     // an em: the font's `/FontMatrix` and `/FontBBox` give the real one, which
     // travels on the width table. Every other font leaves this 1.0.
     let size = tfs * hscale * width.em_scale();
-    let (ux, uy) = tm.apply(em_offset / 1000.0 * tfs, 0.0);
+    let (ux, uy) = tm.apply(em_offset / 1000.0 * tfs * hz, 0.0);
     let (x, y) = ctm.apply(ux, uy);
     let advance = width
         .width(bytes)
-        .map(|w| w / 1000.0 * tfs * hscale)
+        .map(|w| w / 1000.0 * tfs * hx)
         .unwrap_or_else(|| {
             // No metrics: assume a typical letter advance (~0.5 em) so the
             // gap detector still separates words reasonably.
-            0.5 * size
+            0.5 * size * hz
         });
     // Text-matrix advance of this run including `Tc`/`Tw`, in the same device
     // units as `span.x`. `Tc`/`Tw` are added after every code and are *not*
@@ -292,7 +303,7 @@ pub(crate) fn push_span(
     // real inter-word spaces were dropped (`de`+`la` -> `dela`, D2).
     let nchars = text.chars().count() as f64;
     let nspaces = text.chars().filter(|c| *c == ' ').count() as f64;
-    let word_advance = advance + (tc * nchars + tw * nspaces) * hscale;
+    let word_advance = advance + (tc * nchars + tw * nspaces) * hx;
     let eff_a = ctm.a * tm.a + ctm.c * tm.b;
     let eff_b = ctm.b * tm.a + ctm.d * tm.b;
     let is_vertical = eff_b.abs() > 0.7 * hscale && eff_a.abs() < 0.3 * hscale;
